@@ -41,7 +41,11 @@ app.use(handleError);
 
 if (process.argv.includes("--dev")) {
   const { createServer } = await import("vite");
-  const vite = await createServer({ server: { middlewareMode: true }, appType: "spa" });
+  const vite = await createServer({
+    configLoader: "native",
+    server: { middlewareMode: true },
+    appType: "spa",
+  });
   app.use(vite.middlewares);
 } else {
   app.use(express.static(resolve("dist")));
