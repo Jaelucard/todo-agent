@@ -1,38 +1,32 @@
-import { useEffect, useRef, useState } from "react";
-import type { ChatMessage } from "../server/agent.ts";
+import { useRef, useState, type KeyboardEvent } from "react";
+import type { ChatMessage } from "../shared/chat.ts";
+import { requestReply } from "./chat-client.ts";
+import { ChatHistory } from "./ChatHistory.tsx";
 
-const examples = ["提醒我买牛奶", "看看我的待办"];
+function isSendShortcut(event: KeyboardEvent<HTMLTextAreaElement>) {
+  // 中文输入法会用 Enter 确认选词，部分浏览器此时只报告键码 229。
+  const composing = event.nativeEvent.isComposing || event.nativeEvent.keyCode === 229;
+  return event.key === "Enter" && !event.shiftKey && !composing;
+}
 
 export default function App() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [draft, setDraft] = useState("");
   const [pending, setPending] = useState(false);
   const [error, setError] = useState("");
-  const history = useRef<HTMLDivElement>(null);
   const input = useRef<HTMLTextAreaElement>(null);
-
-  useEffect(() => {
-    if (history.current) history.current.scrollTop = history.current.scrollHeight;
-  }, [messages, pending, error]);
 
   async function send(text: string) {
     const content = text.trim();
     if (!content || pending) return;
-    const next: ChatMessage[] = [...messages, { role: "user", content }];
-    setMessages(next);
+    const outgoing: ChatMessage[] = [...messages, { role: "user", content }];
+    setMessages(outgoing);
     setDraft("");
     setPending(true);
     setError("");
     try {
-      const response = await fetch("/api/chat", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ messages: next }),
-      });
-      const body = await response.json();
-      if (!response.ok || typeof body.reply !== "string")
-        throw new Error(body.error || "服务暂时不可用。");
-      setMessages([...next, { role: "assistant", content: body.reply }]);
+      const answer = await requestReply(outgoing);
+      setMessages([...outgoing, { role: "assistant", content: answer }]);
     } catch (cause) {
       setMessages(messages);
       setDraft(text);
@@ -51,33 +45,7 @@ export default function App() {
         <span>小明智能体</span>
       </header>
       <main>
-        <div className="scroll" ref={history}>
-          {messages.length === 0 ? (
-            <section className="welcome">
-              <img src="/logo.png" alt="" />
-              <h1>小明智能体</h1>
-              <p>今天有什么待办？</p>
-              <div className="examples">
-                {examples.map((item) => (
-                  <button key={item} onClick={() => void send(item)}>
-                    {item}
-                    <span aria-hidden="true">↗</span>
-                  </button>
-                ))}
-              </div>
-            </section>
-          ) : (
-            <div className="thread" role="log" aria-label="对话记录" aria-live="polite">
-              {messages.map((message, i) => (
-                <div key={i} className={`message ${message.role}`}>
-                  <small>{message.role === "user" ? "你" : "小明智能体"}</small>
-                  <div>{message.content}</div>
-                </div>
-              ))}
-              {pending && <p role="status">正在回复…</p>}
-            </div>
-          )}
-        </div>
+        <ChatHistory messages={messages} pending={pending} onSelectPrompt={send} />
         <div className="compose">
           {error && (
             <p className="error" role="alert">
@@ -99,12 +67,7 @@ export default function App() {
               readOnly={pending}
               onChange={(event) => setDraft(event.target.value)}
               onKeyDown={(event) => {
-                if (
-                  event.key === "Enter" &&
-                  !event.shiftKey &&
-                  !event.nativeEvent.isComposing &&
-                  event.nativeEvent.keyCode !== 229
-                ) {
+                if (isSendShortcut(event)) {
                   event.preventDefault();
                   void send(draft);
                 }

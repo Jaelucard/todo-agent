@@ -21,14 +21,16 @@ npm run dev
 
 ## 代码入口
 
-| 文件                                       | 用途                                       |
-| ------------------------------------------ | ------------------------------------------ |
-| [src/App.tsx](src/App.tsx)                 | 聊天界面，发送当前页面的对话历史并显示回复 |
-| [server/index.ts](server/index.ts)         | 接收聊天请求并挂载任务 API                 |
-| [server/agent.ts](server/agent.ts)         | 候选人实现入口，接收消息数组，返回回复文本 |
-| [server/model.ts](server/model.ts)         | 服务端 DeepSeek 客户端与模型配置           |
-| [server/tasks.ts](server/tasks.ts)         | 任务 API 和本地 JSON 文件读写              |
-| [server/openapi.yaml](server/openapi.yaml) | 任务请求和响应的完整定义                   |
+| 文件                                         | 用途                                       |
+| -------------------------------------------- | ------------------------------------------ |
+| [src/App.tsx](src/App.tsx)                   | 聊天界面，发送当前页面的对话历史并显示回复 |
+| [server/index.ts](server/index.ts)           | 接入智能体与任务存储，启动服务             |
+| [server/agent.ts](server/agent.ts)           | 候选人实现入口，接收消息数组，返回回复文本 |
+| [server/model.ts](server/model.ts)           | 服务端 DeepSeek 客户端与模型配置           |
+| [server/tasks.ts](server/tasks.ts)           | 任务 API 的输入校验和 HTTP 响应            |
+| [server/app.ts](server/app.ts)               | 接收对话历史，调用智能体并挂载任务 API     |
+| [server/task-store.ts](server/task-store.ts) | 读写本地 JSON 任务清单                     |
+| [server/openapi.yaml](server/openapi.yaml)   | 任务请求和响应的完整定义                   |
 
 ## 手动验证接口
 
