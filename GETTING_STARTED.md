@@ -11,7 +11,7 @@ npm ci
 npm run dev
 ```
 
-浏览器打开 <http://127.0.0.1:3000>。前后端共用这个地址，修改源码后开发服务会自动更新。若 3000 端口已占用，可以用 `PORT=3001 npm run dev` 指定其他端口（macOS / Linux）。
+浏览器打开 <http://127.0.0.1:3000>。前后端共用这个地址，修改服务端代码后服务会自动重启。修改聊天界面的 TSX 后，在另一个终端运行 `npm run build` 并刷新页面。若 3000 端口已占用，可以用 `PORT=3001 npm run dev` 指定其他端口（macOS / Linux）。
 
 ## 接入 DeepSeek
 
@@ -27,7 +27,7 @@ npm run dev
 | [server/index.ts](server/index.ts)         | 接收聊天请求并挂载任务 API                 |
 | [server/agent.ts](server/agent.ts)         | 候选人实现入口，接收消息数组，返回回复文本 |
 | [server/model.ts](server/model.ts)         | 服务端 DeepSeek 客户端与模型配置           |
-| [server/tasks.ts](server/tasks.ts)         | 任务 API 和本地 SQLite 存储                |
+| [server/tasks.ts](server/tasks.ts)         | 任务 API 和本地 JSON 文件读写              |
 | [server/openapi.yaml](server/openapi.yaml) | 任务请求和响应的完整定义                   |
 
 ## 手动验证接口
@@ -51,7 +51,7 @@ curl -sS http://127.0.0.1:3000/api/tasks \
 curl -sS http://127.0.0.1:3000/api/tasks
 ```
 
-首次访问任务 API 时，服务会在项目根目录创建 `data/tasks.sqlite`。这些任务会保留到下次启动，浏览器中的聊天记录则会在刷新后清空。
+首次创建任务时，服务会在项目根目录创建 `data/tasks.json`。这些任务会保留到下次启动，浏览器中的聊天记录则会在刷新后清空。
 
 ## 本地检查
 
@@ -63,4 +63,4 @@ npm run fmt:check
 npm run build
 ```
 
-测试使用独立的临时数据库。要预览构建产物，先停止开发服务，再运行 `npm start` 并打开同一地址。
+测试使用独立的临时目录。要预览构建产物，先停止开发服务，再运行 `npm start` 并打开同一地址。

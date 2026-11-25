@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { once } from "node:events";
 import type { AddressInfo } from "node:net";
 import { test } from "node:test";
@@ -6,9 +9,11 @@ import express from "express";
 import { taskRouter } from "./tasks.ts";
 
 test("任务 API 支持创建、查询、更新和删除，并保留未修改的字段", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "todo-agent-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
   const app = express();
   app.use(express.json());
-  app.use("/api/tasks", taskRouter(":memory:"));
+  app.use("/api/tasks", taskRouter(join(dir, "tasks.json")));
   const server = app.listen(0, "127.0.0.1");
   t.after(async () => {
     await new Promise<void>((resolve, reject) =>

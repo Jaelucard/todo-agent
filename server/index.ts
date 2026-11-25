@@ -39,16 +39,7 @@ const handleError: ErrorRequestHandler = (error, _req, res, _next) => {
 };
 app.use(handleError);
 
-if (process.argv.includes("--dev")) {
-  const { createServer } = await import("vite");
-  const vite = await createServer({
-    configLoader: "native",
-    server: { middlewareMode: true },
-    appType: "spa",
-  });
-  app.use(vite.middlewares);
-} else {
-  app.use(express.static(resolve("dist")));
-}
+app.use(express.static(resolve("public")));
+app.get("/assets/chat.js", (_req, res) => res.sendFile(resolve("dist/chat.js")));
 const port = Number(process.env.PORT || 3000);
 app.listen(port, "127.0.0.1", () => console.log(`小明智能体已启动：http://127.0.0.1:${port}`));

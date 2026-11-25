@@ -1,7 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { mkdirSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { DatabaseSync } from "node:sqlite";
 import { Router } from "express";
 import { z } from "zod";
 
@@ -11,54 +10,51 @@ const updateTask = createTask
   .extend({ done: z.boolean().optional() })
   .refine((value) => Object.keys(value).length > 0);
 
-export function taskRouter(filename = join("data", "tasks.sqlite")) {
+export function taskRouter(filename = join("data", "tasks.json")) {
   const router = Router();
-  let connection: DatabaseSync | undefined;
+  type Task = { id: string; title: string; done: boolean };
 
-  function db() {
-    if (!connection) {
-      mkdirSync(dirname(filename), { recursive: true });
-      const database = new DatabaseSync(filename);
-      database.exec(
-        "CREATE TABLE IF NOT EXISTS tasks (id TEXT PRIMARY KEY, title TEXT NOT NULL, done INTEGER NOT NULL DEFAULT 0)",
-      );
-      connection = database;
-    }
-    return connection;
+  function readTasks(): Task[] {
+    return existsSync(filename) ? JSON.parse(readFileSync(filename, "utf8")) : [];
   }
 
-  function task(row: Record<string, unknown>) {
-    return { id: row.id, title: row.title, done: Boolean(row.done) };
+  function saveTasks(tasks: Task[]) {
+    mkdirSync(dirname(filename), { recursive: true });
+    const temporary = filename + ".tmp";
+    writeFileSync(temporary, JSON.stringify(tasks, null, 2) + "\n");
+    renameSync(temporary, filename);
   }
+
   router.get("/", (_req, res) => {
-    res.json(db().prepare("SELECT * FROM tasks ORDER BY rowid").all().map(task));
+    res.json(readTasks());
   });
 
   router.post("/", (req, res) => {
     const input = createTask.safeParse(req.body);
     if (!input.success)
       return res.status(400).json({ error: "请提供 1 至 200 个字符的任务标题。" });
-    const id = randomUUID();
-    db().prepare("INSERT INTO tasks (id, title) VALUES (?, ?)").run(id, input.data.title);
-    res.status(201).json({ id, title: input.data.title, done: false });
+    const task = { id: randomUUID(), title: input.data.title, done: false };
+    saveTasks([...readTasks(), task]);
+    res.status(201).json(task);
   });
 
   router.patch("/:id", (req, res) => {
     const input = updateTask.safeParse(req.body);
     if (!input.success) return res.status(400).json({ error: "请提供有效的 title 或 done 字段。" });
-    const { title, done } = input.data;
-    const row = db()
-      .prepare(
-        "UPDATE tasks SET title = COALESCE(?, title), done = COALESCE(?, done) WHERE id = ? RETURNING *",
-      )
-      .get(title ?? null, done === undefined ? null : Number(done), req.params.id);
-    if (!row) return res.status(404).json({ error: "找不到这条任务。" });
-    res.json(task(row));
+    const tasks = readTasks();
+    const task = tasks.find((item) => item.id === req.params.id);
+    if (!task) return res.status(404).json({ error: "找不到这条任务。" });
+    Object.assign(task, input.data);
+    saveTasks(tasks);
+    res.json(task);
   });
 
   router.delete("/:id", (req, res) => {
-    const result = db().prepare("DELETE FROM tasks WHERE id = ?").run(req.params.id);
-    if (!result.changes) return res.status(404).json({ error: "找不到这条任务。" });
+    const tasks = readTasks();
+    const remaining = tasks.filter((item) => item.id !== req.params.id);
+    if (remaining.length === tasks.length)
+      return res.status(404).json({ error: "找不到这条任务。" });
+    saveTasks(remaining);
     res.sendStatus(204);
   });
 
