@@ -183,6 +183,11 @@
   },
   "active": "4864a9c125335f17",
   "lastOpenFiles": [
+    "planning/09-checkpoint-3-live-trace.jsonl",
+    "planning/10-checkpoint-3-independent-audit.md",
+    "planning/08-checkpoint-3-verification.md",
+    "planning/07-checkpoint-3-evaluation.mjs",
+    "server/acceptance.test.ts",
     "planning/06-checkpoint-2-live-trace.jsonl"
   ]
 }
