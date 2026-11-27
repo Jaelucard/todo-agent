@@ -8,6 +8,33 @@ test("chat distinguishes confirmed validation rejection from an unknown outcome"
   const cases = [
     { response: Response.json({ error: "请提供对话记录。" }, { status: 400 }), rejected: true },
     { response: Response.json({ error: "对话太长。" }, { status: 413 }), rejected: true },
+    {
+      response: Response.json(
+        {
+          error: "模型服务未正确配置，请检查 .env 中的 DEEPSEEK_API_KEY 后重试。本轮未修改任务。",
+          code: "config_error",
+          mutated: false,
+        },
+        { status: 503 },
+      ),
+      rejected: true,
+    },
+    {
+      response: Response.json(
+        {
+          error: "模型服务暂时无法处理请求，请稍后重试。本轮未修改任务。",
+          code: "model_error",
+          mutated: false,
+        },
+        { status: 503 },
+      ),
+      rejected: true,
+    },
+    { response: Response.json({ error: "代理网关 503。" }, { status: 503 }), rejected: false },
+    {
+      response: Response.json({ error: "部分变更后失败。", mutated: true }, { status: 503 }),
+      rejected: false,
+    },
     { response: Response.json({ error: "服务暂时不可用。" }, { status: 500 }), rejected: false },
     { response: Response.json({ error: "代理错误。" }, { status: 502 }), rejected: false },
     { response: new Response("not JSON", { status: 400 }), rejected: false },
@@ -35,6 +62,25 @@ test("chat distinguishes confirmed validation rejection from an unknown outcome"
     assert.equal(request.arguments[1]?.method, "POST");
     assert.ok(request.arguments[1]?.signal instanceof AbortSignal);
   }
+});
+
+test("chat propagates caller AbortSignal and treats user cancellation as unknown outcome", async (t) => {
+  const controller = new AbortController();
+  let observedSignal: AbortSignal | undefined;
+  t.mock.method(globalThis, "fetch", async (_url: unknown, init?: RequestInit) => {
+    observedSignal = init?.signal ?? undefined;
+    controller.abort();
+    assert.equal(observedSignal?.aborted, true);
+    throw new DOMException("The operation was aborted.", "AbortError");
+  });
+
+  await assert.rejects(client.requestReply([...messages], controller.signal), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.notEqual(error.name, "ChatRequestRejected");
+    return true;
+  });
+  assert.ok(observedSignal instanceof AbortSignal);
+  assert.equal(observedSignal.aborted, true);
 });
 
 test("the recovery check reads current task statuses without sending another chat request", async (t) => {

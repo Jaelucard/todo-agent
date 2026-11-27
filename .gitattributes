@@ -1,0 +1,14 @@
+*.ts text eol=lf
+*.tsx text eol=lf
+*.js text eol=lf
+*.mjs text eol=lf
+*.json text eol=lf
+*.css text eol=lf
+*.html text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+README.md text eol=lf
+GETTING_STARTED.md text eol=lf
+SUBMIT.md -text
+AGENTS.md -text
+package-lock.json -text

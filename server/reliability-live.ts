@@ -22,7 +22,13 @@ type Outbound = {
   elapsedMs?: number;
   usage?: TokenUsage;
 };
-const knownTools = new Set(["create_task", "list_tasks", "complete_task", "delete_task"]);
+const knownTools = new Set([
+  "create_task",
+  "list_tasks",
+  "complete_task",
+  "delete_task",
+  "update_task",
+]);
 
 function toolName(name: unknown) {
   return typeof name === "string" && knownTools.has(name) ? name : "[unknown]";

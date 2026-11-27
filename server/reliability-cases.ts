@@ -207,11 +207,13 @@ export const reliabilityCases: ReliabilityCase[] = [
     initial: [milk],
     turns: [
       {
+        // CANON-06: verified zero-mutation non-claiming Chinese prose is allowed while preserving zero disk writes.
         input: "今天是什么天气？",
         mock: script(stop("你想查哪个城市的天气？")),
         toolCalls: [],
         state: [milk],
-        replyIncludes: ["请告诉我你想如何管理待办。", "本轮未修改任务。"],
+        replyIncludes: ["你想查哪个城市的天气？"],
+        replyExcludes: ["已添加", "已完成", "已删除", "已更新"],
       },
     ],
   },
@@ -339,12 +341,124 @@ export const reliabilityCases: ReliabilityCase[] = [
     initial: [milk],
     turns: [
       {
+        // CANON-03: maxModelRequests raised from 4 to 6; loop limit still triggers cleanly at round 6.
         input: "告诉我现在有什么要做的",
-        mock: script(...[1, 2, 3, 4].map((id) => calls(call(String(id), "list_tasks")))),
+        mock: script(...[1, 2, 3, 4, 5, 6].map((id) => calls(call(String(id), "list_tasks")))),
         state: [milk],
         failure: "execution_limit",
         replyIncludes: ["已达到本轮操作上限。"],
-        mockRequestCount: 4,
+        mockRequestCount: 6,
+      },
+    ],
+  },
+  {
+    id: "compound-complete-and-delete",
+    category: "multiple actions",
+    initial: [
+      { id: "exam", title: "预约体检", done: false },
+      { id: "report", title: "写周报", done: false },
+    ],
+    turns: [
+      {
+        input: "体检预约好了，另外把写周报删掉",
+        mock: script(
+          list,
+          calls(
+            call("complete-exam", "complete_task", { candidateIds: ["exam"] }),
+            call("delete-report", "delete_task", { candidateIds: ["report"] }),
+          ),
+          stop(),
+        ),
+        toolCalls: ["list_tasks", "complete_task", "delete_task"],
+        state: [{ id: "exam", title: "预约体检", done: true }],
+        mutations: [
+          { operation: "complete_task", title: "预约体检", id: "exam" },
+          { operation: "delete_task", title: "写周报", id: "report" },
+        ],
+        replyIncludes: ["已完成「预约体检」。", "已删除「写周报」。"],
+      },
+    ],
+  },
+  {
+    id: "natural-metadata-create",
+    category: "metadata",
+    initial: [],
+    turns: [
+      {
+        input: "加一个高优先级、大工作量的任务：完成季度架构评审",
+        mock: script(
+          calls(
+            call("add-review", "create_task", {
+              title: "完成季度架构评审",
+              priority: "high",
+              workload: "large",
+            }),
+          ),
+          stop(),
+        ),
+        state: [{ title: "完成季度架构评审", done: false, priority: "high", workload: "large" }],
+        mutations: [{ operation: "create_task", title: "完成季度架构评审" }],
+        replyIncludes: ["已添加待办「完成季度架构评审」。", "优先级：高 · 工作量：大"],
+      },
+    ],
+  },
+  {
+    id: "reopen-and-rename-task",
+    category: "update",
+    initial: [{ id: "contract", title: "寄合同", done: true, priority: "high" }],
+    turns: [
+      {
+        input: "把寄合同改回未完成",
+        mock: script(
+          list,
+          calls(
+            call("reopen", "update_task", { candidateIds: ["contract"], changes: { done: false } }),
+          ),
+          stop(),
+        ),
+        toolCalls: ["list_tasks", "update_task"],
+        state: [{ id: "contract", title: "寄合同", done: false, priority: "high" }],
+        mutations: [{ operation: "update_task", title: "寄合同", id: "contract" }],
+        replyIncludes: ["已将「寄合同」改回未完成。"],
+      },
+      {
+        input: "把寄合同重命名为寄正式合同",
+        mock: script(
+          list,
+          calls(
+            call("rename", "update_task", {
+              candidateIds: ["contract"],
+              changes: { title: "寄正式合同" },
+            }),
+          ),
+          stop(),
+        ),
+        toolCalls: ["list_tasks", "update_task"],
+        state: [{ id: "contract", title: "寄正式合同", done: false, priority: "high" }],
+        mutations: [{ operation: "update_task", title: "寄正式合同", id: "contract" }],
+        replyIncludes: ["已将「寄合同」重命名为「寄正式合同」。"],
+      },
+    ],
+  },
+  {
+    id: "post-delete-list-and-due-date",
+    category: "conversational grounding",
+    initial: [milk, parcel],
+    turns: [
+      {
+        input: "把买牛奶删掉，然后给我看看剩下的清单",
+        mock: script(list, remove([milk.id]), stop()),
+        state: [parcel],
+        mutations: [{ operation: "delete_task", title: milk.title, id: milk.id }],
+        replyIncludes: ["已删除「买牛奶」。", "当前清单：", "取快递（待完成）"],
+        replyExcludes: ["买牛奶（待完成）"],
+      },
+      {
+        input: "今天有哪些任务到期？",
+        mock: script(list, stop("目前暂不支持截止日期功能，无法按到期时间查看。")),
+        state: [parcel],
+        replyIncludes: ["截止日期"],
+        replyExcludes: ["当前清单：", "取快递（待完成）"],
       },
     ],
   },

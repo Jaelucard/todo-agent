@@ -924,27 +924,29 @@ test("an invalid later tool preserves only the earlier confirmed mutation", asyn
   assert.doesNotMatch(result.reply, /买面包/);
 });
 
-test("tool proposals stop at the fourth model request", async (t) => {
+// CANON-03: maxModelRequests raised from 4 to 6 to permit compound multi-mutation turns while preserving the loop cap.
+test("tool proposals stop at the sixth model request", async (t) => {
   const { tasks } = await setup(t);
   let requests = 0;
   const agent = createAgent(tasks, async () => {
     requests++;
-    return requests < 4
+    return requests < 6
       ? proposal(call("list-" + requests, "list_tasks", "{}"))
       : proposal(call("unexecuted", "create_task", '{"title":"买牛奶"}'));
   });
   const result = await agent.runTurn([user("帮我梳理一下手头要做的事")]);
-  assert.equal(requests, 4);
+  assert.equal(requests, 6);
   assert.equal(result.failure, "execution_limit");
   assert.deepEqual(result.outcomes, []);
   assert.deepEqual(tasks.list(), []);
 });
 
+// CANON-03: maxToolCalls raised from 8 to 10; an over-budget batch (5 + 6 = 11) still rejects atomically with 0 prefix writes.
 test("a batch exceeding the cumulative tool budget does not execute even its prefix", async (t) => {
   const { tasks } = await setup(t);
   let requests = 0;
   const agent = createAgent(tasks, async () => {
-    const [start, end] = requests++ === 0 ? [1, 6] : [6, 10];
+    const [start, end] = requests++ === 0 ? [1, 6] : [6, 12];
     const calls = Array.from({ length: end - start }, (_, i) => {
       const step = i + start;
       return call("create-" + step, "create_task", JSON.stringify({ title: "任务 " + step }));
@@ -974,7 +976,9 @@ test("large history drops whole old exchanges and keeps the current input", asyn
   const recentReply: ChatMessage = { role: "assistant", content: "前一个回答" };
   const latest = user("打个招呼");
   const greeting = await agent.runTurn([old, oldReply, recent, recentReply, latest]);
-  assert.equal(greeting.reply, "请告诉我你想如何管理待办。\n本轮未修改任务。");
+  // CANON-06: concise, verified non-mutating Chinese prose is preserved while still enforcing zero mutations and byte limits.
+  assert.equal(greeting.reply, "你好。");
+  assert.deepEqual(greeting.outcomes, []);
   assert.equal(greeting.displayedList, undefined);
   assert.equal(requests.length, 1);
   assert.deepEqual(requests[0].messages.slice(1), [recent, recentReply, latest]);
