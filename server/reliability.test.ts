@@ -51,12 +51,14 @@ test("the missing-task evaluator rejects unsupported replies and writes", async 
   const cases = [
     {
       id: "incorrect deletion",
+      input: "删除取快递",
       before: seed,
       choices: [lookup, proposal("delete_task", { candidateIds: ["parcel"] }), stop],
       problem: /Observed 1 unintended mutations/,
     },
     {
       id: "unintended create",
+      input: "新增预约牙医",
       before: seed,
       choices: [lookup, proposal("create_task", { title: "预约牙医" }), stop],
       problem: /The task file changed during a turn that must not write/,
@@ -172,7 +174,7 @@ test("the evaluator checks metadata writes against persisted values", async () =
       initial: [report],
       turns: [
         {
-          input: "把写报告设为高优先级",
+          input: priority === "high" ? "把写报告设为高优先级" : "把写报告设为低优先级",
           state: [{ ...report, priority: "high" }],
           mutations: [{ operation: "update_task", title: report.title, id: report.id }],
           mock: (index) => script[index],
@@ -185,6 +187,30 @@ test("the evaluator checks metadata writes against persisted values", async () =
     assert.equal(result.passed, priority === "high", turn.problems.join("\n"));
     assert.equal(turn.falseSuccessConfirmations, 0);
   }
+});
+
+test("the evaluator recognizes a request to clarify an unauthorized metadata change", async () => {
+  const initial = [{ id: "report", title: "写报告", done: false, workload: "small" }] as const;
+  const overbroad = proposal("update_task", {
+    candidateIds: ["report"],
+    changes: { workload: "large", priority: "low" },
+  });
+  const result = await evaluateReliabilityCase({
+    id: "clarify-metadata",
+    category: "clarification",
+    initial: [...initial],
+    turns: [
+      {
+        input: "把写报告的工作量改成大",
+        state: [...initial],
+        failure: "metadata_confirmation_required",
+        clarifies: true,
+        mock: (index) => [lookup, overbroad][index],
+      },
+    ],
+  });
+  assert.equal(result.passed, true, result.turns[0].problems.join("\n"));
+  assert.equal(result.turns[0].clarified, true);
 });
 
 test("reliability fixtures pass against the real task store with scripted model replies", async (t) => {

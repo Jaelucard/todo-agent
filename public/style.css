@@ -440,3 +440,9 @@ progress::-moz-progress-bar {
     min-height: 54px;
   }
 }
+@media (max-height: 600px) {
+  .tasks {
+    display: block;
+    overflow-y: auto;
+  }
+}

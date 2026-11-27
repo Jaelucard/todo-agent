@@ -1,5 +1,6 @@
 import { z } from "zod";
 import type { ChatMessage } from "../shared/chat.ts";
+import { createTaskSchema } from "../shared/task-input.ts";
 import {
   priorities,
   priorityLabels,
@@ -16,6 +17,13 @@ import {
   type ChatCompletionMessageParam,
   type ModelProvider,
 } from "./model.ts";
+import {
+  clarifiedTitle,
+  maskQuotedTitles,
+  metadataRequest,
+  quotedCreateTitle,
+  quotedTaskTitle,
+} from "./task-request.ts";
 import type { TaskStore } from "./task-store.ts";
 import { createTaskTools } from "./task-tools.ts";
 
@@ -134,6 +142,7 @@ type Failure =
 const failureText: Record<Failure, string> = {
   unknown_tool: "小明收到未知的任务操作。",
   invalid_arguments: "任务操作参数无效，请说明要做什么。",
+  metadata_confirmation_required: "请确认任务全名，以及要设置的优先级或工作量和对应的值。",
   duplicate_create: "已跳过本轮重复的新增请求。",
   list_required: "请先确认最新清单，再指定要操作的任务。",
   reference_required: "请告诉我你指的是哪一项任务。",
@@ -157,24 +166,25 @@ const mutationText: Record<Mutation["operation"], string> = {
   update_task: "已更新",
 };
 
-function isExplicitListRequest(content: string): boolean {
-  // Only whole-list commands and questions qualify. Extra words belong to the model.
+function explicitListScope(content: string): "all" | TaskMetadata["priority"] {
   const text = content
     .trim()
     .replace(/^(?:请问|麻烦|请)/u, "")
     .replace(/[吧呢]?[。！？.!?]?$/u, "");
   const command =
     /^再?(?:给我|帮我)?(?:看看|看一看|列出|(?:查看|显示|展示|看|列)(?:一下|下)?)/u.exec(text);
-  if (command) {
-    const object = text.slice(command[0].length);
-    return /^(?:我的)?(?:(?:当前|所有|全部)的?)?(?:待办(?:事项|清单|列表)?|任务(?:清单|列表)?|清单)$/u.test(
-      object,
-    );
+  const question = /^我?(?:现在)?都?有(?:哪些|什么)/u.exec(text);
+  const prefix = command ?? question;
+  if (prefix) {
+    const object = text.slice(prefix[0].length);
+    const priority = /^(?:我的)?([高中低])优先级的?(?:任务|待办(?:事项)?)$/u.exec(object);
+    if (priority) return priorities.find((value) => priorityLabels[value] === priority[1]);
+    const allTasks = command
+      ? /^(?:我的)?(?:(?:当前|所有|全部)的?)?(?:待办(?:事项|清单|列表)?|任务(?:清单|列表)?|清单)$/u
+      : /^(?:任务|待办(?:事项)?)$/u;
+    if (allTasks.test(object)) return "all";
   }
-  return (
-    /^我?(?:现在)?都?有(?:哪些|什么)(?:任务|待办(?:事项)?)$/u.test(text) ||
-    /^我的(?:任务|待办(?:事项)?)都?有哪些$/u.test(text)
-  );
+  if (/^我的(?:任务|待办(?:事项)?)都?有哪些$/u.test(text)) return "all";
 }
 
 function answersTargetQuestion(previous: ChatMessage | undefined, text: string, tasks: Task[]) {
@@ -193,25 +203,16 @@ function taskCommand(content: string) {
   const text = content
     .trim()
     .replace(/^(?:请(?:帮我)?|帮我|麻烦(?:帮我)?)/u, "")
-    .replace(/^再(?=把|将|给|删除|删掉|移除|完成|标记)/u, "")
+    .replace(/^(?:再|只)(?=把|将|给|删除|删掉|移除|完成|标记)/u, "")
+    .replace(clarifiedTitle, "把$1")
     .replace(/吧?[。！？.!?]?$/u, "");
-  // Recognize clear standalone edits so that bare targets still need a name.
-  const metadataChange =
-    /^(?:把|将|给)(.+?)的?(?:优先级|工作量)(?:设(?:置)?|改|调整?)(?:为|成|到)?[^，。！？；,.!?;\n]+$/u.exec(
-      text,
-    ) ??
-    /^(?:把|将|给)(.+?)(?:设(?:置)?|改|调整?)(?:为|成|到)[^，。！？；,.!?;\n]*?(?:优先级|工作量)[^，。！？；,.!?;\n]*$/u.exec(
-      text,
-    ) ??
-    /^(?:提高|降低)(.+?)的?优先级$/u.exec(text);
-  if (metadataChange) return { target: metadataChange[1], action: "update_task", explicit: true };
   const targetFirst =
     /^(?:把|将)?(.+?)(标(?:记)?(?:为|成)?(?:已)?完成|完成(?:了)?|做完了|删掉|删除|移除)$/u.exec(
       text,
     );
   const actionFirst = /^(删掉|删除|移除|完成|标(?:记)?(?:为|成)?(?:已)?完成)(.+)$/u.exec(text);
   if (targetFirst) {
-    const explicit = /^(?:把|将)/u.test(text);
+    const explicit = /^(?:把|将)/u.test(text) || namedTarget(targetFirst[1])?.literal === true;
     // At both ends an action word might belong to the title. Bare pronouns still need a name.
     if (explicit || actionFirst || isUnboundTarget(targetFirst[1]))
       return { target: targetFirst[1], action: targetFirst[2], explicit };
@@ -220,15 +221,18 @@ function taskCommand(content: string) {
 }
 
 function isUnboundTarget(target: string): boolean {
-  return /^(?:它|(?:这|那|上一|刚(?:才|刚)那|上面那|最后(?:一|那一?))(?:条|项|个)|第[\d一二三四五六七八九十两百]+(?:条|项|个))(?:任务|待办)?$/u.test(
-    target,
-  );
+  const text = target.replace(/\s/gu, "");
+  const position =
+    /^(?:它|(?:这一?|那一?|上一|刚(?:才|刚)那|上面那|最后(?:一|那一?))(?:条|项|个|件)|(?:倒数)?第[\d一二三四五六七八九十两百]+(?:条|项|个|件))(?:任务|待办(?:事项)?|事(?:情)?)?$/u;
+  const earlierMention =
+    /^(?:刚(?:才|刚)?|前面|之前|上面)(?:说|提)(?:到|过)?的(?:[这那]?一?[条项个件])?(?:事(?:情)?|任务|待办(?:事项)?)?$/u;
+  return position.test(text) || earlierMention.test(text);
 }
 
 // A literal name can establish absence. A bare description can only establish an exact match.
 function namedTarget(target: string) {
-  const quoted = /^(?:「([^「」]+)」|“([^“”]+)”)(?:这(?:一)?[项条](?:任务|待办)?)?$/u.exec(target);
-  if (quoted) return { title: quoted[1] ?? quoted[2], literal: true };
+  const quoted = quotedTaskTitle(target);
+  if (quoted !== undefined) return { title: quoted, literal: true };
   if (
     !/^[\p{L}\p{N} ]+$/u.test(target) ||
     /(?:不|别|勿|如果|是否|然后|或|并|和|以及|再把|[个条项]$)/u.test(target)
@@ -236,6 +240,21 @@ function namedTarget(target: string) {
     return undefined;
   }
   return { title: target, literal: false };
+}
+
+function singleCreateGrant(target: string, changes: TaskMetadata | undefined) {
+  const name = namedTarget(target);
+  if (!name || !changes) return;
+  if (
+    !name.literal &&
+    (isUnboundTarget(target) ||
+      /(?:吗|呢|么|嘛|还是|再|顺便|同时|接着|还要|若|否则|取消|删掉|删除|移除|清空|^一[条项个]任务)/u.test(
+        target,
+      ))
+  )
+    return;
+  const input = createTaskSchema.safeParse({ title: name.title, ...changes });
+  if (input.success) return { title: input.data.title, changes };
 }
 
 function displayTitle(title: string): string {
@@ -291,19 +310,21 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
       let displayedList: Task[] | undefined;
       const latest = messages.at(-1);
 
-      function finish(failure?: Failure, note?: string) {
+      function finish(failure?: Failure, note?: string, listPriority?: TaskMetadata["priority"]) {
         const lines = [...confirmations];
         if (displayedList !== undefined) {
           lines.push(
             displayedList.length
               ? [
-                  "当前清单：",
+                  listPriority ? `${priorityLabels[listPriority]}优先级清单：` : "当前清单：",
                   ...displayedList.map((task) => {
                     const metadata = describeMetadata(task);
                     return `- ${displayTitle(task.title)}（${task.done ? "已完成" : "待完成"}${metadata ? ` · ${metadata}` : ""}）`;
                   }),
                 ].join("\n")
-              : "当前没有待办。",
+              : listPriority
+                ? `当前没有${priorityLabels[listPriority]}优先级的待办。`
+                : "当前没有待办。",
           );
         }
         if (note) lines.push(note);
@@ -324,22 +345,93 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
       if (signal.aborted) return finish("deadline");
       // Browser message text alone cannot establish the identity of a referenced task.
       const input = latest.content.trim();
-      const command = taskCommand(input);
-      if (command && isUnboundTarget(command.target)) return finish("reference_required");
-      if (isExplicitListRequest(latest.content)) {
+      const scope = explicitListScope(input);
+      if (scope) {
         const result = createTaskTools(tasks).execute("list_tasks", "{}");
         if (!result.ok) return finish(result.error);
         if (
           result.tool === "list_tasks" &&
           !answersTargetQuestion(messages.at(-2), latest.content.trim(), result.tasks)
         ) {
-          displayedList = result.tasks;
-          return finish();
+          displayedList =
+            scope === "all" ? result.tasks : result.tasks.filter((task) => task.priority === scope);
+          return finish(undefined, undefined, scope === "all" ? undefined : scope);
         }
       }
 
+      const metadata = metadataRequest(input);
+      const create = metadata?.operation === "create_task" ? metadata : undefined;
+      const createGrant = create && singleCreateGrant(create.target, create.changes);
+      if (create && !createGrant) return finish("metadata_confirmation_required");
+      const edit = metadata?.operation === "update_task" ? metadata : undefined;
+      const command = edit?.target
+        ? { target: edit.target, action: "update_task", explicit: true }
+        : taskCommand(input);
+      if (command && isUnboundTarget(command.target)) return finish("reference_required");
+      const target = command && namedTarget(command.target);
+      const editGrant = target && edit?.changes ? { ...target, changes: edit.changes } : undefined;
+      if (edit && !editGrant) return finish("metadata_confirmation_required");
+      const quoted = maskQuotedTitles(input) !== input || /[「」“”『』‘’"]/u.test(input);
+      const demonstrativeDelete =
+        !metadata && !quoted
+          ? /^(?:请(?:帮我)?|帮我|麻烦(?:帮我)?)?(?:把|将)\s*(([^\n]+?)这(?:一)?[条项](?:任务|待办(?:事项)?)?)\s*(?:删掉|删除|移除)吧?[。！.!]?$/u.exec(
+              input,
+            )
+          : null;
+      const deleteName = demonstrativeDelete?.[2].trim();
+      const deleteTarget = deleteName && namedTarget(deleteName);
+      if (
+        demonstrativeDelete &&
+        (!deleteTarget ||
+          isUnboundTarget(deleteTarget.title) ||
+          /(?:还是|顺便|同时|接着|还要|若|否则)/u.test(deleteTarget.title))
+      )
+        return finish("reference_required");
+      const deleteGrant =
+        demonstrativeDelete && deleteTarget
+          ? { ...deleteTarget, suffixedTitle: demonstrativeDelete[1].trim() }
+          : undefined;
+      const literal = target?.literal && !/[?？]$/u.test(input) ? target : undefined;
+      const newTitle = quotedCreateTitle(input, metadata?.operation === "create_task");
+      const quotedTool = newTitle
+        ? "create_task"
+        : literal && command
+          ? ["删掉", "删除", "移除"].includes(command.action)
+            ? "delete_task"
+            : "complete_task"
+          : "list_tasks";
+      const namedMutation = editGrant ? "update_task" : deleteGrant ? "delete_task" : undefined;
+      const lookupTarget = editGrant ?? deleteGrant;
+      const requestedTool = namedMutation ?? (quoted ? quotedTool : metadata?.operation);
+      const grant =
+        createGrant ??
+        lookupTarget ??
+        (newTitle ? { title: newTitle } : literal ? { title: literal.title } : undefined);
+
       // The model must receive its own list before a mutation, even if we just read a task title.
       const toolkit = createTaskTools(tasks);
+      function inspectNamedTarget(view: Task[], title: string) {
+        return toolkit.inspectCandidates(
+          view.filter((task) => task.title === title).map((task) => task.id),
+        );
+      }
+      function finishLookupFailure(
+        error: ToolError,
+        view: Task[],
+        name: NonNullable<ReturnType<typeof namedTarget>>,
+        clarification?: "ambiguous_reference" | "reference_required",
+      ) {
+        if (error === "stale_view" || error === "storage_error") displayedList = undefined;
+        if (error === "task_not_found") {
+          const partial = view.some(
+            (task) => task.title.includes(name.title) || name.title.includes(task.title),
+          );
+          if (view.length && (!name.literal || partial))
+            return finish(clarification ?? "reference_required");
+          return finish(name.literal ? "exact_title_not_found" : "task_not_found");
+        }
+        return finish(error);
+      }
       // The last list can ground a reply without dispatching another mutation.
       function finishAfterLookup(clarification?: "ambiguous_reference" | "reference_required") {
         if (displayedList === undefined) return finish(clarification);
@@ -357,21 +449,8 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
         const target = command.explicit && namedTarget(command.target);
         if (!target) return finish(clarification ?? "reference_required");
         const view = displayedList;
-        const ids = view.filter((task) => task.title === target.title).map((task) => task.id);
-        const resolved = toolkit.inspectCandidates(ids);
-        if (!resolved.ok) {
-          if (resolved.error === "stale_view" || resolved.error === "storage_error")
-            displayedList = undefined;
-          if (resolved.error === "task_not_found") {
-            const partial = view.some(
-              (task) => task.title.includes(target.title) || target.title.includes(task.title),
-            );
-            if (view.length && (!target.literal || partial))
-              return finish(clarification ?? "reference_required");
-            return finish(target.literal ? "exact_title_not_found" : "task_not_found");
-          }
-          return finish(resolved.error);
-        }
+        const resolved = inspectNamedTarget(view, target.title);
+        if (!resolved.ok) return finishLookupFailure(resolved.error, view, target, clarification);
         displayedList = undefined;
         if (
           !["删除", "删掉", "移除", "update_task"].includes(command.action) &&
@@ -386,10 +465,14 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
       const executedCallIds = new Set<string>();
       for (let round = 1; round <= maxModelRequests; round++) {
         if (signal.aborted) return finish("deadline");
+        let forcedTool: "create_task" | "list_tasks" | "update_task" | "delete_task" | undefined;
+        if (create) forcedTool = "create_task";
+        if (namedMutation) forcedTool = round === 1 ? "list_tasks" : namedMutation;
         const request = () =>
           buildModelRequest(
             [{ role: "system", content: systemPrompt }, ...history.flat(), ...transcript],
             tools,
+            forcedTool ? { type: "function", function: { name: forcedTool } } : "auto",
           );
 
         let body = request();
@@ -416,6 +499,10 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
         if (finish_reason === "stop" && calls.length === 0) {
           const text = message.content?.trim();
           if (!text) return finish("invalid_model_response");
+          if (forcedTool) {
+            displayedList = undefined;
+            return finish("action_not_executed");
+          }
           return finishAfterLookup(text === "需要澄清" ? "ambiguous_reference" : undefined);
         }
         if (
@@ -429,6 +516,20 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
         if (round === maxModelRequests || executedCallIds.size + calls.length > maxToolCalls) {
           return finish("execution_limit");
         }
+        if (forcedTool && (calls.length !== 1 || calls[0].function.name !== forcedTool)) {
+          const prematureMutation =
+            forcedTool === "list_tasks" &&
+            calls.some((call) => call.function.name === namedMutation);
+          return finish(prematureMutation ? "list_required" : "invalid_model_response");
+        }
+        const writes = calls.filter((call) => call.function.name !== "list_tasks");
+        const wrongTool = writes.some(({ function: { name } }) =>
+          requestedTool ? name !== requestedTool : name === "update_task",
+        );
+        if (wrongTool || (grant && writes.length && (writes.length > 1 || confirmations.length)))
+          return finish(
+            metadata || !quoted ? "metadata_confirmation_required" : "reference_required",
+          );
         transcript.push(message);
 
         let listedInBatch = false;
@@ -438,7 +539,7 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
           if (listedInBatch && ["complete_task", "delete_task", "update_task"].includes(name)) {
             return finish("list_required");
           }
-          const result = toolkit.execute(name, args);
+          const result = toolkit.execute(name, args, grant);
           executedCallIds.add(call.id);
           if (!result.ok) {
             if (result.error === "task_not_found" && displayedList !== undefined)
@@ -449,6 +550,16 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
           transcript.push({ role: "tool", tool_call_id: call.id, content: JSON.stringify(result) });
           if (result.tool === "list_tasks") {
             displayedList = result.tasks;
+            if (
+              deleteGrant &&
+              result.tasks.some((task) => task.title === deleteGrant.suffixedTitle)
+            )
+              return finish("ambiguous_reference");
+            if (lookupTarget) {
+              const resolved = inspectNamedTarget(result.tasks, lookupTarget.title);
+              if (!resolved.ok)
+                return finishLookupFailure(resolved.error, result.tasks, lookupTarget);
+            }
             listedInBatch = true;
             continue;
           }
@@ -469,6 +580,7 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
             if (metadata) confirmations.push(metadata);
           }
         }
+        if (create || (namedMutation && forcedTool === namedMutation)) return finish();
       }
       return finish("execution_limit");
     },

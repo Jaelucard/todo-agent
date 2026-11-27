@@ -34,12 +34,13 @@ export function getModelClient(): OpenAI {
 export function buildModelRequest(
   messages: ChatCompletionMessageParam[],
   tools: ChatCompletionFunctionTool[],
+  toolChoice: ChatCompletionCreateParamsNonStreaming["tool_choice"] = "auto",
 ): ChatCompletionCreateParamsNonStreaming {
   return {
     model,
     messages,
     tools,
-    tool_choice: "auto",
+    tool_choice: toolChoice,
     reasoning_effort: "none",
     max_tokens: 1024,
     stream: false,

@@ -437,6 +437,25 @@ test("a list reply reflects stored tasks even when the final model text is wrong
   assert.equal(await readFile(filename, "utf8"), before);
 });
 
+test("a priority list shows only current matches and distinguishes no matches from an empty store", async (t) => {
+  const { filename, tasks } = await setup(t);
+  const high = tasks.create("交报告", { priority: "high", workload: "large" });
+  tasks.create("取快递", { priority: "medium", workload: "small" });
+  tasks.create("未分类");
+  const before = await readFile(filename, "utf8");
+  const { agent, requests } = listThenStop(tasks);
+  const turn = await agent.runTurn([user("有哪些高优先级任务？")]);
+  assert.deepEqual(turn.displayedList, [high]);
+  assert.match(turn.reply, /交报告（待完成.*优先级：高.*工作量：大/);
+  assert.doesNotMatch(turn.reply, /取快递|未分类/);
+  const empty = await agent.runTurn([user("请列出低优先级的待办")]);
+  assert.deepEqual(empty.displayedList, []);
+  assert.match(empty.reply, /没有低优先级/);
+  assert.deepEqual([turn.outcomes, empty.outcomes], [[], []]);
+  assert.equal(requests.length, 0);
+  assert.equal(await readFile(filename, "utf8"), before);
+});
+
 test("a list-only follow-up returns the saved list when the model would stop without tools", async (t) => {
   const { filename, tasks } = await setup(t);
   const milk = tasks.create("买牛奶");
@@ -1016,4 +1035,643 @@ test("cancellation stops an active provider request before any tool is dispatche
   assert.equal(result.failure, "deadline");
   assert.deepEqual(result.outcomes, []);
   assert.deepEqual(tasks.list(), []);
+});
+
+const metadataSeed = [
+  { id: "milk", title: "买牛奶", done: false },
+  {
+    id: "report",
+    title: "写报告",
+    done: true,
+    priority: "high",
+    workload: "small",
+    extension: { color: "blue" },
+  },
+];
+const metadataInput = "把「写报告」的工作量改成大";
+const metadataCall = (id: string, changes: Record<string, string>) =>
+  call("edit", "update_task", JSON.stringify({ candidateIds: [id], changes }));
+
+for (const [label, input, proposals] of [
+  [
+    "ordinal without provenance",
+    "第二条设为高优先级",
+    [metadataCall("milk", { priority: "high" })],
+  ],
+  [
+    "combined ordinal",
+    "把第二条的优先级改为高，工作量改为大",
+    [metadataCall("milk", { priority: "high", workload: "large" })],
+  ],
+  [
+    "combined pronoun",
+    "请把它的优先级和工作量分别改为高和大",
+    [metadataCall("milk", { priority: "high", workload: "large" })],
+  ],
+  [
+    "quoted title with the wrong valid ID",
+    metadataInput,
+    [metadataCall("milk", { workload: "large" })],
+  ],
+  [
+    "unrequested priority",
+    metadataInput,
+    [metadataCall("report", { workload: "large", priority: "low" })],
+  ],
+  [
+    "unrequested workload",
+    "把写报告设为低优先级",
+    [metadataCall("report", { priority: "low", workload: "large" })],
+  ],
+  ["wrong enum value", "把写报告设为高优先级", [metadataCall("report", { priority: "low" })]],
+  [
+    "incomplete combined proposal",
+    "把写报告的优先级改为低，工作量改为大",
+    [metadataCall("report", { priority: "low" })],
+  ],
+  [
+    "completion substituted for metadata",
+    "把买牛奶的工作量改为大",
+    [call("finish", "complete_task", '{"candidateIds":["milk"]}')],
+  ],
+  [
+    "creation substituted for metadata",
+    metadataInput,
+    [call("add", "create_task", '{"title":"其他任务"}')],
+  ],
+  [
+    "deletion bundled with a valid edit",
+    metadataInput,
+    [
+      metadataCall("report", { workload: "large" }),
+      call("del", "delete_task", '{"candidateIds":["milk"]}'),
+    ],
+  ],
+  [
+    "title in a metadata patch",
+    metadataInput,
+    [metadataCall("report", { workload: "large", title: "另一个标题" })],
+  ],
+  ["negated edit", "不要把写报告的工作量改为大", [metadataCall("report", { workload: "large" })]],
+  [
+    "question about an edit",
+    "把写报告的工作量改为大？",
+    [metadataCall("report", { workload: "large" })],
+  ],
+  [
+    "unsupported qualified priority edit with substituted deletion",
+    "把「写报告」的优先级降到低。",
+    [call("del", "delete_task", '{"candidateIds":["milk"]}')],
+  ],
+  [
+    "unsupported workload edit with substituted deletion",
+    "把「写报告」的工作量降到小",
+    [call("del", "delete_task", '{"candidateIds":["milk"]}')],
+  ],
+  [
+    "verbless workload edit with substituted creation",
+    "「写报告」的工作量小一点",
+    [call("add", "create_task", '{"title":"其他任务"}')],
+  ],
+  [
+    "read with substituted creation",
+    "写报告的工作量是多少？",
+    [call("add", "create_task", '{"title":"其他任务"}')],
+  ],
+  [
+    "unresolvable description",
+    "把报告的工作量改为大",
+    [metadataCall("report", { workload: "large" })],
+  ],
+  [
+    "edit unrelated to the user request",
+    "现在几点了？",
+    [metadataCall("report", { workload: "large" })],
+  ],
+] as const) {
+  test(`metadata authorization rejects ${label} before writing`, async (t) => {
+    const { tasks, filename } = await setup(t);
+    const before = JSON.stringify(metadataSeed);
+    await writeFile(filename, before);
+    const originalFile = await stat(filename, { bigint: true });
+    const script = [
+      proposal(call("lookup", "list_tasks", "{}")),
+      proposal(...proposals),
+      final("已修改。"),
+    ];
+    const turn = await createAgent(tasks, async () => script.shift()).runTurn([
+      user("我有哪些任务？"),
+      { role: "assistant", content: "当前清单：\n- 买牛奶（待完成）\n- 写报告（已完成）" },
+      user(input),
+    ]);
+    assert.equal(await readFile(filename, "utf8"), before);
+    const file = await stat(filename, { bigint: true });
+    assert.deepEqual([file.ino, file.mtimeNs], [originalFile.ino, originalFile.mtimeNs]);
+    assert.deepEqual(turn.outcomes, []);
+    assert.match(turn.reply, /本轮未修改任务/);
+    assert.doesNotMatch(turn.reply, /已更新|已删除|已添加|已修改/);
+    if (label.includes("ordinal") || label.includes("pronoun")) {
+      assert.equal(turn.failure, "reference_required");
+      assert.equal(script.length, 3);
+    }
+  });
+}
+
+test("metadata authorization permits both requested edits on one named task", async (t) => {
+  const { tasks, filename } = await setup(t);
+  for (const input of [
+    "把写报告的优先级改为低，工作量改为大。",
+    "请把「写报告」的优先级和工作量分别改为低和大",
+  ]) {
+    await writeFile(filename, JSON.stringify(metadataSeed));
+    const edit = { priority: "low", workload: "large" };
+    const script = [
+      proposal(call("lookup", "list_tasks", "{}")),
+      proposal(metadataCall("report", edit)),
+      final("好。"),
+    ];
+    const turn = await createAgent(tasks, async () => script.shift()).runTurn([user(input)]);
+    assert.deepEqual(tasks.list(), [metadataSeed[0], { ...metadataSeed[1], ...edit }]);
+    assert.equal(turn.outcomes.length, 1);
+    assert.match(turn.reply, /已更新「写报告」/);
+  }
+});
+
+test("metadata authorization preserves duplicate and stale target protections", async (t) => {
+  const { tasks, filename } = await setup(t);
+  for (const scenario of ["duplicate", "replaced"] as const) {
+    await writeFile(
+      filename,
+      JSON.stringify(
+        scenario === "duplicate"
+          ? [...metadataSeed, { ...metadataSeed[1], id: "other" }]
+          : metadataSeed,
+      ),
+    );
+    let expected = await readFile(filename, "utf8");
+    let calls = 0;
+    const turn = await createAgent(tasks, async () => {
+      if (++calls === 1) return proposal(call("list", "list_tasks", "{}"));
+      if (scenario === "replaced") {
+        tasks.remove("report");
+        tasks.create("写报告");
+        expected = await readFile(filename, "utf8");
+      }
+      return proposal(metadataCall("report", { workload: "large" }));
+    }).runTurn([user(metadataInput)]);
+    assert.equal(turn.failure, scenario === "duplicate" ? "ambiguous_reference" : "stale_view");
+    assert.deepEqual(turn.outcomes, []);
+    assert.equal(await readFile(filename, "utf8"), expected);
+  }
+});
+
+test("metadata authorization keeps create-like and instruction-like task titles intact", async (t) => {
+  const { tasks, filename } = await setup(t);
+  for (const [title, input] of [
+    ["新增用户", "新增用户的优先级改为低"],
+    ["工作量改成小", "把「工作量改成小」的优先级改为低。"],
+  ]) {
+    const seed = [{ ...metadataSeed[0] }, { ...metadataSeed[1], title }];
+    for (const write of [
+      call("del", "delete_task", '{"candidateIds":["milk"]}'),
+      metadataCall("report", { priority: "low" }),
+    ]) {
+      const before = JSON.stringify(seed);
+      await writeFile(filename, before);
+      const script = [proposal(call("lookup", "list_tasks", "{}")), proposal(write), final("好。")];
+      const turn = await createAgent(tasks, async () => script.shift()).runTurn([user(input)]);
+      if (write.function.name === "delete_task") {
+        assert.equal(await readFile(filename, "utf8"), before);
+        assert.deepEqual(turn.outcomes, []);
+      } else {
+        assert.deepEqual(tasks.list(), [seed[0], { ...seed[1], priority: "low" }]);
+        assert.match(turn.reply, /已更新/);
+      }
+    }
+  }
+});
+
+for (const [input, tool] of [
+  ["删除「写报告」", "delete_task"],
+  ["只删除「写报告」这一条。", "delete_task"],
+  ["「写报告」这条删掉吧", "delete_task"],
+  ["请把「写报告」标为完成。", "complete_task"],
+  ["我说的是“写报告”，请把它标为完成。", "complete_task"],
+] as const) {
+  test(`quoted task authorization binds ${input} to the stored ID and operation`, async (t) => {
+    const { tasks, filename } = await setup(t);
+    const seed = [metadataSeed[0], { ...metadataSeed[1], done: false }];
+    for (const [name, id] of [
+      [tool, "milk"],
+      [tool === "delete_task" ? "complete_task" : "delete_task", "report"],
+      [tool, "report"],
+    ]) {
+      const before = JSON.stringify(seed);
+      await writeFile(filename, before);
+      const script = [
+        proposal(call("lookup", "list_tasks", "{}")),
+        proposal(call("op", name, JSON.stringify({ candidateIds: [id] }))),
+        final("好。"),
+      ];
+      const turn = await createAgent(tasks, async () => script.shift()).runTurn([user(input)]);
+      if (name === tool && id === "report") {
+        assert.deepEqual(
+          tasks.list(),
+          tool === "delete_task" ? [seed[0]] : [seed[0], { ...seed[1], done: true }],
+        );
+        assert.equal(turn.outcomes.length, 1);
+      } else {
+        assert.equal(await readFile(filename, "utf8"), before);
+        assert.deepEqual(turn.outcomes, []);
+        assert.match(turn.reply, /本轮未修改任务/);
+      }
+    }
+  });
+}
+
+test("quoted task authorization excludes wrong IDs across unrecognized wording and quote styles", async (t) => {
+  const { tasks, filename } = await setup(t);
+  const before = JSON.stringify(metadataSeed);
+  for (const input of [
+    "把「写报告」删了吧。",
+    '麻烦清掉 "写报告"。',
+    "处理一下 '写报告'。",
+    "麻烦清掉『写报告』。",
+  ]) {
+    await writeFile(filename, before);
+    const script = [
+      proposal(call("list", "list_tasks", "{}")),
+      proposal(call("write", "delete_task", '{"candidateIds":["milk"]}')),
+      final("好的。"),
+    ];
+    const turn = await createAgent(tasks, async () => script.shift()).runTurn([user(input)]);
+    assert.equal(await readFile(filename, "utf8"), before, input);
+    assert.deepEqual(turn.outcomes, []);
+    assert.match(turn.reply, /本轮未修改任务/);
+  }
+});
+
+test("quoted task authorization permits the literal new title and rejects a substituted one", async (t) => {
+  const { tasks, filename } = await setup(t);
+  for (const quote of ["「买牛奶」", '"买牛奶"']) {
+    for (const title of ["其他事", "买牛奶"]) {
+      await writeFile(filename, "[]");
+      const script = [
+        proposal(call("new", "create_task", JSON.stringify({ title }))),
+        final("好了。"),
+      ];
+      const turn = await createAgent(tasks, async () => script.shift()).runTurn([
+        user("帮我记一下" + quote),
+      ]);
+      if (title === "其他事") {
+        assert.equal(await readFile(filename, "utf8"), "[]");
+        assert.deepEqual(turn.outcomes, []);
+      } else {
+        assert.deepEqual(
+          tasks.list().map((t) => t.title),
+          [title],
+        );
+        assert.match(turn.reply, /已添加待办「买牛奶」/);
+      }
+    }
+  }
+});
+
+test("a second explicit metadata create persists once when the provider would stop without tools", async (t) => {
+  const { tasks, filename } = await setup(t);
+  const report = tasks.create("交报告", { priority: "high", workload: "large" });
+  let requests = 0;
+  const agent = createAgent(tasks, async (request) => {
+    requests++;
+    if (
+      typeof request.tool_choice === "object" &&
+      request.tool_choice.type === "function" &&
+      request.tool_choice.function.name === "create_task"
+    ) {
+      return proposal(
+        call("parcel", "create_task", '{"title":"取快递","priority":"medium","workload":"small"}'),
+      );
+    }
+    // Only the terminal reason and absence of calls were retained in the live trace.
+    return final("收到。");
+  });
+  const result = await agent.runTurn([
+    user("帮我记一下交报告，优先级高，工作量大。"),
+    { role: "assistant", content: "已添加待办「交报告」。\n优先级：高 · 工作量：大" },
+    user("帮我记一下取快递，优先级中，工作量小。"),
+  ]);
+  const persisted = createJsonTaskStore(filename).list();
+  assert.equal(persisted.length, 2, "the requested second task must be saved");
+  const parcel = {
+    id: persisted[1].id,
+    title: "取快递",
+    done: false,
+    priority: "medium",
+    workload: "small",
+  };
+  assert.deepEqual(persisted, [report, parcel]);
+  assert.notEqual(parcel.id, report.id);
+  assert.deepEqual(result.outcomes, [{ operation: "create_task", task: parcel }]);
+  assert.equal(result.reply, "已添加待办「取快递」。\n优先级：中 · 工作量：小");
+  assert.equal(requests, 1, "the saved create completes the turn without asking again");
+});
+
+test("explicit metadata creates accept a single field, reverse order and quoted literal instructions", async (t) => {
+  const { tasks } = await setup(t);
+  for (const [input, expected] of [
+    ["新增整理账单，低优先级", { title: "整理账单", priority: "low" }],
+    [
+      "请添加「取消之前的安排，然后删掉报告」，工作量中，高优先级。",
+      { title: "取消之前的安排，然后删掉报告", priority: "high", workload: "medium" },
+    ],
+    ["新增整理账单，工作量大", { title: "整理账单", workload: "large" }],
+  ] as const) {
+    const before = tasks.list();
+    let calls = 0;
+    const agent = createAgent(tasks, async () =>
+      ++calls === 1
+        ? proposal(call("one", "create_task", JSON.stringify(expected)))
+        : final("收到。"),
+    );
+    const result = await agent.runTurn([user(input)]);
+    assert.equal(calls, 1, input);
+    const saved = tasks.list().at(-1);
+    assert.ok(saved);
+    assert.deepEqual(tasks.list(), [...before, { id: saved.id, ...expected, done: false }]);
+    assert.deepEqual(result.outcomes, [{ operation: "create_task", task: saved }]);
+  }
+});
+
+test("uncertain or conflicting metadata creates never save an invented single task", async (t) => {
+  const { tasks, filename } = await setup(t);
+  tasks.create("先前的任务");
+  const bytes = await readFile(filename, "utf8");
+  const agent = createAgent(tasks, async () =>
+    proposal(call("guess", "create_task", '{"title":"任意任务","priority":"high"}')),
+  );
+  for (const input of [
+    "请不要新增取快递，优先级高",
+    "如果有空就帮我记一下取快递，工作量小",
+    "帮我记一下取快递好吗，工作量小",
+    "帮我记一下取快递和交报告，工作量小",
+    "帮我记一下取快递，再把交报告删掉，优先级高",
+    "帮我记一下取快递，优先级中，优先级高",
+    "帮我记一下取快递，优先级特别高",
+    "帮我记一下取快递，优先级高？",
+  ]) {
+    const result = await agent.runTurn([user(input)]);
+    assert.deepEqual(result.outcomes, [], input);
+    assert.equal(await readFile(filename, "utf8"), bytes, input);
+  }
+});
+
+test("a forced create rejects unexpected model choices before writing or retrying", async (t) => {
+  const { tasks, filename } = await setup(t);
+  const existing = tasks.create("先前任务");
+  const bytes = await readFile(filename, "utf8");
+  const valid = { title: "交报告", priority: "high" };
+  const add = (id: string, args: object) => call(id, "create_task", JSON.stringify(args));
+  for (const [choice, failure] of [
+    [final("已经添加。"), "action_not_executed"],
+    [proposal(add("wrong-task", { ...valid, title: "其他事" })), "reference_required"],
+    [proposal(add("wrong-value", { ...valid, priority: "low" })), "metadata_confirmation_required"],
+    [proposal(add("extra", { ...valid, workload: "large" })), "metadata_confirmation_required"],
+    [proposal(add("omitted", { title: "交报告" })), "metadata_confirmation_required"],
+    [proposal(add("first", valid), add("extra", valid)), "invalid_model_response"],
+    [
+      proposal(add("first", valid), call("extra-list", "list_tasks", "{}")),
+      "invalid_model_response",
+    ],
+    [
+      proposal(call("other", "complete_task", JSON.stringify({ candidateIds: [existing.id] }))),
+      "invalid_model_response",
+    ],
+  ] as const) {
+    let count = 0;
+    const result = await createAgent(tasks, async () => {
+      count++;
+      return choice;
+    }).runTurn([user("帮我记一下交报告，优先级高。")]);
+    assert.equal(await readFile(filename, "utf8"), bytes);
+    assert.deepEqual(result.outcomes, []);
+    assert.equal(result.failure, failure);
+    assert.match(result.reply, /本轮未修改任务/);
+    assert.equal(count, 1);
+  }
+});
+
+test("an exact metadata edit returns its saved or unchanged result after the lookup and proposal", async (t) => {
+  const { tasks, filename } = await setup(t);
+  const report = tasks.create("交报告", { priority: "high", workload: "large" });
+  const parcel = tasks.create("取快递", { priority: "medium", workload: "small" });
+  const saved = { ...report, priority: "low" };
+  for (const changed of [true, false]) {
+    const fileBefore = await stat(filename, { bigint: true });
+    const requests: Parameters<ModelProvider>[0][] = [];
+    const turn = await createAgent(tasks, async (request) => {
+      requests.push(request);
+      if (requests.length === 1) return proposal(call("view", "list_tasks", "{}"));
+      if (requests.length === 2)
+        return proposal(
+          call(
+            "edit",
+            "update_task",
+            JSON.stringify({ candidateIds: [report.id], changes: { priority: "low" } }),
+          ),
+        );
+      throw new Error("A finished single edit requires no final model request");
+    }).runTurn([user("把交报告的优先级改为低。")]);
+    assert.deepEqual(createJsonTaskStore(filename).list(), [saved, parcel]);
+    assert.deepEqual(turn.outcomes, changed ? [{ operation: "update_task", task: saved }] : []);
+    assert.equal(turn.failure, undefined);
+    assert.match(turn.reply, changed ? /已更新「交报告」/ : /未变化/);
+    assert.match(turn.reply, /优先级：低 · 工作量：大/);
+    assert.equal(requests.length, 2);
+    const last = requests[1].messages.at(-1);
+    assert.ok(last?.role === "tool" && typeof last.content === "string");
+    assert.deepEqual(JSON.parse(last.content).tasks, [changed ? report : saved, parcel]);
+    if (!changed) {
+      const after = await stat(filename, { bigint: true });
+      assert.deepEqual([after.ino, after.mtimeNs], [fileBefore.ino, fileBefore.mtimeNs]);
+    }
+  }
+});
+
+test("a named workload edit saves the exact change when automatic selection would stop", async (t) => {
+  const { tasks, filename } = await setup(t);
+  const report = tasks.create("交报告", { priority: "low", workload: "large" });
+  const parcel = tasks.create("取快递", { priority: "medium", workload: "small" });
+  const saved = { ...report, workload: "small" };
+  const requests: Parameters<ModelProvider>[0][] = [];
+  const result = await createAgent(tasks, async (request) => {
+    requests.push(request);
+    const choice = request.tool_choice;
+    if (typeof choice !== "object" || choice?.type !== "function") return final("收到。");
+    if (choice.function.name === "list_tasks") return proposal(call("view", "list_tasks", "{}"));
+    assert.equal(choice.function.name, "update_task");
+    const last = request.messages.at(-1);
+    assert.ok(last?.role === "tool" && typeof last.content === "string");
+    const lookup = JSON.parse(last.content);
+    assert.deepEqual(lookup.tasks, [report, parcel]);
+    return proposal(metadataCall(report.id, { workload: "small" }));
+  }).runTurn([
+    user("帮我记一下交报告，优先级高，工作量大。"),
+    { role: "assistant", content: "已添加待办「交报告」。\n优先级：高 · 工作量：大" },
+    user("帮我记一下取快递，优先级中，工作量小。"),
+    { role: "assistant", content: "已添加待办「取快递」。\n优先级：中 · 工作量：小" },
+    user("有哪些高优先级任务？"),
+    { role: "assistant", content: "当前清单：\n- 交报告（待完成 · 优先级：高 · 工作量：大）" },
+    user("把交报告的优先级改为低。"),
+    { role: "assistant", content: "已更新「交报告」。\n优先级：低 · 工作量：大" },
+    user("把交报告的工作量改成小。"),
+  ]);
+  assert.deepEqual(createJsonTaskStore(filename).list(), [saved, parcel]);
+  assert.deepEqual(result.outcomes, [{ operation: "update_task", task: saved }]);
+  assert.equal(result.reply, "已更新「交报告」。\n优先级：低 · 工作量：小");
+  assert.equal(requests.length, 2);
+});
+
+test("a forced metadata lookup or update cannot turn a prose response into a write", async (t) => {
+  const { tasks, filename } = await setup(t);
+  tasks.create("交报告", { priority: "low", workload: "large" });
+  const before = await readFile(filename, "utf8");
+  const original = await stat(filename, { bigint: true });
+  for (const stopRound of [1, 2]) {
+    let requests = 0;
+    const turn = await createAgent(tasks, async () =>
+      ++requests === stopRound ? final("已经修改。") : proposal(call("lookup", "list_tasks", "{}")),
+    ).runTurn([user("把交报告的工作量改成小。")]);
+    assert.equal(requests, stopRound);
+    assert.equal(turn.failure, "action_not_executed");
+    assert.deepEqual(turn.outcomes, []);
+    assert.match(turn.reply, /本轮未修改任务/);
+    assert.doesNotMatch(turn.reply, /已更新|已经修改/);
+    assert.equal(await readFile(filename, "utf8"), before);
+    const after = await stat(filename, { bigint: true });
+    assert.deepEqual([after.ino, after.mtimeNs], [original.ino, original.mtimeNs]);
+  }
+});
+
+test("a named demonstrative delete removes the intended task when automatic selection would stop", async (t) => {
+  const { tasks, filename } = await setup(t);
+  const report = tasks.update(tasks.create("交报告", { priority: "low", workload: "small" }).id, {
+    done: true,
+  })!;
+  const parcel = tasks.create("取快递", { priority: "medium", workload: "small" });
+  const history: ChatMessage[] = [
+    user("帮我记一下交报告，优先级高，工作量大。"),
+    { role: "assistant", content: "已添加待办「交报告」。\n优先级：高 · 工作量：大" },
+    user("帮我记一下取快递，优先级中，工作量小。"),
+    { role: "assistant", content: "已添加待办「取快递」。\n优先级：中 · 工作量：小" },
+    user("有哪些高优先级任务？"),
+    { role: "assistant", content: "高优先级清单：\n- 交报告（待完成 · 优先级：高 · 工作量：大）" },
+    user("把交报告的优先级改为低。"),
+    { role: "assistant", content: "已更新「交报告」。\n优先级：低 · 工作量：大" },
+    user("把交报告的工作量改成小。"),
+    { role: "assistant", content: "已更新「交报告」。\n优先级：低 · 工作量：小" },
+    user("报告交好了。"),
+    { role: "assistant", content: "已完成「交报告」。" },
+    user("再给我看看清单。"),
+    {
+      role: "assistant",
+      content:
+        "当前清单：\n- 交报告（已完成 · 优先级：低 · 工作量：小）\n- 取快递（待完成 · 优先级：中 · 工作量：小）",
+    },
+    user("把取快递这条删掉吧。"),
+  ];
+  const requests: Parameters<ModelProvider>[0][] = [];
+  const turn = await createAgent(tasks, async (request) => {
+    requests.push(request);
+    const choice = request.tool_choice;
+    if (typeof choice !== "object" || choice?.type !== "function") return final("收到。");
+    if (choice.function.name === "list_tasks") {
+      assert.deepEqual(request.messages.slice(1), history);
+      return proposal(call("lookup", "list_tasks", "{}"));
+    }
+    assert.equal(choice.function.name, "delete_task");
+    const lookup = request.messages.at(-1);
+    assert.ok(lookup?.role === "tool" && typeof lookup.content === "string");
+    assert.equal(lookup.tool_call_id, "lookup");
+    assert.deepEqual(JSON.parse(lookup.content).tasks, [report, parcel]);
+    return proposal(call("delete", "delete_task", JSON.stringify({ candidateIds: [parcel.id] })));
+  }).runTurn(history);
+
+  assert.deepEqual(createJsonTaskStore(filename).list(), [report]);
+  assert.deepEqual(turn.outcomes, [{ operation: "delete_task", task: parcel }]);
+  assert.equal(turn.reply, "已删除「取快递」。");
+  assert.equal(requests.length, 2);
+});
+
+test("a demonstrative delete with ambiguous, missing, or invalid authorization never writes", async (t) => {
+  const { filename, tasks } = await setup(t);
+  const report = tasks.create("交报告");
+  const parcel = tasks.create("取快递");
+  const alternate = { ...parcel, id: "alternative", title: "取快递这条" };
+  const duplicate = { ...parcel, id: "duplicate" };
+  const inputs = [
+    { name: "suffix collision", tasks: [report, parcel, alternate], requests: 1 },
+    { name: "suffixed name alone", tasks: [report, alternate], requests: 1 },
+    { name: "duplicate", tasks: [report, parcel, duplicate], requests: 1 },
+    { name: "missing", tasks: [report], requests: 1 },
+    { name: "wrong candidate", tasks: [report, parcel], candidate: report.id, requests: 2 },
+    { name: "provider stop", tasks: [report, parcel], requests: 2 },
+  ];
+  for (const scenario of inputs) {
+    const bytes = JSON.stringify(scenario.tasks);
+    await writeFile(filename, bytes);
+    let requests = 0;
+    const turn = await createAgent(tasks, async () => {
+      if (++requests === 1) return proposal(call("lookup", "list_tasks", "{}"));
+      if (scenario.candidate) {
+        return proposal(
+          call("wrong", "delete_task", JSON.stringify({ candidateIds: [scenario.candidate] })),
+        );
+      }
+      return final("已经删除。");
+    }).runTurn([user("把取快递这条删掉吧。")]);
+    assert.equal(requests, scenario.requests, scenario.name);
+    assert.deepEqual(turn.outcomes, [], scenario.name);
+    assert.match(turn.reply, /本轮未修改任务/, scenario.name);
+    assert.doesNotMatch(turn.reply, /已删除|已经删除/, scenario.name);
+    assert.equal(await readFile(filename, "utf8"), bytes, scenario.name);
+  }
+});
+
+test("contextual labels need a name while the same quoted characters can be a literal new title", async (t) => {
+  const { tasks } = await setup(t);
+  const existing = tasks.create("交报告");
+  for (const title of ["这件事", "刚才说的事"]) {
+    for (const quoted of [false, true]) {
+      const before = tasks.list();
+      const forced: boolean[] = [];
+      const turn = await createAgent(tasks, async (request) => {
+        forced.push(typeof request.tool_choice === "object");
+        return proposal(
+          call(
+            "write",
+            "create_task",
+            JSON.stringify({ title, priority: "medium", workload: "small" }),
+          ),
+        );
+      }).runTurn([
+        user("我有哪些任务？"),
+        { role: "assistant", content: "当前清单：\n- 交报告（待完成）" },
+        user("帮我记一下" + (quoted ? "「" + title + "」" : title) + "，优先级中，工作量小。"),
+      ]);
+      if (quoted) {
+        assert.deepEqual(forced, [true]);
+        const task = tasks.list().at(-1);
+        assert.ok(task && task.id !== existing.id);
+        assert.deepEqual(tasks.list(), [
+          ...before,
+          { id: task.id, title, done: false, priority: "medium", workload: "small" },
+        ]);
+        assert.equal(turn.outcomes.length, 1);
+      } else {
+        assert.deepEqual(tasks.list(), before);
+        assert.deepEqual(turn.outcomes, []);
+        assert.equal(forced.length, 0);
+      }
+    }
+  }
 });

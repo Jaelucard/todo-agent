@@ -68,12 +68,14 @@ function observeProposals(result: unknown): string[] {
 }
 
 const clarificationFailures = [
+  "metadata_confirmation_required",
   "ambiguous_reference",
   "reference_required",
   "task_not_found",
   "exact_title_not_found",
 ];
 const clarificationLines = [
+  "请确认任务全名，以及要设置的优先级或工作量和对应的值。",
   "请告诉我你指的是哪一项任务。",
   "找不到指定的任务，请确认名称。",
   "当前清单中没有完全同名的任务，请确认名称。",

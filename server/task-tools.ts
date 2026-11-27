@@ -6,7 +6,9 @@ import type { TaskStore } from "./task-store.ts";
 type Task = Pick<ReturnType<TaskStore["create"]>, "id" | "title" | "done"> & TaskMetadata;
 type BoundReference = Pick<Task, "id" | "title">;
 type ResolvedTarget = { ok: true; task: Task } | Extract<ToolResult, { ok: false }>;
+type RequestedTarget = { title: string; changes?: TaskMetadata };
 type ToolError =
+  | "metadata_confirmation_required"
   | "unknown_tool"
   | "invalid_arguments"
   | "duplicate_create"
@@ -44,7 +46,10 @@ export function createTaskTools(tasks: TaskStore, boundReference?: BoundReferenc
   const createdTitles = new Set<string>();
   let lastView: string | undefined;
 
-  function resolveTarget(selector: z.infer<typeof selectorSchema>): ResolvedTarget {
+  function resolveTarget(
+    selector: z.infer<typeof selectorSchema>,
+    expectedTitle?: string,
+  ): ResolvedTarget {
     const semantic = "candidateIds" in selector;
     if (semantic && lastView === undefined) {
       return {
@@ -73,13 +78,19 @@ export function createTaskTools(tasks: TaskStore, boundReference?: BoundReferenc
       return { ok: false, error: "ambiguous_reference" };
     }
     if (!semantic && target.title !== binding?.title) return { ok: false, error: "stale_view" };
+    if (expectedTitle !== undefined && target.title !== expectedTitle)
+      return { ok: false, error: "reference_required" };
     return { ok: true, task: target };
   }
 
-  function mutateTask(tool: "complete_task" | "delete_task", args: unknown): ToolResult {
+  function mutateTask(
+    tool: "complete_task" | "delete_task",
+    args: unknown,
+    expectedTitle?: string,
+  ): ToolResult {
     const input = selectorSchema.safeParse(args);
     if (!input.success) return { ok: false, error: "invalid_arguments" };
-    const resolved = resolveTarget(input.data);
+    const resolved = resolveTarget(input.data, expectedTitle);
     if (!resolved.ok) return resolved;
     const target = resolved.task;
     if (tool === "complete_task") {
@@ -95,13 +106,18 @@ export function createTaskTools(tasks: TaskStore, boundReference?: BoundReferenc
     return { ok: true, tool, task: target };
   }
 
-  function updateTask(args: unknown): ToolResult {
+  function updateTask(args: unknown, grant?: RequestedTarget): ToolResult {
     const input = updateTaskSchema.safeParse(args);
     if (!input.success) return { ok: false, error: "invalid_arguments" };
-    const resolved = resolveTarget(input.data);
+    const resolved = resolveTarget(input.data, grant?.title);
     if (!resolved.ok) return resolved;
     const target = resolved.task;
     const changes = input.data.changes;
+    if (
+      grant &&
+      (changes.priority !== grant.changes?.priority || changes.workload !== grant.changes?.workload)
+    )
+      return { ok: false, error: "metadata_confirmation_required" };
     if (
       (changes.priority === undefined || changes.priority === target.priority) &&
       (changes.workload === undefined || changes.workload === target.workload)
@@ -123,7 +139,7 @@ export function createTaskTools(tasks: TaskStore, boundReference?: BoundReferenc
         return { ok: false, error: "storage_error" };
       }
     },
-    execute(tool: string, argumentsJson: string): ToolResult {
+    execute(tool: string, argumentsJson: string, grant?: RequestedTarget): ToolResult {
       if (
         tool !== "list_tasks" &&
         tool !== "create_task" &&
@@ -154,6 +170,13 @@ export function createTaskTools(tasks: TaskStore, boundReference?: BoundReferenc
             const input = createTaskSchema.safeParse(args);
             if (!input.success) return { ok: false, error: "invalid_arguments" };
             const { title, ...metadata } = input.data;
+            if (grant && title !== grant.title) return { ok: false, error: "reference_required" };
+            if (
+              grant?.changes &&
+              (metadata.priority !== grant.changes.priority ||
+                metadata.workload !== grant.changes.workload)
+            )
+              return { ok: false, error: "metadata_confirmation_required" };
             if (createdTitles.has(title)) return { ok: false, error: "duplicate_create" };
             const task = tasks.create(title, metadata);
             createdTitles.add(title);
@@ -162,9 +185,9 @@ export function createTaskTools(tasks: TaskStore, boundReference?: BoundReferenc
           }
           case "complete_task":
           case "delete_task":
-            return mutateTask(tool, args);
+            return mutateTask(tool, args, grant?.title);
           case "update_task":
-            return updateTask(args);
+            return updateTask(args, grant);
         }
       } catch {
         return { ok: false, error: "storage_error" };
