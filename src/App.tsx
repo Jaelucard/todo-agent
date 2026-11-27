@@ -1,7 +1,16 @@
 import { useRef, useState, type KeyboardEvent } from "react";
 import type { ChatMessage } from "../shared/chat.ts";
-import { requestReply } from "./chat-client.ts";
+import {
+  ChatRequestRejected,
+  requestReply,
+  requestTaskList,
+  type TaskStatus,
+} from "./chat-client.ts";
 import { ChatHistory } from "./ChatHistory.tsx";
+
+type Recovery =
+  | { status: "available" | "checking" | "failed" }
+  | { status: "loaded"; tasks: TaskStatus[] };
 
 function isSendShortcut(event: KeyboardEvent<HTMLTextAreaElement>) {
   // 中文输入法会用 Enter 确认选词，部分浏览器此时只报告键码 229。
@@ -14,26 +23,44 @@ export default function App() {
   const [draft, setDraft] = useState("");
   const [pending, setPending] = useState(false);
   const [error, setError] = useState("");
+  const [recovery, setRecovery] = useState<Recovery>();
   const input = useRef<HTMLTextAreaElement>(null);
+  const checking = recovery?.status === "checking";
 
   async function send(text: string) {
     const content = text.trim();
-    if (!content || pending) return;
+    if (!content || pending || checking) return;
     const outgoing: ChatMessage[] = [...messages, { role: "user", content }];
     setMessages(outgoing);
     setDraft("");
     setPending(true);
     setError("");
+    setRecovery(undefined);
     try {
       const answer = await requestReply(outgoing);
       setMessages([...outgoing, { role: "assistant", content: answer }]);
     } catch (cause) {
       setMessages(messages);
-      setDraft(text);
-      setError(cause instanceof Error ? `发送失败：${cause.message}` : "发送失败，请重试。");
+      if (cause instanceof ChatRequestRejected) {
+        setDraft(text);
+        setError(`发送失败：${cause.message}`);
+      } else {
+        setRecovery({ status: "available" });
+      }
     } finally {
       setPending(false);
       requestAnimationFrame(() => input.current?.focus());
+    }
+  }
+
+  async function checkTasks() {
+    if (checking) return;
+    setRecovery({ status: "checking" });
+    try {
+      const tasks = await requestTaskList();
+      setRecovery({ status: "loaded", tasks });
+    } catch {
+      setRecovery({ status: "failed" });
     }
   }
 
@@ -51,6 +78,33 @@ export default function App() {
             <p className="error" role="alert">
               {error}
             </p>
+          )}
+          {recovery && (
+            <div>
+              <p className="error" role="alert">
+                发送结果未知，原操作可能仍在处理。请先查看当前任务，再决定是否重新发送。
+              </p>
+              <button type="button" disabled={checking} onClick={() => void checkTasks()}>
+                查看当前任务
+              </button>
+              {checking && <p role="status">正在读取任务…</p>}
+              {recovery.status === "failed" && <p role="status">读取任务清单失败。</p>}
+              {recovery.status === "loaded" &&
+                (recovery.tasks.length ? (
+                  <ul
+                    aria-label="当前任务"
+                    style={{ maxHeight: "12rem", overflowY: "auto", overflowWrap: "anywhere" }}
+                  >
+                    {recovery.tasks.map((task) => (
+                      <li key={task.id}>
+                        {task.title}（{task.done ? "已完成" : "待完成"}）
+                      </li>
+                    ))}
+                  </ul>
+                ) : (
+                  <p role="status">当前没有待办。</p>
+                ))}
+            </div>
           )}
           <form
             onSubmit={(event) => {
@@ -73,7 +127,11 @@ export default function App() {
                 }
               }}
             />
-            <button className="send" disabled={pending || !draft.trim()} aria-label="发送消息">
+            <button
+              className="send"
+              disabled={pending || checking || !draft.trim()}
+              aria-label="发送消息"
+            >
               ↑
             </button>
           </form>

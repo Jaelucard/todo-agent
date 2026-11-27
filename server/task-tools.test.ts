@@ -87,7 +87,7 @@ test("rejects invalid calls, missing IDs, and ambiguous candidates without chang
     ["complete_task", '{"candidateIds":[7]}', "invalid_arguments"],
     ["delete_task", JSON.stringify({ id: milk.id }), "invalid_arguments"],
     ["delete_task", '{"candidateIds":["missing"],"useBoundReference":true}', "invalid_arguments"],
-    ["complete_task", '{"candidateIds":[]}', "ambiguous_reference"],
+    ["complete_task", '{"candidateIds":[]}', "task_not_found"],
     [
       "complete_task",
       JSON.stringify({ candidateIds: [milk.id, parcel.id] }),
@@ -100,6 +100,18 @@ test("rejects invalid calls, missing IDs, and ambiguous candidates without chang
     assert.deepEqual(tools.execute(name, args), { ok: false, error }, `${name} ${args}`);
     assert.equal(await readFile(filename, "utf8"), before);
   }
+});
+
+test("a fresh lookup with no matching candidates reports a missing task without writing", async (t) => {
+  const { tasks, filename } = await temporaryStore(t);
+  tasks.create("取快递");
+  const before = await readFile(filename, "utf8");
+  const tools = createTaskTools(tasks);
+  const args = '{"candidateIds":[]}';
+  assert.deepEqual(tools.execute("delete_task", args), { ok: false, error: "list_required" });
+  assert.ok(tools.execute("list_tasks", "{}").ok);
+  assert.deepEqual(tools.execute("delete_task", args), { ok: false, error: "task_not_found" });
+  assert.equal(await readFile(filename, "utf8"), before);
 });
 
 test("REST sees a tool-created task and a REST update invalidates the previous tool view", async (t) => {

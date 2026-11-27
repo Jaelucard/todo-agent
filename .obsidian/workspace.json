@@ -183,15 +183,22 @@
   },
   "active": "4864a9c125335f17",
   "lastOpenFiles": [
+    "planning/17-checkpoint-4-teaching-handover.md",
+    "planning/16-checkpoint-4-reliability.md",
+    "server/reliability-cases.ts",
+    "server/reliability-eval.ts",
+    "server/reliability.test.ts",
+    "server/reliability-live.ts",
+    "server/chat-client.test.ts",
+    "planning/15-checkpoint-3-live-rerun-report.md",
+    "planning/14-checkpoint-3-targeted-1795753911119.jsonl",
+    "planning/14-checkpoint-3-live-rerun-1795753911118.jsonl",
     "planning/12-checkpoint-3-list-repair.md",
     "planning/13-checkpoint-3-repair-mock-1795720938033.jsonl",
     "planning/13-checkpoint-3-repair-mock-trace.jsonl",
     "planning/11-checkpoint-3-live-acceptance.md",
     "planning/09-checkpoint-3-live-trace.jsonl",
     "planning/10-checkpoint-3-independent-audit.md",
-    "planning/08-checkpoint-3-verification.md",
-    "planning/07-checkpoint-3-evaluation.mjs",
-    "server/acceptance.test.ts",
-    "planning/06-checkpoint-2-live-trace.jsonl"
+    "planning/08-checkpoint-3-verification.md"
   ]
 }

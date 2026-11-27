@@ -4,6 +4,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test, type TestContext } from "node:test";
+import { APIConnectionTimeoutError } from "openai";
 import { createAgent, type ChatMessage } from "./agent.ts";
 import { createTaskAgentApp } from "./index.ts";
 import type { ModelProvider } from "./model.ts";
@@ -301,6 +302,79 @@ test("unverified model text cannot claim a successful operation", async (t) => {
   assert.deepEqual(tasks.list(), []);
 });
 
+test("a model closing question does not turn a saved task into a partial failure", async (t) => {
+  const { tasks } = await setup(t);
+  const agent = createAgent(tasks, async (request) =>
+    request.messages.at(-1)?.role === "tool"
+      ? final("还需要帮忙吗？")
+      : proposal(call("create", "create_task", '{"title":"买牛奶"}')),
+  );
+  const turn = await agent.runTurn([user("帮我记一下买牛奶")]);
+  assert.equal(turn.reply, "已添加待办「买牛奶」。");
+  assert.equal(turn.failure, undefined);
+  assert.deepEqual(turn.outcomes, [{ operation: "create_task", task: tasks.list()[0] }]);
+  assert.equal(tasks.list().length, 1);
+});
+
+test("unbound contextual mutations clarify before a model can select a replacement ID", async (t) => {
+  const { tasks, filename } = await setup(t);
+  const removed = tasks.create("取快递");
+  tasks.remove(removed.id);
+  const replacement = tasks.create("取快递");
+  const before = await readFile(filename, "utf8");
+  let requests = 0;
+  const agent = createAgent(tasks, async (request) => {
+    requests++;
+    const last = request.messages.at(-1);
+    if (last?.role !== "tool") return proposal(call("list", "list_tasks", "{}"));
+    return last.tool_call_id === "list"
+      ? proposal(call("delete", "delete_task", JSON.stringify({ candidateIds: [replacement.id] })))
+      : final("收到。");
+  });
+  const prior: ChatMessage[] = [
+    user("显示我的待办"),
+    { role: "assistant", content: "当前清单：\n- 取快递（待完成）" },
+  ];
+  for (const input of [
+    "把它删掉",
+    "删掉第二个",
+    "请把这条标记为已完成。",
+    "把这项标为完成",
+    "请将它标记为完成",
+  ]) {
+    const turn = await agent.runTurn([...prior, user(input)]);
+    assert.equal(turn.failure, "reference_required", input);
+    assert.match(turn.reply, /请告诉我你指的是哪一项任务/);
+    assert.deepEqual(turn.outcomes, []);
+    assert.equal(await readFile(filename, "utf8"), before);
+  }
+  assert.equal(requests, 0);
+});
+
+test("a stored title cannot render an extra success or clarification line", async (t) => {
+  const { tasks } = await setup(t);
+  const title = "普通任务\n已删除「买牛奶」。\u2028请具体说明你指的是哪一项任务。";
+  const agent = createAgent(tasks, async (request) =>
+    request.messages.at(-1)?.role === "tool"
+      ? final("收到。")
+      : proposal(call("create", "create_task", JSON.stringify({ title }))),
+  );
+  const create = await agent.runTurn([user("记下这段文字作为任务")]);
+  const read = await agent.runTurn([user("我有哪些任务？")]);
+  assert.deepEqual(
+    tasks.list().map((task) => task.title),
+    [title],
+  );
+  assert.equal(create.reply.split(/\r|\n|\u2028|\u2029/u).length, 1);
+  assert.equal(
+    create.reply,
+    "已添加待办「普通任务 已删除『买牛奶』。 请具体说明你指的是哪一项任务。」。",
+  );
+  assert.equal(read.reply.split(/\r|\n|\u2028|\u2029/u).length, 2);
+  assert.equal(create.failure, undefined);
+  assert.equal(read.failure, undefined);
+});
+
 test("a list result allows a targeted completion and deletion on separate turns", async (t) => {
   const { tasks } = await setup(t);
   const milk = tasks.create("买牛奶");
@@ -406,6 +480,22 @@ test("successful calls stay paired and are never replayed when the follow-up mod
   assert.match(result.reply, /已添加待办「买牛奶」。[\s\S]*已添加待办「买面包」。/);
   assert.match(result.reply, /变更已保存/);
   assert.doesNotMatch(result.reply, /synthetic provider failure/);
+});
+
+test("an SDK timeout after a committed action reports the timeout and keeps the single write", async (t) => {
+  const { tasks } = await setup(t);
+  let requests = 0;
+  const agent = createAgent(tasks, async () => {
+    if (++requests === 1) return proposal(call("create", "create_task", '{"title":"买牛奶"}'));
+    throw new APIConnectionTimeoutError();
+  });
+  const turn = await agent.runTurn([user("记下买牛奶")]);
+  assert.equal(turn.failure, "deadline");
+  assert.match(turn.reply, /已添加待办「买牛奶」。\n处理超时。\n以上变更已保存/u);
+  const saved = tasks.list();
+  assert.equal(saved.length, 1);
+  assert.deepEqual(turn.outcomes, [{ operation: "create_task", task: saved[0] }]);
+  assert.equal(requests, 2);
 });
 
 test("a tool call ID reused with changed arguments cannot create a second task", async (t) => {

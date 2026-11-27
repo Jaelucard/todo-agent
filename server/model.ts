@@ -1,4 +1,4 @@
-import OpenAI from "openai";
+import OpenAI, { APIConnectionTimeoutError } from "openai";
 import type {
   ChatCompletionCreateParamsNonStreaming,
   ChatCompletionFunctionTool,
@@ -14,6 +14,10 @@ export type ModelProvider = (
 
 export const model = process.env.DEEPSEEK_MODEL || "deepseek-flash";
 export const MODEL_TIMEOUT_MS = 20_000;
+
+export function isModelTimeout(error: unknown): boolean {
+  return error instanceof APIConnectionTimeoutError;
+}
 
 export function getModelClient(): OpenAI {
   const apiKey = process.env.DEEPSEEK_API_KEY;

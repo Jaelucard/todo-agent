@@ -42,12 +42,12 @@ export function createTaskTools(tasks: TaskStore, boundReference?: BoundReferenc
     if (!input.success) return { ok: false, error: "invalid_arguments" };
     const selector = input.data;
     const semantic = "candidateIds" in selector;
-    if (semantic && selector.candidateIds.length !== 1) {
+    if (semantic && selector.candidateIds.length > 1) {
       return { ok: false, error: "ambiguous_reference" };
     }
     if (semantic && lastView === undefined) return { ok: false, error: "list_required" };
     const id = semantic ? selector.candidateIds[0] : binding?.id;
-    if (id === undefined) return { ok: false, error: "reference_required" };
+    if (!semantic && id === undefined) return { ok: false, error: "reference_required" };
 
     // Validate the same view given to the caller, then write synchronously.
     const current = tasks.list().map(taskSummary);
@@ -55,6 +55,7 @@ export function createTaskTools(tasks: TaskStore, boundReference?: BoundReferenc
       lastView = undefined;
       return { ok: false, error: "stale_view" };
     }
+    if (id === undefined) return { ok: false, error: "task_not_found" };
     const [target, duplicateId] = current.filter((task) => task.id === id);
     if (!target) return { ok: false, error: "task_not_found" };
     if (
