@@ -4,6 +4,7 @@ import type { TaskStore } from "./task-store.ts";
 
 type Task = Pick<ReturnType<TaskStore["create"]>, "id" | "title" | "done">;
 type BoundReference = Pick<Task, "id" | "title">;
+type ResolvedTarget = { ok: true; task: Task } | Extract<ToolResult, { ok: false }>;
 type ToolError =
   | "unknown_tool"
   | "invalid_arguments"
@@ -37,24 +38,25 @@ export function createTaskTools(tasks: TaskStore, boundReference?: BoundReferenc
   const createdTitles = new Set<string>();
   let lastView: string | undefined;
 
-  function mutateTask(tool: "complete_task" | "delete_task", args: unknown): ToolResult {
-    const input = selectorSchema.safeParse(args);
-    if (!input.success) return { ok: false, error: "invalid_arguments" };
-    const selector = input.data;
+  function resolveTarget(selector: z.infer<typeof selectorSchema>): ResolvedTarget {
     const semantic = "candidateIds" in selector;
-    if (semantic && selector.candidateIds.length > 1) {
-      return { ok: false, error: "ambiguous_reference" };
+    if (semantic && lastView === undefined) {
+      return {
+        ok: false,
+        error: selector.candidateIds.length > 1 ? "ambiguous_reference" : "list_required",
+      };
     }
-    if (semantic && lastView === undefined) return { ok: false, error: "list_required" };
     const id = semantic ? selector.candidateIds[0] : binding?.id;
     if (!semantic && id === undefined) return { ok: false, error: "reference_required" };
 
-    // Validate the same view given to the caller, then write synchronously.
+    // Revalidate the view before either describing a target or modifying it.
     const current = tasks.list().map(taskSummary);
     if (semantic && JSON.stringify(current) !== lastView) {
       lastView = undefined;
       return { ok: false, error: "stale_view" };
     }
+    if (semantic && selector.candidateIds.length > 1)
+      return { ok: false, error: "ambiguous_reference" };
     if (id === undefined) return { ok: false, error: "task_not_found" };
     const [target, duplicateId] = current.filter((task) => task.id === id);
     if (!target) return { ok: false, error: "task_not_found" };
@@ -65,7 +67,15 @@ export function createTaskTools(tasks: TaskStore, boundReference?: BoundReferenc
       return { ok: false, error: "ambiguous_reference" };
     }
     if (!semantic && target.title !== binding?.title) return { ok: false, error: "stale_view" };
+    return { ok: true, task: target };
+  }
 
+  function mutateTask(tool: "complete_task" | "delete_task", args: unknown): ToolResult {
+    const input = selectorSchema.safeParse(args);
+    if (!input.success) return { ok: false, error: "invalid_arguments" };
+    const resolved = resolveTarget(input.data);
+    if (!resolved.ok) return resolved;
+    const target = resolved.task;
     if (tool === "complete_task") {
       if (target.done) return { ok: true, tool, task: target, changed: false };
       const updated = tasks.update(target.id, { done: true });
@@ -80,6 +90,14 @@ export function createTaskTools(tasks: TaskStore, boundReference?: BoundReferenc
   }
 
   return {
+    // Server-only observation. Never dispatch a mutation to find out whether it is a no-op.
+    inspectCandidates(candidateIds: string[]): ResolvedTarget {
+      try {
+        return resolveTarget({ candidateIds });
+      } catch {
+        return { ok: false, error: "storage_error" };
+      }
+    },
     execute(tool: string, argumentsJson: string): ToolResult {
       if (
         tool !== "list_tasks" &&

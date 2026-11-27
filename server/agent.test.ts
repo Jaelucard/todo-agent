@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { once } from "node:events";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test, type TestContext } from "node:test";
@@ -30,6 +30,228 @@ const final = (content: string) => ({
   message: { role: "assistant", content },
 });
 const user = (content: string): ChatMessage => ({ role: "user", content });
+
+// Replay the two observed provider choices. The archived trace omits final prose.
+function listThenStop(
+  tasks: ReturnType<typeof createJsonTaskStore>,
+  onStop?: () => void,
+  text = "已执行。",
+) {
+  const requests: Parameters<ModelProvider>[0][] = [];
+  const agent = createAgent(tasks, async (request) => {
+    requests.push(request);
+    if (requests.length === 1) return proposal(call("lookup", "list_tasks", "{}"));
+    assert.equal(requests.length, 2);
+    assert.deepEqual(request.messages.at(-1), {
+      role: "tool",
+      tool_call_id: "lookup",
+      content: JSON.stringify({ ok: true, tool: "list_tasks", tasks: tasks.list() }),
+    });
+    onStop?.();
+    return final(text);
+  });
+  return { agent, requests };
+}
+
+for (const [name, input, done, expectedFailure, expectedReply] of [
+  [
+    "missing named task",
+    "请删掉「预约牙医」这项任务。",
+    false,
+    "exact_title_not_found",
+    "当前清单中没有完全同名的任务，请确认名称。",
+  ],
+  ["already completed task", "再把买牛奶标记完成", true, undefined, "「买牛奶」已经完成。"],
+] as const) {
+  test(`a lookup followed by stop explains the ${name} without a write`, async (t) => {
+    const { filename, tasks } = await setup(t);
+    const initial = [
+      { id: "milk", title: "买牛奶", done },
+      { id: "parcel", title: "取快递", done: false },
+    ];
+    await writeFile(filename, JSON.stringify(initial));
+    const fileBefore = await stat(filename, { bigint: true });
+    const { agent, requests } = listThenStop(tasks);
+    const turn = await agent.runTurn([user(input)]);
+    assert.equal(requests.length, 2);
+    assert.deepEqual(tasks.list(), initial);
+    assert.equal(await readFile(filename, "utf8"), JSON.stringify(initial));
+    const fileAfter = await stat(filename, { bigint: true });
+    assert.deepEqual([fileAfter.ino, fileAfter.mtimeNs], [fileBefore.ino, fileBefore.mtimeNs]);
+    assert.deepEqual(turn.outcomes, []);
+    assert.equal(turn.failure, expectedFailure);
+    assert.ok(turn.reply.split("\n").includes(expectedReply), turn.reply);
+    assert.doesNotMatch(turn.reply, /已执行/);
+  });
+}
+
+test("a stopped lookup reports only what a single, identified task establishes", async (t) => {
+  const { filename, tasks } = await setup(t);
+  const initial = [
+    { id: "done", title: "写报告", done: true },
+    { id: "pending", title: "预约牙医", done: false },
+    { id: "a", title: "登记完成", done: true },
+    { id: "b", title: "完成登记", done: true },
+  ];
+  await writeFile(filename, JSON.stringify(initial));
+  for (const [input, expected] of [
+    ["请将“写报告”标为已完成。", "「写报告」已经完成。"],
+    ["删除「牙医」", "请告诉我你指的是哪一项任务。"],
+    ["删掉买菜", "请告诉我你指的是哪一项任务。"],
+    ["完成登记完成", "请告诉我你指的是哪一项任务。"],
+    ["请把预约牙医标记完成", "尚未执行请求的操作。"],
+    ["删除写报告", "尚未执行请求的操作。"],
+  ]) {
+    const turn = await listThenStop(tasks).agent.runTurn([user(input)]);
+    assert.ok(turn.reply.includes(expected), input + " " + turn.reply);
+    assert.deepEqual(turn.outcomes, []);
+    assert.deepEqual(tasks.list(), initial);
+  }
+  for (const [input, expected] of [
+    ["将写报告标为完成", "「写报告」已经完成。"],
+    ["请移除“买面包”", "当前清单中没有完全同名的任务，请确认名称。"],
+  ]) {
+    const turn = await listThenStop(tasks, undefined, "需要澄清").agent.runTurn([user(input)]);
+    assert.ok(turn.reply.includes(expected), turn.reply);
+  }
+  for (const input of [
+    "不要把写报告标记完成",
+    "把写报告标记完成？",
+    "先列清单，再删除「面包」",
+    "删除「面包」或「牙医」",
+  ]) {
+    const turn = await listThenStop(tasks).agent.runTurn([user(input)]);
+    assert.doesNotMatch(turn.reply, /已经完成。|找不到指定的任务|没有完全同名|已删除|已执行/);
+    if (input === "不要把写报告标记完成") assert.equal(turn.failure, undefined);
+    assert.deepEqual(turn.outcomes, []);
+    assert.deepEqual(tasks.list(), initial);
+  }
+  assert.equal(await readFile(filename, "utf8"), JSON.stringify(initial));
+});
+
+test("both no-match paths report exact-title absence when a semantic alias remains possible", async (t) => {
+  const { filename, tasks } = await setup(t);
+  const alias = tasks.create("联系口腔诊所约诊");
+  const before = await readFile(filename, "utf8");
+  const input = [user("请删掉「预约牙医」这项任务。")];
+  for (const answer of [
+    final("没有相关的任务。"),
+    proposal(call("no-match", "delete_task", '{"candidateIds":[]}')),
+  ]) {
+    let requests = 0;
+    const agent = createAgent(tasks, async () =>
+      requests++ === 0 ? proposal(call("lookup", "list_tasks", "{}")) : answer,
+    );
+    const turn = await agent.runTurn(input);
+    assert.equal(requests, 2);
+    assert.equal(turn.failure, "exact_title_not_found");
+    assert.match(turn.reply, /^当前清单中没有完全同名的任务，请确认名称。$/m);
+    assert.doesNotMatch(turn.reply, /没有相关的任务|找不到指定的任务|已删除/);
+    assert.deepEqual(turn.outcomes, []);
+    assert.deepEqual(tasks.list(), [alias]);
+    assert.equal(await readFile(filename, "utf8"), before);
+  }
+});
+
+test("empty deletion candidates ask for clarification when the exact named task exists", async (t) => {
+  const { filename, tasks } = await setup(t);
+  const task = tasks.create("预约牙医");
+  const before = await readFile(filename, "utf8");
+  let requests = 0;
+  const agent = createAgent(tasks, async () =>
+    requests++ === 0
+      ? proposal(call("lookup", "list_tasks", "{}"))
+      : proposal(call("no-match", "delete_task", '{"candidateIds":[]}')),
+  );
+  const turn = await agent.runTurn([user("请删掉「预约牙医」这项任务。")]);
+  assert.equal(requests, 2);
+  assert.equal(turn.failure, "reference_required");
+  assert.match(turn.reply, /^请告诉我你指的是哪一项任务。$/m);
+  assert.doesNotMatch(turn.reply, /没有完全同名|找不到指定的任务|已删除/);
+  assert.deepEqual(turn.outcomes, []);
+  assert.deepEqual(tasks.list(), [task]);
+  assert.equal(await readFile(filename, "utf8"), before);
+});
+
+test("lookup ambiguity and a changed view never establish a current task status", async (t) => {
+  const { filename, tasks } = await setup(t);
+  const original = { id: "one", title: "写报告", done: true };
+  const duplicate = { ...original, id: "two" };
+  await writeFile(filename, JSON.stringify([original, duplicate]));
+  const input = [user("把写报告标为完成")];
+  const ambiguous = await listThenStop(tasks).agent.runTurn(input);
+  assert.equal(ambiguous.failure, "ambiguous_reference");
+  assert.deepEqual(ambiguous.outcomes, []);
+  const stale = await listThenStop(tasks, () => {
+    tasks.remove(duplicate.id);
+  }).agent.runTurn(input);
+  assert.equal(stale.failure, "stale_view");
+  assert.equal(stale.displayedList, undefined);
+  assert.deepEqual(stale.outcomes, []);
+  assert.deepEqual(tasks.list(), [original]);
+});
+
+test("a stop without a lookup cannot establish that a named task is missing or already done", async (t) => {
+  const { tasks } = await setup(t);
+  const task = tasks.create("买牛奶");
+  tasks.update(task.id, { done: true });
+  const agent = createAgent(tasks, async () => final("已经完成。找不到指定的任务。"));
+  for (const input of ["请移除「写报告」", "再把买牛奶标记完成"]) {
+    const turn = await agent.runTurn([user(input)]);
+    assert.deepEqual(turn.outcomes, []);
+    assert.doesNotMatch(turn.reply, /已经完成|找不到/);
+    assert.match(turn.reply, /本轮未修改任务/);
+  }
+  assert.deepEqual(tasks.list(), [{ ...task, done: true }]);
+});
+
+test("a stop after a saved create and a lookup reports only the committed part of a mixed turn", async (t) => {
+  const { tasks } = await setup(t);
+  const milk = tasks.create("买牛奶");
+  const script = [
+    proposal(call("add", "create_task", '{"title":"取快递"}')),
+    proposal(call("list", "list_tasks", "{}")),
+    final("两个任务都办好了。"),
+  ];
+  const turn = await createAgent(tasks, async () => script.shift()).runTurn([
+    user("加一条取快递，再把买牛奶标记完成"),
+  ]);
+  const parcel = tasks.list()[1];
+  assert.deepEqual(tasks.list(), [milk, { id: parcel.id, title: "取快递", done: false }]);
+  assert.deepEqual(turn.outcomes, [{ operation: "create_task", task: parcel }]);
+  assert.match(turn.reply, /已添加待办「取快递」。/);
+  assert.match(turn.reply, /本轮只执行了上面确认的更改。/);
+  assert.doesNotMatch(turn.reply, /已完成「买牛奶」|两个任务都办好了/);
+  assert.equal(script.length, 0);
+});
+
+test("terminal inspection reports a failed read and respects cancellation after a lookup", async (t) => {
+  const { tasks } = await setup(t);
+  const task = tasks.create("写报告");
+  tasks.update(task.id, { done: true });
+  const input = [user("把写报告标记完成")];
+  const controller = new AbortController();
+  const cancelled = await listThenStop(tasks, () => controller.abort()).agent.runTurn(
+    input,
+    controller.signal,
+  );
+  assert.equal(cancelled.failure, "deadline");
+  let readFails = false;
+  const store = {
+    ...tasks,
+    list() {
+      if (readFails) throw new Error("synthetic read failure");
+      return tasks.list();
+    },
+  };
+  const failed = await listThenStop(store, () => {
+    readFails = true;
+  }).agent.runTurn(input);
+  assert.equal(failed.failure, "storage_error");
+  assert.equal(failed.displayedList, undefined);
+  assert.deepEqual(failed.outcomes, []);
+  assert.deepEqual(tasks.list(), [{ ...task, done: true }]);
+});
 
 test("the production app composition shares chat writes with the task API", async (t) => {
   const { tasks } = await setup(t);

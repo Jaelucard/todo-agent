@@ -1,6 +1,115 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { reliabilityCases } from "./reliability-cases.ts";
 import { evaluateReliabilityCase, summarizeReliability } from "./reliability-eval.ts";
+
+const missingTask = reliabilityCases.find((fixture) => fixture.id === "nonexistent-named-task");
+assert.ok(missingTask);
+
+function proposal(name: string, args: object = {}) {
+  return {
+    finish_reason: "tool_calls",
+    message: {
+      role: "assistant",
+      content: null,
+      tool_calls: [
+        { id: name, type: "function", function: { name, arguments: JSON.stringify(args) } },
+      ],
+    },
+  };
+}
+
+const lookup = proposal("list_tasks");
+const stop = {
+  finish_reason: "stop",
+  message: { role: "assistant", content: "找不到指定的任务，已经删除。" },
+};
+
+test("both recorded missing-task paths pass the behavior gate with separate tool scores", async () => {
+  for (const [terminal, strictMatch] of [
+    [proposal("delete_task", { candidateIds: [] }), true],
+    [stop, false],
+  ] as const) {
+    const result = await evaluateReliabilityCase({
+      ...missingTask,
+      turns: [{ ...missingTask.turns[0], mock: (index) => [lookup, terminal][index] }],
+    });
+    const [turn] = result.turns;
+    assert.equal(result.passed, true, turn.problems.join("\n"));
+    assert.equal(turn.originalToolSequenceMatched, strictMatch);
+    assert.deepEqual(turn.after, missingTask.initial);
+    assert.equal(turn.failure, "exact_title_not_found");
+    assert.equal(turn.clarified, true);
+    assert.equal(turn.falseSuccessConfirmations, 0);
+    assert.doesNotMatch(turn.reply, /已删除/);
+  }
+});
+
+test("the missing-task evaluator rejects unsupported replies and writes", async (t) => {
+  const seed = missingTask.initial;
+  const expectation = missingTask.turns[0];
+  const cases = [
+    {
+      id: "incorrect deletion",
+      before: seed,
+      choices: [lookup, proposal("delete_task", { candidateIds: ["parcel"] }), stop],
+      problem: /Observed 1 unintended mutations/,
+    },
+    {
+      id: "unintended create",
+      before: seed,
+      choices: [lookup, proposal("create_task", { title: "预约牙医" }), stop],
+      problem: /The task file changed during a turn that must not write/,
+    },
+    {
+      id: "generic list",
+      before: seed,
+      input: "我有哪些任务？",
+      choices: [],
+      problem: /Reply omitted/,
+    },
+    {
+      id: "no lookup",
+      before: seed,
+      choices: [stop],
+      problem: /Exact-title absence was not supported by the task lookup/,
+    },
+    {
+      id: "contradictory existing title",
+      before: [...seed, { id: "dentist", title: "预约牙医", done: false }],
+      choices: [lookup, proposal("delete_task", { candidateIds: [] })],
+      problem: /Exact-title absence was not supported by the task lookup/,
+    },
+    {
+      id: "wrong clarification",
+      before: [...seed, { id: "dental", title: "牙医", done: false }],
+      choices: [lookup, stop],
+      problem: /Expected failure exact_title_not_found, observed reference_required/,
+    },
+  ];
+  for (const { id, before, input, choices, problem } of cases) {
+    await t.test(id, async () => {
+      const result = await evaluateReliabilityCase({
+        ...missingTask,
+        initial: before,
+        turns: [
+          {
+            ...expectation,
+            input: input ?? expectation.input,
+            state: before,
+            mock: (index) => choices[index],
+          },
+        ],
+      });
+      assert.equal(result.passed, false);
+      assert.match(result.turns[0].problems.join("\n"), problem);
+      if (id === "generic list") {
+        assert.equal(result.turns[0].taskStateCorrect, true);
+        assert.equal(result.turns[0].clarified, false);
+      }
+    });
+  }
+});
 
 test("the reliability evaluator catches a committed change to the wrong task", async () => {
   const before = [
@@ -50,7 +159,6 @@ test("the reliability evaluator catches a committed change to the wrong task", a
 });
 
 test("reliability fixtures pass against the real task store with scripted model replies", async (t) => {
-  const { reliabilityCases } = await import("./reliability-cases.ts");
   const results = [];
   for (const fixture of reliabilityCases) {
     const result = await evaluateReliabilityCase(fixture);

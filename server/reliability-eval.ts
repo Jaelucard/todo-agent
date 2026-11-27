@@ -22,6 +22,7 @@ interface ReliabilityTurn {
   replyExcludes?: string[];
   clarifies?: boolean;
   toolCalls?: string[];
+  missingExactTitle?: string;
   mockRequestCount?: number;
   blockedWrite?: boolean;
 }
@@ -65,10 +66,16 @@ function observeProposals(result: unknown): string[] {
   return names;
 }
 
-const clarificationFailures = ["ambiguous_reference", "reference_required", "task_not_found"];
+const clarificationFailures = [
+  "ambiguous_reference",
+  "reference_required",
+  "task_not_found",
+  "exact_title_not_found",
+];
 const clarificationLines = [
   "请告诉我你指的是哪一项任务。",
   "找不到指定的任务，请确认名称。",
+  "当前清单中没有完全同名的任务，请确认名称。",
   "请具体说明你指的是哪一项任务。",
 ];
 const confirmationPrefixes: Record<Mutation["operation"], string> = {
@@ -210,7 +217,24 @@ async function evaluateTurn(
     if (result.reply.includes(excluded))
       problems.push(`Reply included ${JSON.stringify(excluded)}`);
   }
-  if (expected.toolCalls && !isDeepStrictEqual(expected.toolCalls, proposedTools)) {
+  const originalToolSequenceMatched =
+    expected.toolCalls && isDeepStrictEqual(expected.toolCalls, proposedTools);
+  const allowsReadOnlyLookup = expected.missingExactTitle !== undefined;
+  if (allowsReadOnlyLookup) {
+    const sawCurrentList = [...feedback.values()].some((value) =>
+      isDeepStrictEqual(value, { ok: true, tool: "list_tasks", tasks: before }),
+    );
+    if (
+      !sawCurrentList ||
+      [...before, ...after].some(({ title }) => title === expected.missingExactTitle)
+    ) {
+      problems.push("Exact-title absence was not supported by the task lookup");
+    }
+  }
+  if (
+    originalToolSequenceMatched === false &&
+    !(allowsReadOnlyLookup && isDeepStrictEqual(proposedTools, ["list_tasks"]))
+  ) {
     problems.push(`Unexpected model-proposed tools ${JSON.stringify(proposedTools)}`);
   }
   if (
@@ -226,6 +250,7 @@ async function evaluateTurn(
     after,
     outcomes: result.outcomes,
     proposedTools,
+    originalToolSequenceMatched,
     toolResults: [...feedback].map(([callId, toolResult]) => ({ callId, result: toolResult })),
     reply: result.reply,
     latencyMs,
@@ -296,6 +321,11 @@ export function summarizeReliability(
     falsePositiveClarifications: turns.filter(
       (turn) => turn.clarified && !turn.expectedClarification,
     ).length,
+    originalToolSequenceChecks: turns.filter(
+      (turn) => turn.originalToolSequenceMatched !== undefined,
+    ).length,
+    originalToolSequenceMatches: turns.filter((turn) => turn.originalToolSequenceMatched === true)
+      .length,
     modelRequests: turns.reduce((sum, turn) => sum + turn.modelRequests, 0),
     failures,
     medianLatencyMs: sorted.length

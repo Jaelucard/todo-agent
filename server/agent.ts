@@ -98,6 +98,8 @@ type Failure =
   | ToolError
   | "model_error"
   | "invalid_model_response"
+  | "action_not_executed"
+  | "exact_title_not_found"
   | "deadline"
   | "execution_limit"
   | "input_limit";
@@ -110,10 +112,12 @@ const failureText: Record<Failure, string> = {
   reference_required: "请告诉我你指的是哪一项任务。",
   stale_view: "任务清单已变化，请确认最新清单后再操作。",
   task_not_found: "找不到指定的任务，请确认名称。",
+  exact_title_not_found: "当前清单中没有完全同名的任务，请确认名称。",
   ambiguous_reference: "请具体说明你指的是哪一项任务。",
   storage_error: "任务存储暂时不可用。",
   model_error: "模型暂时无法继续处理。",
   invalid_model_response: "模型返回了无法处理的结果。",
+  action_not_executed: "尚未执行请求的操作。",
   deadline: "处理超时。",
   execution_limit: "已达到本轮操作上限。",
   input_limit: "本轮内容或任务清单过长，请缩小请求范围。",
@@ -146,24 +150,48 @@ function answersTargetQuestion(previous: ChatMessage | undefined, text: string, 
   return (
     question === failureText.ambiguous_reference ||
     question === failureText.reference_required ||
-    question === failureText.task_not_found
+    question === failureText.task_not_found ||
+    question === failureText.exact_title_not_found
   );
 }
 
-function isUnboundMutation(content: string): boolean {
+function taskCommand(content: string) {
   const text = content
     .trim()
     .replace(/^(?:请(?:帮我)?|帮我|麻烦(?:帮我)?)/u, "")
+    .replace(/^再(?=把|将|删除|删掉|移除|完成|标记)/u, "")
     .replace(/吧?[。！？.!?]?$/u, "");
   const targetFirst =
-    /^(?:把|将)?(.+?)(?:标(?:记)?(?:为|成)?(?:已)?完成|完成(?:了)?|做完了|删掉|删除|移除)$/u.exec(
+    /^(?:把|将)?(.+?)(标(?:记)?(?:为|成)?(?:已)?完成|完成(?:了)?|做完了|删掉|删除|移除)$/u.exec(
       text,
     );
-  const actionFirst = /^(?:删掉|删除|移除|完成|标(?:记)?(?:为|成)?(?:已)?完成)(.+)$/u.exec(text);
-  const target = targetFirst?.[1] ?? actionFirst?.[1] ?? "";
+  const actionFirst = /^(删掉|删除|移除|完成|标(?:记)?(?:为|成)?(?:已)?完成)(.+)$/u.exec(text);
+  if (targetFirst) {
+    const explicit = /^(?:把|将)/u.test(text);
+    // At both ends an action word might belong to the title. Bare pronouns still need a name.
+    if (explicit || actionFirst || isUnboundTarget(targetFirst[1]))
+      return { target: targetFirst[1], action: targetFirst[2], explicit };
+  }
+  if (actionFirst) return { target: actionFirst[2], action: actionFirst[1], explicit: true };
+}
+
+function isUnboundTarget(target: string): boolean {
   return /^(?:它|(?:这|那|上一|刚才那|上面那)(?:条|项|个)|第[\d一二三四五六七八九十两百]+(?:条|项|个))(?:任务|待办)?$/u.test(
     target,
   );
+}
+
+// A literal name can establish absence. A bare description can only establish an exact match.
+function namedTarget(target: string) {
+  const quoted = /^(?:「([^「」]+)」|“([^“”]+)”)(?:这(?:一)?[项条](?:任务|待办)?)?$/u.exec(target);
+  if (quoted) return { title: quoted[1] ?? quoted[2], literal: true };
+  if (
+    !/^[\p{L}\p{N} ]+$/u.test(target) ||
+    /(?:不|别|勿|如果|是否|然后|或|并|和|以及|再把|[个条项]$)/u.test(target)
+  ) {
+    return undefined;
+  }
+  return { title: target, literal: false };
 }
 
 function displayTitle(title: string): string {
@@ -212,7 +240,7 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
       let displayedList: Task[] | undefined;
       const latest = messages.at(-1);
 
-      function finish(failure?: Failure) {
+      function finish(failure?: Failure, note?: string) {
         const lines = [...confirmations];
         if (displayedList !== undefined) {
           lines.push(
@@ -226,6 +254,7 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
               : "当前没有待办。",
           );
         }
+        if (note) lines.push(note);
         if (failure) {
           lines.push(failureText[failure]);
           lines.push(outcomes.length ? "以上变更已保存，其余操作已停止。" : "本轮未修改任务。");
@@ -242,7 +271,9 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
       if (latest?.role !== "user") return finish("invalid_arguments");
       if (signal.aborted) return finish("deadline");
       // Browser message text alone cannot establish the identity of a referenced task.
-      if (isUnboundMutation(latest.content)) return finish("reference_required");
+      const input = latest.content.trim();
+      const command = taskCommand(input);
+      if (command && isUnboundTarget(command.target)) return finish("reference_required");
       if (isExplicitListRequest(latest.content)) {
         const result = createTaskTools(tasks).execute("list_tasks", "{}");
         if (!result.ok) return finish(result.error);
@@ -257,6 +288,44 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
 
       // The model must receive its own list before a mutation, even if we just read a task title.
       const toolkit = createTaskTools(tasks);
+      // The last list can ground a reply without dispatching another mutation.
+      function finishAfterLookup(clarification?: "ambiguous_reference" | "reference_required") {
+        if (displayedList === undefined) return finish(clarification);
+        if (confirmations.length) {
+          const note =
+            outcomes.length && !clarification ? "本轮只执行了上面确认的更改。" : undefined;
+          return finish(clarification, note);
+        }
+        if (!command || /[?？]$/u.test(input)) {
+          return finish(
+            clarification,
+            clarification ? undefined : "如需更改，请说明具体任务和操作。",
+          );
+        }
+        const target = command.explicit && namedTarget(command.target);
+        if (!target) return finish(clarification ?? "reference_required");
+        const view = displayedList;
+        const ids = view.filter((task) => task.title === target.title).map((task) => task.id);
+        const resolved = toolkit.inspectCandidates(ids);
+        if (!resolved.ok) {
+          if (resolved.error === "stale_view" || resolved.error === "storage_error")
+            displayedList = undefined;
+          if (resolved.error === "task_not_found") {
+            const partial = view.some(
+              (task) => task.title.includes(target.title) || target.title.includes(task.title),
+            );
+            if (view.length && (!target.literal || partial))
+              return finish(clarification ?? "reference_required");
+            return finish(target.literal ? "exact_title_not_found" : "task_not_found");
+          }
+          return finish(resolved.error);
+        }
+        displayedList = undefined;
+        if (!["删除", "删掉", "移除"].includes(command.action) && resolved.task.done) {
+          return finish(undefined, `「${displayTitle(resolved.task.title)}」已经完成。`);
+        }
+        return finish(clarification ?? "action_not_executed");
+      }
       const history = historyPairs(messages);
       const transcript: ChatCompletionMessageParam[] = [latest];
       const executedCallIds = new Set<string>();
@@ -292,8 +361,7 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
         if (finish_reason === "stop" && calls.length === 0) {
           const text = message.content?.trim();
           if (!text) return finish("invalid_model_response");
-          // Model text can signal clarification. The server owns all user-visible task claims.
-          return text === "需要澄清" ? finish("ambiguous_reference") : finish();
+          return finishAfterLookup(text === "需要澄清" ? "ambiguous_reference" : undefined);
         }
         if (
           finish_reason !== "tool_calls" ||
@@ -318,6 +386,8 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
           const result = toolkit.execute(name, args);
           executedCallIds.add(call.id);
           if (!result.ok) {
+            if (result.error === "task_not_found" && displayedList !== undefined)
+              return finishAfterLookup("reference_required");
             if (result.error === "stale_view") displayedList = undefined;
             return finish(result.error);
           }
