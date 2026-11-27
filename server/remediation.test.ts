@@ -1258,3 +1258,83 @@ test("MEDIUM-2: single_task provenance invalidates on external REST edits to bou
     assert.equal(await readFile(filename, "utf8"), beforeT2, label);
   }
 });
+
+// --- Live QA Repair #3 Regression (L2a: [加急] unrequested-metadata bounded single retry + fail-closed controls) ---
+
+test("REPAIR-3 (L2a): unrequested create_task metadata allows one clean retry while failing closed on repeat, stop, or explicit metadata mismatch", async (t) => {
+  const input = '帮我记一下："买🥛牛奶 & 咖啡" [加急]';
+  const expectedTitle = '"买🥛牛奶 & 咖啡" [加急]';
+
+  // 1. Positive recovery: Round 1 infers priority:"high" from [加急] -> receives hint -> Round 2 retries cleanly without metadata -> succeeds.
+  {
+    const { tasks } = await setup(t);
+    const mock = scripted(
+      proposal(call("c1", "create_task", { title: expectedTitle, priority: "high" })),
+      proposal(call("c2", "create_task", { title: expectedTitle })),
+      final("已添加。"),
+    );
+    const turn = await createAgent(tasks, mock.provider).runTurn([user(input)]);
+    assert.equal(turn.failure, undefined);
+    assert.equal(turn.outcomes.length, 1);
+    assert.equal(mock.requests.length, 3);
+    const toolFeedback = mock.requests[1].messages.at(-1);
+    assert.ok(toolFeedback?.role === "tool" && typeof toolFeedback.content === "string");
+    const parsedFeedback = JSON.parse(toolFeedback.content);
+    assert.equal(parsedFeedback.ok, false);
+    assert.equal(parsedFeedback.error, "metadata_confirmation_required");
+
+    const [saved] = tasks.list();
+    assert.ok(saved);
+    assert.equal(saved.title, expectedTitle);
+    assert.equal(saved.priority, undefined);
+    assert.equal(saved.workload, undefined);
+    assert.match(turn.reply, /已添加待办/);
+  }
+
+  // 2. Negative control A (persisting unauthorized metadata): Round 1 AND Round 2 both propose priority:"high" -> fails closed with 0 writes.
+  {
+    const { tasks } = await setup(t);
+    const mock = scripted(
+      proposal(call("c1", "create_task", { title: expectedTitle, priority: "high" })),
+      proposal(call("c2", "create_task", { title: expectedTitle, priority: "high" })),
+      final("已添加。"),
+    );
+    const turn = await createAgent(tasks, mock.provider).runTurn([user(input)]);
+    assert.equal(turn.failure, "metadata_confirmation_required");
+    assert.deepEqual(turn.outcomes, []);
+    assert.deepEqual(tasks.list(), []);
+    assert.equal(mock.requests.length, 2);
+  }
+
+  // 3. Negative control B (stop after rejection with false prose): fails closed with metadata_confirmation_required and 0 writes.
+  {
+    const { tasks } = await setup(t);
+    const mock = scripted(
+      proposal(call("c1", "create_task", { title: expectedTitle, priority: "high" })),
+      final("已为你添加买🥛牛奶 & 咖啡。"),
+    );
+    const turn = await createAgent(tasks, mock.provider).runTurn([user(input)]);
+    assert.equal(turn.failure, "metadata_confirmation_required");
+    assert.deepEqual(turn.outcomes, []);
+    assert.deepEqual(tasks.list(), []);
+    assert.doesNotMatch(turn.reply, /已为你添加/);
+    assert.match(turn.reply, /本轮未修改任务/);
+  }
+
+  // 4. Negative control C (explicit metadata request unchanged): fails closed immediately on call 1 with 0 writes.
+  {
+    const { tasks } = await setup(t);
+    const mock = scripted(
+      proposal(call("c1", "create_task", { title: "交报告", priority: "low" })),
+      proposal(call("c2", "create_task", { title: "交报告", priority: "high" })),
+      final("已添加。"),
+    );
+    const turn = await createAgent(tasks, mock.provider).runTurn([
+      user("新增交报告，优先级设为高"),
+    ]);
+    assert.equal(turn.failure, "metadata_confirmation_required");
+    assert.deepEqual(turn.outcomes, []);
+    assert.deepEqual(tasks.list(), []);
+    assert.equal(mock.requests.length, 1);
+  }
+});
