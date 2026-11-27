@@ -1006,6 +1006,43 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
 
       const toolkit = createTaskTools(tasks, activeBoundReference);
 
+      // Deterministic server-verified execution for bare disambiguation index replies (#1, 第一条, etc.)
+      // when snapshot freshness, entry lookup, and pending complete/delete authorization are proven.
+      if (
+        boundSelectionIsBare &&
+        activeBoundReference &&
+        (inheritedDisambiguationOp === "complete_task" ||
+          inheritedDisambiguationOp === "delete_task")
+      ) {
+        if (signal.aborted) return finish("deadline");
+        const auth = isToolAuthorized(inheritedDisambiguationOp);
+        if (!auth.ok) return finish(auth.error);
+        const result = toolkit.execute(
+          inheritedDisambiguationOp,
+          '{"useBoundReference":true}',
+          grantForTool(inheritedDisambiguationOp),
+        );
+        if (!result.ok) return finish(result.error);
+        if (result.tool === "complete_task" || result.tool === "delete_task") {
+          const label = `「${displayTitle(result.task.title)}」`;
+          if (result.tool === "complete_task" && !result.changed) {
+            confirmations.push(`${label}已经完成。`);
+          } else {
+            outcomes.push({ operation: result.tool, task: result.task });
+            confirmations.push(`${mutationText[result.tool]}${label}。`);
+          }
+          if (trailingList.wantsList) {
+            const listResult = toolkit.execute("list_tasks", JSON.stringify(trailingList.filter));
+            if (!listResult.ok) return finish(listResult.error);
+            if (listResult.tool === "list_tasks") {
+              displayedList = listResult.tasks;
+              displayedListFilter = trailingList.filter;
+            }
+          }
+          return finish();
+        }
+      }
+
       function buildDuplicateDisambiguation(
         duplicateTitle: string,
         pendingOperation?: "complete_task" | "delete_task" | "update_task",
@@ -1210,9 +1247,33 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
 
       for (let round = 1; round <= maxModelRequests; round++) {
         if (signal.aborted) return finish("deadline");
-        let forcedTool: "create_task" | "list_tasks" | "update_task" | "delete_task" | undefined;
+        let forcedTool:
+          | "create_task"
+          | "list_tasks"
+          | "complete_task"
+          | "update_task"
+          | "delete_task"
+          | undefined;
         if (create) forcedTool = "create_task";
         if (namedMutation) forcedTool = round === 1 ? "list_tasks" : namedMutation;
+        if (
+          round === 1 &&
+          boundSelectionIsBare &&
+          activeBoundReference &&
+          inheritedDisambiguationOp === "update_task"
+        ) {
+          forcedTool = "update_task";
+        } else if (
+          round === 1 &&
+          activeBoundReference &&
+          !boundSelectionIsBare &&
+          singleRequestedTool &&
+          (singleRequestedTool === "complete_task" ||
+            singleRequestedTool === "delete_task" ||
+            singleRequestedTool === "update_task")
+        ) {
+          forcedTool = singleRequestedTool;
+        }
         const request = () =>
           buildModelRequest(
             [{ role: "system", content: systemPrompt }, ...history.flat(), ...transcript],
