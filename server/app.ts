@@ -72,7 +72,9 @@ const handleApiError: ErrorRequestHandler = (error, _req, res, _next) => {
   if (error.type === "entity.too.large") {
     return res.status(413).json({ error: "对话太长，请刷新后开始新的对话。" });
   }
-  const errorName = error instanceof Error ? error.name : "UnknownError";
+  const rawName = error instanceof Error ? error.name : "UnknownError";
+  const cleaned = rawName.replace(/[^A-Za-z0-9_]/gu, "").slice(0, 40);
+  const errorName = /^[A-Za-z0-9_]{1,40}$/u.test(cleaned) ? cleaned : "UnknownError";
   console.error(`[app] unexpected_error error=${errorName}`);
   res.status(500).json({ error: "服务暂时无法处理请求，请稍后重试。" });
 };

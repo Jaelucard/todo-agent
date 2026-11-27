@@ -205,12 +205,16 @@ export function createTaskTools(tasks: TaskStore, boundReference?: BoundReferenc
     const resolved = resolveTarget(input.data, tool, grant);
     if (!resolved.ok) return resolved;
     const target = resolved.task;
+    const semantic = "candidateIds" in input.data;
+    const snapshotStillMatches =
+      expectedSnapshot !== undefined &&
+      (semantic || JSON.stringify(tasks.list().map(taskSummary)) === expectedSnapshot);
     lastBeforeMutation = target;
     if (tool === "complete_task") {
       if (target.done) return { ok: true, tool, task: target, changed: false };
       const updated = tasks.update(target.id, { done: true });
       if (!updated) return { ok: false, error: "task_not_found" };
-      if (expectedSnapshot !== undefined) {
+      if (snapshotStillMatches) {
         expectedSnapshot = JSON.stringify(tasks.list().map(taskSummary));
       }
       return { ok: true, tool, task: taskSummary(updated), changed: true };
@@ -218,7 +222,7 @@ export function createTaskTools(tasks: TaskStore, boundReference?: BoundReferenc
 
     if (!tasks.remove(target.id)) return { ok: false, error: "task_not_found" };
     observedIds.delete(target.id);
-    if (expectedSnapshot !== undefined) {
+    if (snapshotStillMatches) {
       expectedSnapshot = JSON.stringify(tasks.list().map(taskSummary));
     }
     return { ok: true, tool, task: target };
@@ -230,6 +234,7 @@ export function createTaskTools(tasks: TaskStore, boundReference?: BoundReferenc
     const resolved = resolveTarget(input.data, "update_task", grant);
     if (!resolved.ok) return resolved;
     const target = resolved.task;
+    const semantic = "candidateIds" in input.data;
     const changes = input.data.changes;
 
     if (grant) {
@@ -266,6 +271,9 @@ export function createTaskTools(tasks: TaskStore, boundReference?: BoundReferenc
     if (!titleChanged && !doneChanged && !priorityChanged && !workloadChanged) {
       return { ok: true, tool: "update_task", task: target, changed: false };
     }
+    const snapshotStillMatches =
+      expectedSnapshot !== undefined &&
+      (semantic || JSON.stringify(tasks.list().map(taskSummary)) === expectedSnapshot);
     const patch: Partial<Pick<Task, "title" | "done">> & TaskMetadata = {
       ...(changes.title !== undefined && { title: changes.title }),
       ...(changes.done !== undefined && { done: changes.done }),
@@ -275,10 +283,10 @@ export function createTaskTools(tasks: TaskStore, boundReference?: BoundReferenc
     const updated = tasks.update(target.id, patch);
     if (!updated) return { ok: false, error: "task_not_found" };
     const summary = taskSummary(updated);
-    if (!("candidateIds" in input.data) && binding && changes.title !== undefined) {
+    if (!semantic && binding && changes.title !== undefined) {
       binding.title = summary.title;
     }
-    if (expectedSnapshot !== undefined) {
+    if (snapshotStillMatches) {
       expectedSnapshot = JSON.stringify(tasks.list().map(taskSummary));
     }
     return { ok: true, tool: "update_task", task: summary, changed: true };

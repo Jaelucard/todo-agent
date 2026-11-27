@@ -38,10 +38,10 @@ const targetAndAssignment = new RegExp(
 );
 
 const anaphoricPattern =
-  /^(?:它|(?:这一?|那一?|上一|刚(?:才|刚)那|上面那)(?:条|项|个|件)?|这件事|那件事|刚才说的事|刚刚说的事|(?:刚(?:才|刚)?|前面|之前|上面)(?:说|提)(?:到|过)?的(?:[这那]?一?[条项个件])?(?:事(?:情)?|任务|待办(?:事项)?)?)(?:任务|待办(?:事项)?|事(?:情)?)?$/u;
+  /^(?:它|(?:这一?|那一?|上一|刚(?:才|刚)那|上面那)(?:条|项|个|件)?|这件事|那件事|刚才说的事|刚刚说的事|(?:刚(?:才|刚)?|前面|之前|上面)(?:说|提|加|添加|新增|新建|创建|记(?:录|下)?|改|修改|更新|完成)(?:到|过|了)?的(?:[这那]?一?[条项个件])?(?:事(?:情)?|任务|待办(?:事项)?)?)(?:任务|待办(?:事项)?|事(?:情)?)?$/u;
 
 const positionalPattern =
-  /^(?:最后(?:一|那一?)(?:条|项|个|件)|(?:倒数)?第[\d一二三四五六七八九十两百]+(?:条|项|个|件))(?:任务|待办(?:事项)?|事(?:情)?)?$/u;
+  /^(?:(?:\[#\d+\]|#\d+)|最后(?:一|那一?)(?:条|项|个|件)|(?:倒数)?第[\d一二三四五六七八九十两百]+(?:条|项|个|件))(?:任务|待办(?:事项)?|事(?:情)?)?$/u;
 
 export function maskQuotedTitles(input: string): string {
   return input.replace(quotedGlobal, "任务名称");
@@ -206,7 +206,7 @@ const trailingListClausePattern =
   /^(?:再|然后|最后|顺便|并|并且|同时|接着|之后|另外)?(?:请)?(?:给我|帮我)?(?:看看|看一看|看下|看一下|查看(?:一下|下)?|显示(?:一下|下)?|展示(?:一下|下)?|列出|告诉我)(?:一下|下)?.*(?:清单|列表|待办|任务|剩|有什么|有哪些)/u;
 
 const clauseNegationPattern =
-  /(?:^|(?:任务|待办|其他|其余))(?:千万)?(?:不要|别|勿|不用|不必|暂不|不要动|别动)/u;
+  /(?:千万)?(?:不要|(?<!分|特|级|类|区|告|差|识|判|个|性)别(?!人|的|处|扭)|勿|不用|不必|暂不|不想|不打算|不要动|别动)/u;
 
 export function extractTrailingListRequest(input: string): {
   wantsList: boolean;
@@ -409,15 +409,20 @@ export interface ClauseAnalysis {
   allowDelete: boolean;
   allowReopen: boolean;
   allowRename: boolean;
+  isPureCreate: boolean;
+  hasCompleteVerb: boolean;
+  hasDeleteVerb: boolean;
   hasPositiveCreateCommand: boolean;
 }
 
 const retractionClausePattern = /^(?:(?:还是)?算了(?:吧)?|罢了|没事了|不麻烦了)$/u;
+const wholeTurnRetractionClausePattern =
+  /^(?:(?:还是)?算了(?:吧)?|罢了|没事了|不麻烦了|(?:(?:还是)?算了(?:吧)?\s*)?(?:还是|先)?(?:不用|不要|(?<!分|特|级|类|区|告|差|识|判|个|性)别(?!人|的|处|扭)|不必)(?:记|加|新增|创建|添加|删|改|做|办|完成|动|管)了)$/u;
 const keepNoOpClausePattern =
   /^(?:(?:先|还是|就)?(?:留着|保留|保持原样|不动|别动|放着|搁着)(?:吧|好了|就行)?)$/u;
 const tentativeIntentPattern = /^(?:我)?(?:本来|原本|刚才|刚刚)想/u;
 const retractionCuePattern =
-  /(?:算了|(?:不用|不要|别|不必)(?:记|加|新增|创建|添加|删|改|做|办|完成|动|管)了?)/u;
+  /(?:算了|(?:不用|不要|(?<!分|特|级|类|区|告|差|识|判|个|性)别(?!人|的|处|扭)|不必)(?:记|加|新增|创建|添加|删|改|做|办|完成|动|管)了?)/u;
 
 export function analyzeClauses(input: string): ClauseAnalysis {
   const trimmed = input.trim();
@@ -427,6 +432,7 @@ export function analyzeClauses(input: string): ClauseAnalysis {
   const forbiddenTitles = new Set<string>();
   const positiveEntries: Array<{ masked: string; quoted: string[]; tentative: boolean }> = [];
   let previousWasProhibition = false;
+  let sawAnyProhibition = false;
 
   const isQuestion =
     /[?？]$/u.test(maskedWhole) ||
@@ -440,22 +446,29 @@ export function analyzeClauses(input: string): ClauseAnalysis {
     const clauseQuoted = extractQuotedTitles(clause);
     const isSelfCancelledTentative =
       tentativeIntentPattern.test(maskedClause) && retractionCuePattern.test(maskedClause);
+    const isWholeRetraction = wholeTurnRetractionClausePattern.test(maskedClause);
     const isProhibition =
       isSelfCancelledTentative ||
+      isWholeRetraction ||
       clauseNegationPattern.test(maskedClause) ||
-      /^(?:请(?:帮我)?|帮我|麻烦(?:帮我)?)?(?:(?:还是)?算了(?:吧)?\s*)?(?:还是|先)?(?:不要|别|勿|不用|不必|千万不要|千万别|暂不)/u.test(
-        maskedClause,
-      ) ||
       retractionClausePattern.test(maskedClause) ||
       keepNoOpClausePattern.test(maskedClause) ||
       (previousWasProhibition && /^(?:尤其是|特别是|包括)/u.test(maskedClause));
 
     if (isProhibition) {
+      sawAnyProhibition = true;
       previousWasProhibition = true;
       for (const title of clauseQuoted) {
         forbiddenTitles.add(title);
       }
-      if (retractionClausePattern.test(maskedClause) || retractionCuePattern.test(maskedClause)) {
+      if (isWholeRetraction) {
+        for (const entry of positiveEntries) {
+          for (const title of entry.quoted) {
+            forbiddenTitles.add(title);
+          }
+        }
+        positiveEntries.length = 0;
+      } else if (retractionCuePattern.test(maskedClause)) {
         for (let i = positiveEntries.length - 1; i >= 0; i--) {
           if (positiveEntries[i].tentative) {
             for (const title of positiveEntries[i].quoted) {
@@ -474,6 +487,15 @@ export function analyzeClauses(input: string): ClauseAnalysis {
       quoted: clauseQuoted,
       tentative: tentativeIntentPattern.test(maskedClause),
     });
+  }
+
+  // A bare index token (e.g. "#2" in "#2，不要改了") never independently enables mutations when another clause negates.
+  if (sawAnyProhibition) {
+    for (let i = positiveEntries.length - 1; i >= 0; i--) {
+      if (parseDisambiguationIndex(positiveEntries[i].masked)?.bare) {
+        positiveEntries.splice(i, 1);
+      }
+    }
   }
 
   const positiveMaskedClauses: string[] = [];
@@ -607,7 +629,7 @@ export function analyzeClauses(input: string): ClauseAnalysis {
     !hasDeleteVerb &&
     !allowReopen &&
     !allowRename &&
-    !hasMetadataMention;
+    !/(?:改|设|调|降|升)(?:为|成|到|至)/u.test(positiveText);
   const isPureComplete =
     isSinglePositiveClause &&
     hasCompleteVerb &&
@@ -681,6 +703,9 @@ export function analyzeClauses(input: string): ClauseAnalysis {
     allowDelete,
     allowReopen: mutationsAllowed && allowReopen,
     allowRename: mutationsAllowed && allowRename,
+    isPureCreate: mutationsAllowed && isPureCreate,
+    hasCompleteVerb: mutationsAllowed && hasCompleteVerb,
+    hasDeleteVerb: mutationsAllowed && hasDeleteVerb,
     hasPositiveCreateCommand,
   };
 }
@@ -692,6 +717,7 @@ export function detectUnboundCommand(input: string): "anaphoric" | "positional" 
     .trim();
   const masked = maskQuotedTitles(trimmed);
   if (clarifiedTitle.test(trimmed)) return undefined;
+  if (parseDisambiguationIndex(trimmed)?.bare) return "positional";
   const clauses = splitClausesOutsideQuotes(trimmed);
   // If multiple clauses exist and an earlier clause already names a task (e.g. "牛奶已经买回来了，帮我把那项标成完成"),
   // do not treat the later pronoun as an unbound cross-turn reference.
@@ -702,7 +728,7 @@ export function detectUnboundCommand(input: string): "anaphoric" | "positional" 
       !isUnboundTarget(
         firstMasked.replace(/^(?:请(?:帮我)?|帮我|麻烦(?:帮我)?)?(?:把|将|给)?/u, ""),
       ) &&
-      !/^(?:把|将|给)?(?:它|这|那|刚|上|最后|第)/u.test(
+      !/^(?:把|将|给)?(?:它|这|那|刚|上|最后|第|#|\[#)/u.test(
         firstMasked.replace(/^(?:请(?:帮我)?|帮我|麻烦(?:帮我)?)?/u, ""),
       );
     // Still catch pure compound metadata updates on one unbound target ("把第二条的优先级改为高，工作量改为大").
@@ -717,6 +743,9 @@ export function detectUnboundCommand(input: string): "anaphoric" | "positional" 
     .replace(/^(?:再|只)(?=把|将|给|删除|删掉|移除|完成|标记|改|设|调|提高|降低|重命名|改名)/u, "")
     .replace(/吧?[。！？.!?]?$/u, "")
     .trim();
+
+  if (isPositionalTarget(normalized)) return "positional";
+  if (isAnaphoricTarget(normalized)) return "anaphoric";
 
   // Extract candidate target from common single-target command structures.
   const candidates: string[] = [];
@@ -737,6 +766,12 @@ export function detectUnboundCommand(input: string): "anaphoric" | "positional" 
       normalized,
     );
   if (targetFirstMetadata) candidates.push(targetFirstMetadata[1].trim());
+
+  const subjectFirst =
+    /^(.+?)(?:已经|都|也|快)?(?:请)?(?:帮我|给我)?(?:标(?:记)?(?:为|成)?(?:已|未|待)?完成|完成(?:了)?|做完了|做好了|买好了|搞定了|删掉|删除|移除|改回|重命名|改名|更名|改(?:为|成|到)|设(?:置)?(?:为|成|到)|调(?:整)?(?:为|成|到))/u.exec(
+      normalized,
+    );
+  if (subjectFirst) candidates.push(subjectFirst[1].trim());
 
   for (const candidate of candidates) {
     if (isPositionalTarget(candidate)) return "positional";

@@ -237,6 +237,9 @@ type ProvenanceRecord =
       kind: "single_task";
       id: string;
       title: string;
+      done: boolean;
+      priority?: TaskMetadata["priority"];
+      workload?: TaskMetadata["workload"];
     }
   | {
       kind: "disambiguation";
@@ -455,17 +458,64 @@ function formatUpdateConfirmations(
   return lines;
 }
 
-const falseClaimPattern =
-  /(?:已(?:经)?(?:添加|新增|新建|创建|记录|保存|完成|标(?:记)?(?:为|成)?(?:已)?完成|删除|删掉|移除|更新|修改|改好|改回|重命名|执行|处理|清空)|找不到指定的任务|没有完全同名|当前清单：|已完成「|已删除「|已添加|已更新「|已将「|请具体说明你指的是哪一项任务|请告诉我你指的是哪一项任务)/u;
+const falseClaimPatterns = [
+  // Direct or non-adjacent affirmative claims of task mutations.
+  /(?:已(?:经)?|(?<!没|不|未|不会|没有|不要)(?:帮[你您]|为[你您]|替[你您])|刚(?:刚|才)?|全部|全都|都已)[^，,。！？!\n]{0,24}(?:添加|新增|新建|创建|记录|记下|记好|保存|完成|标(?:记)?(?:为|成)?|删除|删掉|移除|清掉|清空|更新|修改|改好|改回|改名|重命名|更名|设为|设好|调(?:整)?(?:为|成|到)|执行|处理|搞定)/u,
+  // Bare past-tense task mutation verbs (excluding explicit negations like "不做修改了").
+  /(?<!不|没|未|别|不做|不会|没有|不要)(?:删掉了?|删除了|移除了|清掉了|清空了|完成了|标记为?完成了|改名(?:为|成)?[^，,。！？!\n]{0,16}了|重命名(?:为|成)?[^，,。！？!\n]{0,16}了|改回(?:未|待)完成了|改好了|记好了|记下了|添加了|新增了|创建了|保存了|更新了|修改了|设好了|搞定了)/u,
+  // Ungrounded lookup/list/status or spoofed server confirmation/clarification lines.
+  /(?:找不到指定的任务|没有完全同名|当前清单：|已完成「|已删除「|已添加|已更新「|已将「|请具体说明你指的是哪一项任务|请告诉我你指的是哪一项任务|(?:你|当前|目前|清单里)(?:现在|目前)?(?:还)?有\s*[\d一二三四五六七八九十两]+\s*(?:条|项|个)(?:待办|任务)|(?:待办|任务)清单(?:里|中)?(?:现在|目前)?(?:是|有|包含|为空))/u,
+];
 
 const injectionLeakPattern =
   /(?:systemPrompt|candidateIds|useBoundReference|DEEPSEEK_API_KEY|tool_calls|HACKED|PWNED|INJECTED|SYSTEM OVERRIDE|忽略之前的指令|sk-[A-Za-z0-9]{8,})/iu;
 
-function isSafeZeroMutationProse(text: string, input: string): boolean {
+const externalContactPatterns = [
+  /https?:\/\/\S+/giu,
+  /\bwww\.\S+/giu,
+  /\b[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.(?:com|net|org|cn|io|co|me|cc|xyz|top|app|dev|site|info|biz|example|test|local|gg|tv|ai)\b/giu,
+  /\b[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}\b/giu,
+  /@[a-zA-Z0-9_]{3,}\b/gu,
+  /\b[a-zA-Z][a-zA-Z0-9]*_[a-zA-Z0-9_]{2,}\b/gu,
+];
+
+const assistantBoilerplateGrams = new Set([
+  "帮你管理",
+  "管理待办",
+  "待办任务",
+  "待办事项",
+  "有什么可",
+  "随时告诉",
+  "可以帮你",
+  "我是小明",
+  "注意休息",
+]);
+
+function echoesStoredTaskTitle(cleaned: string, input: string, storedTitles: string[]): boolean {
+  for (const rawTitle of storedTitles) {
+    const title = stripBidiControls(rawTitle).trim();
+    if (title.length < 4) continue;
+    const segments = title
+      .split(/[\s，,。！？!?.:：；;（）()「」『』“”"'【】[\]<>《》、\-—/]+/u)
+      .filter((segment) => segment.length >= 4);
+    for (const segment of segments) {
+      const chars = [...segment];
+      for (let i = 0; i <= chars.length - 4; i++) {
+        const gram = chars.slice(i, i + 4).join("");
+        if (assistantBoilerplateGrams.has(gram)) continue;
+        if (input.includes(gram)) continue;
+        if (cleaned.includes(gram)) return true;
+      }
+    }
+  }
+  return false;
+}
+
+function isSafeZeroMutationProse(text: string, input: string, storedTitles: string[]): boolean {
   const cleaned = stripBidiControls(text).trim();
   if (!cleaned || cleaned.length > 300) return false;
   if (cleaned === "需要澄清") return false;
-  if (falseClaimPattern.test(cleaned)) return false;
+  if (falseClaimPatterns.some((pattern) => pattern.test(cleaned))) return false;
   if (injectionLeakPattern.test(cleaned)) return false;
   // Require at least one CJK character so pure-ASCII injection payloads cannot pass through.
   if (!/\p{Script=Han}/u.test(cleaned)) return false;
@@ -473,6 +523,14 @@ function isSafeZeroMutationProse(text: string, input: string): boolean {
   for (const match of cleaned.matchAll(/\b[A-Z][A-Z0-9_]{7,}\b/gu)) {
     if (!input.includes(match[0])) return false;
   }
+  // Reject URLs, domains, emails, and handles not present in the user's current input.
+  for (const pattern of externalContactPatterns) {
+    for (const match of cleaned.matchAll(pattern)) {
+      if (!input.toLowerCase().includes(match[0].toLowerCase())) return false;
+    }
+  }
+  // Reject replies echoing non-trivial substrings from stored task titles (prompt injection defense).
+  if (echoesStoredTaskTitle(cleaned, input, storedTitles)) return false;
   return true;
 }
 
@@ -560,10 +618,14 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
           outcomes[0].operation !== "delete_task" &&
           displayedList === undefined
         ) {
+          const task = outcomes[0].task;
           setProvenance(nextKey, {
             kind: "single_task",
-            id: outcomes[0].task.id,
-            title: outcomes[0].task.title,
+            id: task.id,
+            title: task.title,
+            done: task.done,
+            priority: task.priority,
+            workload: task.workload,
           });
         }
       }
@@ -643,8 +705,13 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
         | Extract<ProvenanceRecord, { kind: "disambiguation" }>["pendingPolicy"]
         | undefined;
 
+      const clauseAnalysis = analyzeClauses(commandInput);
       const disambigIndex = parseDisambiguationIndex(commandInput);
-      if (prefixRecord?.kind === "disambiguation" && disambigIndex) {
+      if (
+        prefixRecord?.kind === "disambiguation" &&
+        disambigIndex &&
+        (clauseAnalysis.mutationsAllowed || disambigIndex.bare)
+      ) {
         let currentAll: Task[];
         try {
           currentAll = tasks.list().map(taskSummary);
@@ -664,11 +731,21 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
         inheritedDisambiguationPolicy = prefixRecord.pendingPolicy;
       }
 
+      // Fail closed immediately on unauthenticated index selections (#1, 选#1, 第一条, 删掉 #1, 把#1删掉).
+      if (
+        disambigIndex &&
+        !activeBoundReference &&
+        (disambigIndex.bare || (clauseAnalysis.mutationsAllowed && !clauseAnalysis.isPureCreate))
+      ) {
+        return finish("reference_required");
+      }
+
       const unboundKind = detectUnboundCommand(commandInput);
       if (
         !activeBoundReference &&
         unboundKind === "anaphoric" &&
-        prefixRecord?.kind === "single_task"
+        prefixRecord?.kind === "single_task" &&
+        clauseAnalysis.mutationsAllowed
       ) {
         let currentAll: Task[];
         try {
@@ -677,12 +754,17 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
           return finish("storage_error");
         }
         const live = currentAll.find((item) => item.id === prefixRecord.id);
-        if (live && live.title === prefixRecord.title) {
+        if (
+          live &&
+          live.title === prefixRecord.title &&
+          live.done === prefixRecord.done &&
+          live.priority === prefixRecord.priority &&
+          live.workload === prefixRecord.workload
+        ) {
           activeBoundReference = { id: live.id, title: live.title };
         }
       }
 
-      const clauseAnalysis = analyzeClauses(commandInput);
       const metadata = singleMetadataRequest(commandInput);
       if (metadata?.operation === "invalid_metadata") {
         return finish("metadata_confirmation_required");
@@ -888,6 +970,14 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
           };
         }
         if (toolName === "update_task") {
+          if (clauseAnalysis.isPureCreate && !singleRequestedTool) {
+            return {
+              ok: false,
+              error: clauseAnalysis.hasMetadataMention
+                ? "metadata_confirmation_required"
+                : "reference_required",
+            };
+          }
           const canUpdateAnyField =
             effectiveAllowedPriorities.size > 0 ||
             effectiveAllowedWorkloads.size > 0 ||
@@ -1030,13 +1120,6 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
         }
         if (isUnsupportedDueDateQuery(input) && !clarification) {
           displayedList = undefined;
-          if (
-            modelStopText &&
-            /(?:不支持|没有|暂未|无法).*(?:截止|到期|日期|时间)/u.test(modelStopText) &&
-            isSafeZeroMutationProse(modelStopText, input)
-          ) {
-            return finish(undefined, stripBidiControls(modelStopText).trim());
-          }
           return finish(
             undefined,
             "目前暂不支持截止日期或到期时间功能，只能按完成状态、优先级和工作量查看待办。\n本轮未修改任务。",
@@ -1050,12 +1133,23 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
             clauseAnalysis.mutationsAllowed &&
             (Boolean(command) ||
               clauseAnalysis.hasPositiveCreateCommand ||
+              clauseAnalysis.hasCompleteVerb ||
+              clauseAnalysis.hasDeleteVerb ||
+              clauseAnalysis.allowReopen ||
+              clauseAnalysis.allowRename ||
+              clauseAnalysis.hasMetadataMention ||
               Boolean(singleGrant) ||
               Boolean(activeBoundReference));
+          let storedTitles: string[] = [];
+          try {
+            storedTitles = tasks.list().map((task) => task.title);
+          } catch {
+            storedTitles = [];
+          }
           if (
             !isUnexecutedCommand &&
             modelStopText &&
-            isSafeZeroMutationProse(modelStopText, input)
+            isSafeZeroMutationProse(modelStopText, input, storedTitles)
           ) {
             return finish(undefined, stripBidiControls(modelStopText).trim());
           }
