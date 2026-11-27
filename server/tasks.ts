@@ -20,15 +20,20 @@ export function taskRouter(tasks: TaskStore) {
   router.post("/", (req, res) => {
     const input = createTaskSchema.safeParse(req.body);
     if (!input.success) {
-      return res.status(400).json({ error: "请提供 1 至 200 个字符的任务标题。" });
+      return res
+        .status(400)
+        .json({ error: "请提供 1 至 200 个字符的标题和有效的可选优先级、工作量。" });
     }
-    res.status(201).json(tasks.create(input.data.title));
+    const { title, ...metadata } = input.data;
+    res.status(201).json(tasks.create(title, metadata));
   });
 
   router.patch("/:id", (req, res) => {
     const input = updateTaskSchema.safeParse(req.body);
     if (!input.success) {
-      return res.status(400).json({ error: "请提供有效的 title 或 done 字段。" });
+      return res
+        .status(400)
+        .json({ error: "请提供有效的 title、done、priority 或 workload 字段。" });
     }
 
     const updated = tasks.update(req.params.id, input.data);

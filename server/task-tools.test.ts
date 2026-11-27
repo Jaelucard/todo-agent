@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { once } from "node:events";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -27,6 +27,87 @@ test("create_task saves a pending task with a trimmed title", async (t) => {
 
   assert.deepEqual(created.task, task);
   assert.deepEqual(createJsonTaskStore(filename).list(), [task]);
+});
+
+test("metadata creation and edits preserve task identity and other stored fields", async (t) => {
+  const { tasks, filename } = await temporaryStore(t);
+  const legacySummary = { id: "legacy", title: "取快递", done: true };
+  const legacy = { ...legacySummary, note: "旧记录" };
+  await writeFile(filename, JSON.stringify([legacy]));
+  const tools = createTaskTools(tasks);
+  const created = tools.execute(
+    "create_task",
+    '{"title":"写报告","priority":"high","workload":"large"}',
+  );
+  assert.ok(created.ok && created.tool === "create_task");
+  const report = {
+    id: created.task.id,
+    title: "写报告",
+    done: false,
+    priority: "high",
+    workload: "large",
+  };
+  assert.deepEqual(created.task, report);
+  assert.deepEqual(tools.execute("list_tasks", "{}"), {
+    ok: true,
+    tool: "list_tasks",
+    tasks: [legacySummary, report],
+  });
+  const change = JSON.stringify({ candidateIds: [legacy.id], changes: { priority: "low" } });
+  assert.deepEqual(tools.execute("update_task", change), {
+    ok: true,
+    tool: "update_task",
+    changed: true,
+    task: { ...legacySummary, priority: "low" },
+  });
+  assert.deepEqual(createJsonTaskStore(filename).list(), [{ ...legacy, priority: "low" }, report]);
+
+  assert.deepEqual(tools.execute("update_task", change), { ok: false, error: "list_required" });
+  assert.ok(tools.execute("list_tasks", "{}").ok);
+  const contents = await readFile(filename, "utf8");
+  const identity = await stat(filename, { bigint: true });
+  assert.deepEqual(tools.execute("update_task", change), {
+    ok: true,
+    tool: "update_task",
+    changed: false,
+    task: { ...legacySummary, priority: "low" },
+  });
+  assert.equal(await readFile(filename, "utf8"), contents);
+  const current = await stat(filename, { bigint: true });
+  assert.deepEqual([current.ino, current.mtimeNs], [identity.ino, identity.mtimeNs]);
+});
+
+test("metadata edits reject invalid changes, ambiguity and a metadata-only stale list", async (t) => {
+  const { tasks, filename } = await temporaryStore(t);
+  const first = { id: "first", title: "买牛奶", done: false, priority: "low" };
+  const second = { ...first, id: "second" };
+  await writeFile(filename, JSON.stringify([first, second]));
+  const tools = createTaskTools(tasks);
+  assert.ok(tools.execute("list_tasks", "{}").ok);
+  const before = await readFile(filename, "utf8");
+  for (const changes of [
+    {},
+    { title: "错误" },
+    { done: true },
+    { priority: "urgent" },
+    { workload: 3 },
+  ]) {
+    assert.deepEqual(
+      tools.execute("update_task", JSON.stringify({ candidateIds: [first.id], changes })),
+      {
+        ok: false,
+        error: "invalid_arguments",
+      },
+    );
+  }
+  const edit = JSON.stringify({ candidateIds: [first.id], changes: { workload: "medium" } });
+  assert.deepEqual(tools.execute("update_task", edit), { ok: false, error: "ambiguous_reference" });
+  assert.equal(await readFile(filename, "utf8"), before);
+
+  const concurrent = JSON.stringify([{ ...first, priority: "high" }, second]);
+  await writeFile(filename, concurrent);
+  assert.deepEqual(tools.execute("update_task", edit), { ok: false, error: "stale_view" });
+  assert.equal(await readFile(filename, "utf8"), concurrent);
 });
 
 test("list, complete, and delete use the current saved tasks", async (t) => {

@@ -1,10 +1,11 @@
 import type { ChatMessage } from "../shared/chat.ts";
+import { readTaskMetadata, type TaskMetadata } from "../shared/task-metadata.ts";
 
 export class ChatRequestRejected extends Error {
   override name = "ChatRequestRejected";
 }
 
-export interface TaskStatus {
+export interface TaskStatus extends TaskMetadata {
   id: string;
   title: string;
   done: boolean;
@@ -15,6 +16,7 @@ export async function requestReply(messages: ChatMessage[]): Promise<string> {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ messages }),
+    signal: AbortSignal.timeout(25_000),
   });
   const body: unknown = await response.json();
   if (typeof body === "object" && body !== null) {
@@ -32,7 +34,7 @@ export async function requestReply(messages: ChatMessage[]): Promise<string> {
   throw new Error("没有收到有效的聊天响应。");
 }
 
-function isTaskStatus(value: unknown): value is TaskStatus {
+function isTaskStatus(value: unknown): value is Pick<TaskStatus, "id" | "title" | "done"> {
   return (
     typeof value === "object" &&
     value !== null &&
@@ -53,7 +55,14 @@ export async function requestTaskList(): Promise<TaskStatus[]> {
   });
   if (response.ok) {
     const body: unknown = await response.json();
-    if (Array.isArray(body) && body.every(isTaskStatus)) return body;
+    if (Array.isArray(body) && body.every(isTaskStatus)) {
+      return body.map((task) => ({
+        id: task.id,
+        title: task.title,
+        done: task.done,
+        ...readTaskMetadata(task),
+      }));
+    }
   }
   throw new Error("读取任务清单失败。");
 }

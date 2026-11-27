@@ -2,15 +2,16 @@ import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { z } from "zod";
+import type { TaskMetadata } from "../shared/task-metadata.ts";
 
 const storedTask = z.looseObject({ id: z.string(), title: z.string(), done: z.boolean() });
 const taskList = z.array(storedTask);
 type Task = z.infer<typeof storedTask>;
-type TaskChanges = Partial<Pick<Task, "title" | "done">>;
+type TaskChanges = Partial<Pick<Task, "title" | "done">> & TaskMetadata;
 
 export interface TaskStore {
   list(): Task[];
-  create(title: string): Task;
+  create(title: string, metadata?: TaskMetadata): Task;
   update(id: string, changes: TaskChanges): Task | undefined;
   remove(id: string): boolean;
 }
@@ -32,8 +33,8 @@ export function createJsonTaskStore(filename: string): TaskStore {
   return {
     list,
 
-    create(title) {
-      const task = { id: randomUUID(), title, done: false };
+    create(title, metadata) {
+      const task = { id: randomUUID(), title, done: false, ...metadata };
       save([...list(), task]);
       return task;
     },

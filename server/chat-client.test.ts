@@ -13,6 +13,7 @@ test("chat distinguishes confirmed validation rejection from an unknown outcome"
     { response: new Response("not JSON", { status: 400 }), rejected: false },
     { response: Response.json({ reply: "" }), rejected: false },
     { response: new Error("connection closed after request"), rejected: false },
+    { response: new DOMException("chat request timed out", "TimeoutError"), rejected: false },
   ];
   let next = 0;
   const fetch = t.mock.method(globalThis, "fetch", async () => {
@@ -32,6 +33,7 @@ test("chat distinguishes confirmed validation rejection from an unknown outcome"
   for (const request of fetch.mock.calls) {
     assert.equal(request.arguments[0], "/api/chat");
     assert.equal(request.arguments[1]?.method, "POST");
+    assert.ok(request.arguments[1]?.signal instanceof AbortSignal);
   }
 });
 
@@ -61,4 +63,19 @@ test("the recovery check reads current task statuses without sending another cha
     assert.equal(init?.cache, "no-store");
     assert.ok(init?.signal instanceof AbortSignal);
   }
+});
+
+test("dashboard reads show supported metadata and tolerate legacy extension values", async (t) => {
+  const report = { id: "report", title: "写报告", done: false };
+  const milk = { id: "milk", title: "买牛奶", done: true };
+  t.mock.method(globalThis, "fetch", async () =>
+    Response.json([
+      { ...report, priority: "high", workload: "large" },
+      { ...milk, priority: 1, workload: "small", legacyNote: "保留" },
+    ]),
+  );
+  assert.deepEqual(await client.requestTaskList(), [
+    { ...report, priority: "high", workload: "large" },
+    { ...milk, workload: "small" },
+  ]);
 });

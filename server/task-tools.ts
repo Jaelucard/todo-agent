@@ -1,8 +1,9 @@
 import { z } from "zod";
-import { createTaskSchema } from "../shared/task-input.ts";
+import { createTaskSchema, taskMetadataPatchSchema } from "../shared/task-input.ts";
+import { readTaskMetadata, type TaskMetadata } from "../shared/task-metadata.ts";
 import type { TaskStore } from "./task-store.ts";
 
-type Task = Pick<ReturnType<TaskStore["create"]>, "id" | "title" | "done">;
+type Task = Pick<ReturnType<TaskStore["create"]>, "id" | "title" | "done"> & TaskMetadata;
 type BoundReference = Pick<Task, "id" | "title">;
 type ResolvedTarget = { ok: true; task: Task } | Extract<ToolResult, { ok: false }>;
 type ToolError =
@@ -19,17 +20,22 @@ type ToolResult =
   | { ok: true; tool: "list_tasks"; tasks: Task[] }
   | { ok: true; tool: "create_task"; task: Task }
   | { ok: true; tool: "complete_task"; task: Task; changed: boolean }
+  | { ok: true; tool: "update_task"; task: Task; changed: boolean }
   | { ok: true; tool: "delete_task"; task: Task }
   | { ok: false; error: ToolError };
 
 const listTaskSchema = z.strictObject({});
-const selectorSchema = z.union([
-  z.strictObject({ candidateIds: z.array(z.string()) }),
-  z.strictObject({ useBoundReference: z.literal(true) }),
+const semanticSelectorSchema = z.strictObject({ candidateIds: z.array(z.string()) });
+const boundSelectorSchema = z.strictObject({ useBoundReference: z.literal(true) });
+const selectorSchema = z.union([semanticSelectorSchema, boundSelectorSchema]);
+const updateTaskSchema = z.union([
+  semanticSelectorSchema.extend({ changes: taskMetadataPatchSchema }),
+  boundSelectorSchema.extend({ changes: taskMetadataPatchSchema }),
 ]);
 
-function taskSummary({ id, title, done }: Task): Task {
-  return { id, title, done };
+function taskSummary(task: ReturnType<TaskStore["create"]>): Task {
+  const { id, title, done } = task;
+  return { id, title, done, ...readTaskMetadata(task) };
 }
 
 // Create one toolkit per turn. A bound reference comes from trusted server context.
@@ -89,6 +95,25 @@ export function createTaskTools(tasks: TaskStore, boundReference?: BoundReferenc
     return { ok: true, tool, task: target };
   }
 
+  function updateTask(args: unknown): ToolResult {
+    const input = updateTaskSchema.safeParse(args);
+    if (!input.success) return { ok: false, error: "invalid_arguments" };
+    const resolved = resolveTarget(input.data);
+    if (!resolved.ok) return resolved;
+    const target = resolved.task;
+    const changes = input.data.changes;
+    if (
+      (changes.priority === undefined || changes.priority === target.priority) &&
+      (changes.workload === undefined || changes.workload === target.workload)
+    ) {
+      return { ok: true, tool: "update_task", task: target, changed: false };
+    }
+    const updated = tasks.update(target.id, changes);
+    if (!updated) return { ok: false, error: "task_not_found" };
+    lastView = undefined;
+    return { ok: true, tool: "update_task", task: taskSummary(updated), changed: true };
+  }
+
   return {
     // Server-only observation. Never dispatch a mutation to find out whether it is a no-op.
     inspectCandidates(candidateIds: string[]): ResolvedTarget {
@@ -103,7 +128,8 @@ export function createTaskTools(tasks: TaskStore, boundReference?: BoundReferenc
         tool !== "list_tasks" &&
         tool !== "create_task" &&
         tool !== "complete_task" &&
-        tool !== "delete_task"
+        tool !== "delete_task" &&
+        tool !== "update_task"
       ) {
         return { ok: false, error: "unknown_tool" };
       }
@@ -127,9 +153,9 @@ export function createTaskTools(tasks: TaskStore, boundReference?: BoundReferenc
           case "create_task": {
             const input = createTaskSchema.safeParse(args);
             if (!input.success) return { ok: false, error: "invalid_arguments" };
-            const { title } = input.data;
+            const { title, ...metadata } = input.data;
             if (createdTitles.has(title)) return { ok: false, error: "duplicate_create" };
-            const task = tasks.create(title);
+            const task = tasks.create(title, metadata);
             createdTitles.add(title);
             lastView = undefined;
             return { ok: true, tool, task: taskSummary(task) };
@@ -137,6 +163,8 @@ export function createTaskTools(tasks: TaskStore, boundReference?: BoundReferenc
           case "complete_task":
           case "delete_task":
             return mutateTask(tool, args);
+          case "update_task":
+            return updateTask(args);
         }
       } catch {
         return { ok: false, error: "storage_error" };

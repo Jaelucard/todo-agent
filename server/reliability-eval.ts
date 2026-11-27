@@ -3,13 +3,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import type { ChatMessage } from "../shared/chat.ts";
+import { readTaskMetadata, type TaskMetadata } from "../shared/task-metadata.ts";
 import { createAgent } from "./agent.ts";
 import type { ModelProvider } from "./model.ts";
 import { createJsonTaskStore } from "./task-store.ts";
 
 type AgentTurn = Awaited<ReturnType<ReturnType<typeof createAgent>["runTurn"]>>;
 type Mutation = AgentTurn["outcomes"][number];
-type Task = Mutation["task"];
+type Task = Mutation["task"] & TaskMetadata;
 type ExpectedMutation = { operation: Mutation["operation"]; title: string; id?: string };
 
 interface ReliabilityTurn {
@@ -82,6 +83,7 @@ const confirmationPrefixes: Record<Mutation["operation"], string> = {
   create_task: "已添加待办",
   complete_task: "已完成",
   delete_task: "已删除",
+  update_task: "已更新",
 };
 
 // Reconcile the public operation log against persisted state. Looking only at the
@@ -97,9 +99,16 @@ function reconcile(before: Task[], after: Task[], outcomes: Mutation[]) {
       replayed.set(task.id, task);
     } else if (
       operation === "complete_task" &&
-      previous?.title === task.title &&
+      previous &&
       !previous.done &&
-      task.done
+      isDeepStrictEqual({ ...previous, done: true }, task)
+    ) {
+      replayed.set(task.id, task);
+    } else if (
+      operation === "update_task" &&
+      previous?.title === task.title &&
+      previous.done === task.done &&
+      !isDeepStrictEqual(previous, task)
     ) {
       replayed.set(task.id, task);
     } else if (operation === "delete_task" && isDeepStrictEqual(previous, task)) {
@@ -116,8 +125,8 @@ function reconcile(before: Task[], after: Task[], outcomes: Mutation[]) {
   return { grounded: grounded.filter(({ task }) => !unexplained.includes(task.id)), unexplained };
 }
 
-function readTaskSummary(task: Task): Task {
-  return { id: task.id, title: task.title, done: task.done };
+function readTaskSummary(task: ReturnType<ReturnType<typeof createJsonTaskStore>["create"]>): Task {
+  return { id: task.id, title: task.title, done: task.done, ...readTaskMetadata(task) };
 }
 
 async function snapshot(file: string) {
@@ -160,9 +169,15 @@ async function evaluateTurn(
   const expectedMutations = expected.mutations ?? [];
   const taskStateCorrect =
     expected.state.length === after.length &&
-    expected.state.every(({ title, done, id }, index) => {
+    expected.state.every(({ title, done, id, priority, workload }, index) => {
       const task = after[index];
-      return title === task.title && done === task.done && (id === undefined || id === task.id);
+      return (
+        title === task.title &&
+        done === task.done &&
+        priority === task.priority &&
+        workload === task.workload &&
+        (id === undefined || id === task.id)
+      );
     });
   const { grounded, unexplained } = reconcile(before, after, result.outcomes);
   const unintendedMutations =

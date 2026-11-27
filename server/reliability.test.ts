@@ -158,6 +158,35 @@ test("the reliability evaluator catches a committed change to the wrong task", a
   assert.equal(result.turns[0].falseSuccessConfirmations, 0);
 });
 
+test("the evaluator checks metadata writes against persisted values", async () => {
+  const report = { id: "report", title: "写报告", done: false, workload: "small" } as const;
+  for (const priority of ["high", "low"]) {
+    const script = [
+      lookup,
+      proposal("update_task", { candidateIds: [report.id], changes: { priority } }),
+      stop,
+    ];
+    const result = await evaluateReliabilityCase({
+      id: "metadata-state",
+      category: "scoring",
+      initial: [report],
+      turns: [
+        {
+          input: "把写报告设为高优先级",
+          state: [{ ...report, priority: "high" }],
+          mutations: [{ operation: "update_task", title: report.title, id: report.id }],
+          mock: (index) => script[index],
+        },
+      ],
+    });
+    const [turn] = result.turns;
+    assert.deepEqual(turn.after, [{ ...report, priority }]);
+    assert.equal(turn.taskStateCorrect, priority === "high");
+    assert.equal(result.passed, priority === "high", turn.problems.join("\n"));
+    assert.equal(turn.falseSuccessConfirmations, 0);
+  }
+});
+
 test("reliability fixtures pass against the real task store with scripted model replies", async (t) => {
   const results = [];
   for (const fixture of reliabilityCases) {

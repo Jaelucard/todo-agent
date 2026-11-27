@@ -296,7 +296,7 @@ test("create sends DeepSeek the saved task under the matching call ID", async (t
   assert.deepEqual(requests[0].messages.at(-1), input);
   assert.deepEqual(
     requests[0].tools?.map((tool) => "function" in tool && tool.function.name).sort(),
-    ["complete_task", "create_task", "delete_task", "list_tasks"],
+    ["complete_task", "create_task", "delete_task", "list_tasks", "update_task"],
   );
   assert.deepEqual(requests[1].messages.slice(-2), [
     { role: "assistant", content: null, tool_calls: [toolCall] },
@@ -310,6 +310,102 @@ test("create sends DeepSeek the saved task under the matching call ID", async (t
     reply: "已添加待办「买牛奶」。",
     outcomes: [{ operation: "create_task", task }],
   });
+});
+
+test("the agent reports saved metadata for Chinese create, update and list requests", async (t) => {
+  const { tasks, filename } = await setup(t);
+  const created = await createAgent(tasks, async (request) => {
+    if (request.messages.at(-1)?.role === "tool") return final("好。");
+    return proposal(
+      call("new", "create_task", '{"title":"写报告","priority":"high","workload":"large"}'),
+    );
+  }).runTurn([user("帮我记一下写报告，优先级高，工作量大")]);
+  const [report] = tasks.list();
+  assert.deepEqual(report, {
+    id: report.id,
+    title: "写报告",
+    done: false,
+    priority: "high",
+    workload: "large",
+  });
+  assert.deepEqual(created.outcomes, [{ operation: "create_task", task: report }]);
+  assert.equal(created.reply.split("\n")[0], "已添加待办「写报告」。");
+  assert.match(created.reply, /优先级：高.*工作量：大/);
+
+  const update = async () => {
+    const script = [
+      proposal(call("list", "list_tasks", "{}")),
+      proposal(
+        call(
+          "edit",
+          "update_task",
+          JSON.stringify({ candidateIds: [report.id], changes: { workload: "small" } }),
+        ),
+      ),
+      final("好。"),
+    ];
+    return createAgent(tasks, async () => script.shift()).runTurn([user("把写报告的工作量改成小")]);
+  };
+  const updated = await update();
+  const stored = { ...report, workload: "small" };
+  assert.deepEqual(updated.outcomes, [{ operation: "update_task", task: stored }]);
+  assert.equal(updated.reply.split("\n")[0], "已更新「写报告」。");
+  assert.match(updated.reply, /优先级：高.*工作量：小/);
+  assert.deepEqual(createJsonTaskStore(filename).list(), [stored]);
+
+  const bytes = await readFile(filename, "utf8");
+  const unchanged = await update();
+  assert.deepEqual(unchanged.outcomes, []);
+  assert.match(unchanged.reply, /未变化/);
+  assert.doesNotMatch(unchanged.reply, /已更新/);
+  assert.equal(await readFile(filename, "utf8"), bytes);
+
+  const listed = await createAgent(tasks, async () => {
+    throw new Error("direct list must not use the model");
+  }).runTurn([user("我有哪些任务？")]);
+  assert.deepEqual(listed.displayedList, [stored]);
+  assert.match(listed.reply, /写报告（待完成.*优先级：高.*工作量：小/);
+});
+
+test("metadata edits require a list delivered to the provider and a named contextual target", async (t) => {
+  const { tasks, filename } = await setup(t);
+  const milk = tasks.create("买牛奶");
+  const parcel = tasks.create("取快递");
+  const before = await readFile(filename, "utf8");
+  const read = call("list", "list_tasks", "{}");
+  const write = call(
+    "edit",
+    "update_task",
+    JSON.stringify({ candidateIds: [milk.id], changes: { priority: "high" } }),
+  );
+  const combined = await createAgent(tasks, async () => proposal(read, write)).runTurn([
+    user("把买牛奶的优先级改成高"),
+  ]);
+  assert.equal(combined.failure, "list_required");
+  assert.deepEqual(combined.outcomes, []);
+
+  const history: ChatMessage[] = [
+    user("我有哪些任务？"),
+    { role: "assistant", content: "当前清单：\n- 买牛奶（待完成）\n- 取快递（待完成）" },
+  ];
+  for (const input of [
+    "把最后那个改成高优先级",
+    "将它的工作量设为大",
+    "把第二项的优先级改为高",
+    "给第二条设为高优先级",
+    "提高刚刚那个的优先级",
+  ]) {
+    const script = [proposal(read), proposal(write), final("好了。")];
+    const result = await createAgent(tasks, async () => script.shift()).runTurn([
+      ...history,
+      user(input),
+    ]);
+    assert.equal(result.failure, "reference_required", input);
+    assert.deepEqual(result.outcomes, []);
+    assert.equal(script.length, 3);
+  }
+  assert.deepEqual(tasks.list(), [milk, parcel]);
+  assert.equal(await readFile(filename, "utf8"), before);
 });
 
 test("a list reply reflects stored tasks even when the final model text is wrong", async (t) => {
@@ -571,6 +667,54 @@ test("unbound contextual mutations clarify before a model can select a replaceme
     assert.equal(await readFile(filename, "utf8"), before);
   }
   assert.equal(requests, 0);
+});
+
+for (const [input, action] of [
+  ["把最后一个删掉", "delete_task"],
+  ["把最后那个删掉", "delete_task"],
+  ["删掉最后一条任务", "delete_task"],
+  ["完成最后那一项", "complete_task"],
+] as const) {
+  test(`a last-item reference asks for its title before mutating: ${input}`, async (t) => {
+    const { tasks, filename } = await setup(t);
+    const milk = tasks.create("买牛奶");
+    const parcel = tasks.create("取快递");
+    const before = await readFile(filename, "utf8");
+    const history: ChatMessage[] = [
+      user("显示我的待办"),
+      { role: "assistant", content: "当前清单：\n- 买牛奶（待完成）\n- 取快递（待完成）" },
+    ];
+    const script = [
+      proposal(call("list", "list_tasks", "{}")),
+      proposal(call("write", action, JSON.stringify({ candidateIds: [milk.id] }))),
+      final("好了。"),
+    ];
+    const agent = createAgent(tasks, async () => script.shift());
+    const turn = await agent.runTurn([...history, user(input)]);
+
+    assert.deepEqual(tasks.list(), [milk, parcel]);
+    assert.equal(await readFile(filename, "utf8"), before);
+    assert.equal(turn.failure, "reference_required");
+    assert.match(turn.reply, /请告诉我你指的是哪一项任务/);
+    assert.deepEqual(turn.outcomes, []);
+    assert.equal(script.length, 3);
+  });
+}
+
+test("a quoted last-item phrase can name a saved task", async (t) => {
+  const { tasks } = await setup(t);
+  const named = tasks.create("最后一个");
+  const parcel = tasks.create("取快递");
+  const script = [
+    proposal(call("list", "list_tasks", "{}")),
+    proposal(call("delete", "delete_task", JSON.stringify({ candidateIds: [named.id] }))),
+    final("好的。"),
+  ];
+  const agent = createAgent(tasks, async () => script.shift());
+  const turn = await agent.runTurn([user("把「最后一个」删掉")]);
+
+  assert.match(turn.reply, /已删除「最后一个」/);
+  assert.deepEqual(tasks.list(), [parcel]);
 });
 
 test("a stored title cannot render an extra success or clarification line", async (t) => {

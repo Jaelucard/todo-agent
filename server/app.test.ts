@@ -82,6 +82,39 @@ test("更新已有 JSON 清单时保留其他任务和扩展字段", async (t) =
   assert.deepEqual(createJsonTaskStore(filename).list(), [{ ...first, done: true }, second]);
 });
 
+test("任务 API 可以保存优先级和工作量，部分更新保留其他字段", async (t) => {
+  const { request, filename } = await startTestApp(t);
+  const legacy = { id: "untouched", title: "买牛奶", done: true };
+  await writeFile(filename, JSON.stringify([legacy]));
+  const collection = "/api/tasks";
+  const created = await request("POST", collection, {
+    title: " 写报告 ",
+    priority: "high",
+    workload: "medium",
+  });
+  assert.equal(created.status, 201);
+  assert.deepEqual(created.body, {
+    id: created.body.id,
+    title: "写报告",
+    done: false,
+    priority: "high",
+    workload: "medium",
+  });
+  const item = collection + "/" + created.body.id;
+  assert.deepEqual(await request("PATCH", item, { workload: "large" }), {
+    status: 200,
+    body: { ...created.body, workload: "large" },
+  });
+  const expected = [legacy, { ...created.body, workload: "large" }];
+  assert.deepEqual((await request("GET", collection)).body, expected);
+  assert.deepEqual(createJsonTaskStore(filename).list(), expected);
+  for (const invalid of [{ priority: null }, { workload: "huge" }, { priority: 1 }]) {
+    assert.equal((await request("PATCH", item, invalid)).status, 400);
+    assert.equal((await request("POST", collection, { title: "坏输入", ...invalid })).status, 400);
+  }
+  assert.deepEqual((await request("GET", collection)).body, expected);
+});
+
 test("聊天 API 只将有效的完整对话传给智能体，并返回其回复", async (t) => {
   const { request, conversations } = await startTestApp(t);
   const messages = [
