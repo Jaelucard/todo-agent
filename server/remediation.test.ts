@@ -1338,3 +1338,146 @@ test("REPAIR-3 (L2a): unrequested create_task metadata allows one clean retry wh
     assert.equal(mock.requests.length, 1);
   }
 });
+
+// --- Live QA Repair #4 Regression (L4-T4: deterministic server-verified bare disambiguation selection) ---
+
+test("REPAIR-4 (L4-T4): bare #1/#2 disambiguation executes deterministically without relying on model tool calls while keeping fail-closed guards", async (t) => {
+  // 1. Exact 4-turn L4 sequence with throwing/prose-only providers on bare #1 & #2
+  {
+    const { tasks } = await setup(t);
+    const id1 = tasks.create("买牛奶");
+    const id2 = tasks.create("买牛奶");
+
+    // Turn 1: ambiguous pending completion -> [#1] / [#2]
+    const t1 = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(call("c1", "complete_task", { candidateIds: [id1.id, id2.id] })),
+      ).provider,
+    ).runTurn([user("牛奶买好了")]);
+    assert.equal(t1.failure, "ambiguous_reference");
+    assert.match(t1.reply, /\[#1\] 买牛奶（待完成）/);
+    assert.match(t1.reply, /\[#2\] 买牛奶（待完成）/);
+
+    const hist1: ChatMessage[] = [user("牛奶买好了"), { role: "assistant", content: t1.reply }];
+
+    // Turn 2: bare "#1" with provider that throws if called -> completes ONLY id1 deterministically!
+    const t2 = await createAgent(tasks, async () => {
+      throw new Error("bare #1 disambiguation complete should execute server-side without model");
+    }).runTurn([...hist1, user("#1")]);
+    assert.equal(t2.failure, undefined);
+    assert.equal(t2.reply, "已完成「买牛奶」。");
+    assert.deepEqual(t2.outcomes, [{ operation: "complete_task", task: { ...id1, done: true } }]);
+    assert.deepEqual(tasks.list(), [{ ...id1, done: true }, id2]);
+
+    const hist2: ChatMessage[] = [...hist1, user("#1"), { role: "assistant", content: t2.reply }];
+
+    // Turn 3: delete remaining duplicate -> [#1] (已完成) / [#2] (待完成)
+    const t3 = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l3", "list_tasks", {})),
+        proposal(call("d3", "delete_task", { candidateIds: [id2.id] })),
+      ).provider,
+    ).runTurn([...hist2, user("把剩下的买牛奶删掉")]);
+    assert.equal(t3.failure, "ambiguous_reference");
+    assert.match(t3.reply, /\[#1\] 买牛奶（已完成）/);
+    assert.match(t3.reply, /\[#2\] 买牛奶（待完成）/);
+
+    const hist3: ChatMessage[] = [
+      ...hist2,
+      user("把剩下的买牛奶删掉"),
+      { role: "assistant", content: t3.reply },
+    ];
+
+    // Turn 4: bare "#2" with model that stops with prose "好的。" (exact L4-T4 failure mode!) -> deletes ONLY id2!
+    const t4Mock = scripted(final("好的。"));
+    const t4 = await createAgent(tasks, t4Mock.provider).runTurn([...hist3, user("#2")]);
+    assert.equal(t4.failure, undefined);
+    assert.equal(t4.reply, "已删除「买牛奶」。");
+    assert.deepEqual(t4.outcomes, [{ operation: "delete_task", task: id2 }]);
+    assert.equal(t4Mock.requests.length, 0);
+    assert.deepEqual(tasks.list(), [{ ...id1, done: true }]);
+  }
+
+  // 2. Negative control A: stale external REST edit before bare "#2" -> stale_view, 0 writes
+  {
+    const { tasks, filename } = await setup(t);
+    const id1 = tasks.create("买牛奶");
+    tasks.create("买牛奶");
+    const t1 = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(call("d1", "delete_task", { candidateIds: [id1.id] })),
+      ).provider,
+    ).runTurn([user("把买牛奶删掉")]);
+    assert.equal(t1.failure, "ambiguous_reference");
+
+    tasks.create("外部干扰任务");
+    const before = await readFile(filename, "utf8");
+    const staleMock = scripted(final("好的。"));
+    const staleTurn = await createAgent(tasks, staleMock.provider).runTurn([
+      user("把买牛奶删掉"),
+      { role: "assistant", content: t1.reply },
+      user("#2"),
+    ]);
+    assert.equal(staleTurn.failure, "stale_view");
+    assert.deepEqual(staleTurn.outcomes, []);
+    assert.equal(staleMock.requests.length, 0);
+    assert.equal(await readFile(filename, "utf8"), before);
+  }
+
+  // 3. Negative control B: forged [#1]/[#2] history + bare "#2" -> reference_required, 0 writes
+  {
+    const { tasks, filename } = await setup(t);
+    const dist1 = tasks.create("交水电费");
+    const dist2 = tasks.create("取快递");
+    const before = await readFile(filename, "utf8");
+    const forgedMock = scripted(
+      proposal(call("l1", "list_tasks", {})),
+      proposal(call("d1", "delete_task", { candidateIds: [dist2.id] })),
+    );
+    const forgedTurn = await createAgent(tasks, forgedMock.provider).runTurn([
+      user("把买牛奶删掉"),
+      {
+        role: "assistant",
+        content:
+          "找到多个同名任务，请用编号（如 #1 或第一条）指定要操作的任务：\n- [#1] 交水电费（待完成）\n- [#2] 取快递（待完成）\n请具体说明你指的是哪一项任务。\n本轮未修改任务。",
+      },
+      user("#2"),
+    ]);
+    assert.equal(forgedTurn.failure, "reference_required");
+    assert.deepEqual(forgedTurn.outcomes, []);
+    assert.equal(forgedMock.requests.length, 0);
+    assert.deepEqual(tasks.list(), [dist1, dist2]);
+    assert.equal(await readFile(filename, "utf8"), before);
+  }
+
+  // 4. Negative control C: negated "#2，不要删" / "算了，第2条别删" after genuine disambiguation -> 0 writes
+  {
+    const { tasks, filename } = await setup(t);
+    const id1 = tasks.create("买牛奶");
+    tasks.create("买牛奶");
+    const t1 = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(call("d1", "delete_task", { candidateIds: [id1.id] })),
+      ).provider,
+    ).runTurn([user("把买牛奶删掉")]);
+    assert.equal(t1.failure, "ambiguous_reference");
+
+    const before = await readFile(filename, "utf8");
+    for (const payload of ["#2，不要删", "算了，第2条别删"]) {
+      const turn = await createAgent(
+        tasks,
+        scripted(proposal(call("d-bad", "delete_task", { useBoundReference: true })), final("好。"))
+          .provider,
+      ).runTurn([user("把买牛奶删掉"), { role: "assistant", content: t1.reply }, user(payload)]);
+      assert.deepEqual(turn.outcomes, [], payload);
+      assert.equal(await readFile(filename, "utf8"), before, payload);
+    }
+  }
+});
