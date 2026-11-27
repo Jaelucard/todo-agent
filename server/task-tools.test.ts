@@ -556,3 +556,33 @@ test("update_task supports reopen and rename while enforcing field authorization
     error: "invalid_arguments",
   });
 });
+
+test("MEDIUM-1: bound-reference writes do not heal a stale expectedSnapshot for subsequent semantic writes", async (t) => {
+  for (const boundOp of ["complete_task", "update_task", "delete_task"] as const) {
+    const { tasks, filename } = await temporaryStore(t);
+    const boundA = tasks.create("买牛奶");
+    const otherB = tasks.create("取快递");
+    const tools = createTaskTools(tasks, { id: boundA.id, title: boundA.title });
+
+    assert.ok(tools.execute("list_tasks", "{}").ok);
+    // Out-of-band external REST edit mutates unrelated task B, making expectedSnapshot stale.
+    tasks.update(otherB.id, { priority: "high" });
+
+    // Bound write on boundA still succeeds because boundA itself was not modified externally.
+    const boundArgs =
+      boundOp === "update_task"
+        ? JSON.stringify({ useBoundReference: true, changes: { workload: "small" } })
+        : '{"useBoundReference":true}';
+    const boundResult = tools.execute(boundOp, boundArgs);
+    assert.equal(boundResult.ok, true, boundOp);
+
+    // Crucially, the bound write must NOT heal expectedSnapshot for a subsequent semantic write on B.
+    const beforeSemantic = await readFile(filename, "utf8");
+    const semanticResult = tools.execute(
+      "delete_task",
+      JSON.stringify({ candidateIds: [otherB.id] }),
+    );
+    assert.deepEqual(semanticResult, { ok: false, error: "stale_view" }, boundOp);
+    assert.equal(await readFile(filename, "utf8"), beforeSemantic, boundOp);
+  }
+});
