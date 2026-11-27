@@ -1,20 +1,16 @@
 import { useState } from "react";
 import { priorities, priorityLabels, workloads, workloadLabels } from "../shared/task-metadata.ts";
 import type { TaskStatus } from "./chat-client.ts";
-
-const filters = [
-  { key: "all", label: "全部" },
-  { key: "pending", label: "待完成" },
-  { key: "completed", label: "已完成" },
-] as const;
+import {
+  defaultTaskFilterState,
+  filterAndGroupTasks,
+  taskStatusFilters,
+  type TaskStatusFilter,
+} from "./task-view.ts";
 
 export interface DashboardState {
   tasks: TaskStatus[] | null;
   status: "loading" | "ready" | "error";
-}
-
-function matchesFilter(value: string | undefined, selection: string) {
-  return selection === "*" || (value ?? "") === selection;
 }
 
 export function TaskDashboard({
@@ -24,28 +20,23 @@ export function TaskDashboard({
   state: DashboardState;
   onRefresh: () => void;
 }) {
-  const [filter, setFilter] = useState<(typeof filters)[number]["key"]>("all");
-  const [priorityFilter, setPriorityFilter] = useState("*");
-  const [workloadFilter, setWorkloadFilter] = useState("*");
+  const [filter, setFilter] = useState<TaskStatusFilter>(defaultTaskFilterState.status);
+  const [priorityFilter, setPriorityFilter] = useState(defaultTaskFilterState.priority);
+  const [workloadFilter, setWorkloadFilter] = useState(defaultTaskFilterState.workload);
   const { tasks, status } = state;
-  const pending = tasks?.filter((task) => !task.done) ?? [];
-  const completed = tasks?.filter((task) => task.done) ?? [];
-  const total = tasks?.length ?? 0;
-  const percent = total ? Math.round((completed.length / total) * 100) : 0;
-  const groups = [
-    { key: "pending", title: "待完成", items: pending },
-    { key: "completed", title: "已完成", items: completed },
-  ]
-    .filter(({ key }) => filter === "all" || filter === key)
-    .map((group) => ({
-      ...group,
-      items: group.items.filter(
-        (task) =>
-          matchesFilter(task.priority, priorityFilter) &&
-          matchesFilter(task.workload, workloadFilter),
-      ),
-    }))
-    .filter(({ items }) => items.length > 0);
+
+  const { total, pendingCount, completedCount, percent, filteredCount, hasActiveFilters, groups } =
+    filterAndGroupTasks(tasks ?? [], {
+      status: filter,
+      priority: priorityFilter,
+      workload: workloadFilter,
+    });
+
+  function resetFilters() {
+    setFilter(defaultTaskFilterState.status);
+    setPriorityFilter(defaultTaskFilterState.priority);
+    setWorkloadFilter(defaultTaskFilterState.workload);
+  }
 
   return (
     <section className="tasks pane" aria-labelledby="tasks-heading" id="workspace-tasks">
@@ -53,8 +44,13 @@ export function TaskDashboard({
         <h2 id="tasks-heading" tabIndex={-1}>
           任务清单
         </h2>
-        <button type="button" className="secondary-button" onClick={onRefresh}>
-          刷新任务
+        <button
+          type="button"
+          className="secondary-button"
+          disabled={status === "loading"}
+          onClick={onRefresh}
+        >
+          {status === "loading" ? "刷新中…" : "刷新任务"}
         </button>
       </div>
 
@@ -68,18 +64,18 @@ export function TaskDashboard({
               </div>
               <div>
                 <dt>待完成</dt>
-                <dd>{pending.length}</dd>
+                <dd>{pendingCount}</dd>
               </div>
               <div>
                 <dt>已完成</dt>
-                <dd>{completed.length}</dd>
+                <dd>{completedCount}</dd>
               </div>
             </dl>
             <div className="progress-label">
               <label htmlFor="completion-progress">完成进度</label>
               <span>{percent}%</span>
             </div>
-            <progress id="completion-progress" value={completed.length} max={total || 1} />
+            <progress id="completion-progress" value={completedCount} max={total || 1} />
           </div>
           <div className="metadata-filters">
             <div>
@@ -116,7 +112,7 @@ export function TaskDashboard({
             </div>
           </div>
           <div className="task-filters" role="group" aria-label="任务状态筛选">
-            {filters.map(({ key, label }) => (
+            {taskStatusFilters.map(({ key, label }) => (
               <button
                 key={key}
                 type="button"
@@ -127,19 +123,36 @@ export function TaskDashboard({
               </button>
             ))}
           </div>
+          {hasActiveFilters && (
+            <div className="active-filter-bar">
+              <span>{`已筛选：显示 ${filteredCount} / ${total} 项`}</span>
+              {groups.length > 0 && (
+                <button type="button" className="secondary-button" onClick={resetFilters}>
+                  重置筛选
+                </button>
+              )}
+            </div>
+          )}
         </>
       )}
       <div className="task-content" aria-busy={status === "loading"}>
-        {status === "loading" && <p role="status">正在读取任务…</p>}
+        {status === "loading" && tasks === null && <p role="status">正在读取任务…</p>}
         {status === "error" && (
           <p className="error" role="alert">
             {tasks === null ? "读取任务失败，请刷新重试。" : "刷新任务失败，当前清单可能已过时。"}
           </p>
         )}
         {tasks !== null && (
-          <div aria-label="当前任务">
+          <div>
             {!groups.length && (
-              <p className="task-empty">{total ? "没有符合筛选条件的任务" : "暂无任务"}</p>
+              <div className="task-empty">
+                <p>{total ? "没有符合筛选条件的任务" : "暂无任务"}</p>
+                {hasActiveFilters && (
+                  <button type="button" className="secondary-button" onClick={resetFilters}>
+                    重置筛选
+                  </button>
+                )}
+              </div>
             )}
             {groups.map(({ key, title, items }) => (
               <div className="task-group" key={key}>
