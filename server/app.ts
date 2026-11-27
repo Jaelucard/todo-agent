@@ -4,8 +4,20 @@ import { chatRequestSchema, type ChatMessage } from "../shared/chat.ts";
 import type { TaskStore } from "./task-store.ts";
 import { taskRouter } from "./tasks.ts";
 
+export class ChatServiceUnavailableError extends Error {
+  override name = "ChatServiceUnavailableError";
+  readonly status = 503;
+  readonly code: "config_error" | "model_error";
+  readonly mutated = false;
+
+  constructor(code: "config_error" | "model_error", message: string) {
+    super(message);
+    this.code = code;
+  }
+}
+
 interface AppDependencies {
-  reply(messages: ChatMessage[]): Promise<string>;
+  reply(messages: ChatMessage[], signal?: AbortSignal): Promise<string>;
   tasks: TaskStore;
 }
 
@@ -18,8 +30,22 @@ export function createApp({ reply, tasks }: AppDependencies) {
     if (!input.success) {
       return res.status(400).json({ error: "请提供对话记录，并以用户消息结尾。" });
     }
-    const answer = await reply(input.data.messages);
-    res.json({ reply: answer });
+    const controller = new AbortController();
+    const onClose = () => {
+      if (!res.writableEnded) controller.abort();
+    };
+    res.on("close", onClose);
+    try {
+      const answer = await reply(input.data.messages, controller.signal);
+      if (!res.writableEnded && !controller.signal.aborted) {
+        res.json({ reply: answer });
+      }
+    } catch (error) {
+      if (controller.signal.aborted) return;
+      throw error;
+    } finally {
+      res.off("close", onClose);
+    }
   });
 
   app.use("/api/tasks", taskRouter(tasks));
@@ -27,17 +53,26 @@ export function createApp({ reply, tasks }: AppDependencies) {
   app.use(handleApiError);
 
   app.use(express.static(resolve("public")));
-  app.get("/assets/chat.js", (_req, res) => res.sendFile(resolve("dist/chat.js")));
+  app.get("/assets/chat.js", (_req, res) => res.sendFile("chat.js", { root: resolve("dist") }));
   return app;
 }
 
 const handleApiError: ErrorRequestHandler = (error, _req, res, _next) => {
+  if (res.headersSent || res.writableEnded) return;
+  if (error instanceof ChatServiceUnavailableError) {
+    return res.status(503).json({
+      error: error.message,
+      code: error.code,
+      mutated: false,
+    });
+  }
   if (error.type === "entity.parse.failed") {
     return res.status(400).json({ error: "请求需要使用有效的 JSON。" });
   }
   if (error.type === "entity.too.large") {
     return res.status(413).json({ error: "对话太长，请刷新后开始新的对话。" });
   }
-  console.error(error);
+  const errorName = error instanceof Error ? error.name : "UnknownError";
+  console.error(`[app] unexpected_error error=${errorName}`);
   res.status(500).json({ error: "服务暂时无法处理请求，请稍后重试。" });
 };

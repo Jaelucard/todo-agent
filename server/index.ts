@@ -1,6 +1,6 @@
 import { join } from "node:path";
 import { createAgent } from "./agent.ts";
-import { createApp } from "./app.ts";
+import { ChatServiceUnavailableError, createApp } from "./app.ts";
 import type { ModelProvider } from "./model.ts";
 import { createJsonTaskStore, type TaskStore } from "./task-store.ts";
 
@@ -8,8 +8,19 @@ export function createTaskAgentApp(tasks: TaskStore, provider?: ModelProvider) {
   const agent = createAgent(tasks, provider);
   return createApp({
     tasks,
-    async reply(messages) {
-      return (await agent.runTurn(messages)).reply;
+    async reply(messages, signal) {
+      const turn = await agent.runTurn(messages, signal);
+      if (
+        turn.outcomes.length === 0 &&
+        (turn.failure === "config_error" || turn.failure === "model_error")
+      ) {
+        const message =
+          turn.failure === "config_error"
+            ? "模型服务未正确配置，请检查 .env 中的 DEEPSEEK_API_KEY 后重试。本轮未修改任务。"
+            : "模型服务暂时无法处理请求，请稍后重试。本轮未修改任务。";
+        throw new ChatServiceUnavailableError(turn.failure, message);
+      }
+      return turn.reply;
     },
   });
 }

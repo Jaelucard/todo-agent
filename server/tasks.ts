@@ -1,12 +1,6 @@
 import { Router } from "express";
-import { z } from "zod";
-import { createTaskSchema } from "../shared/task-input.ts";
+import { createTaskSchema, taskUpdatePatchSchema } from "../shared/task-input.ts";
 import type { TaskStore } from "./task-store.ts";
-
-const updateTaskSchema = createTaskSchema
-  .partial()
-  .extend({ done: z.boolean().optional() })
-  .refine((changes) => Object.keys(changes).length > 0);
 
 const taskNotFound = { error: "找不到这条任务。" };
 
@@ -29,7 +23,7 @@ export function taskRouter(tasks: TaskStore) {
   });
 
   router.patch("/:id", (req, res) => {
-    const input = updateTaskSchema.safeParse(req.body);
+    const input = taskUpdatePatchSchema.safeParse(req.body);
     if (!input.success) {
       return res
         .status(400)

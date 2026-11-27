@@ -81,7 +81,7 @@ components:
   schemas:
     Title:
       type: string
-      description: 首尾空白会自动去除，去除后长度应为 1 至 200
+      description: 首尾空白和危险双向控制字符会自动去除，去除后须包含可见字符且长度为 1 至 200
       minLength: 1
       maxLength: 200
     Priority:
