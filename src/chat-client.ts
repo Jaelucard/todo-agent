@@ -11,19 +11,26 @@ export interface TaskStatus extends TaskMetadata {
   done: boolean;
 }
 
-export async function requestReply(messages: ChatMessage[]): Promise<string> {
+export async function requestReply(messages: ChatMessage[], signal?: AbortSignal): Promise<string> {
+  const timeoutSignal = AbortSignal.timeout(25_000);
+  const requestSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
   const response = await fetch("/api/chat", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ messages }),
-    signal: AbortSignal.timeout(25_000),
+    signal: requestSignal,
   });
   const body: unknown = await response.json();
   if (typeof body === "object" && body !== null) {
-    if (response.ok && "reply" in body && typeof body.reply === "string" && body.reply.trim())
+    if (response.ok && "reply" in body && typeof body.reply === "string" && body.reply.trim()) {
       return body.reply;
+    }
+    const confirmedRejection =
+      response.status === 400 ||
+      response.status === 413 ||
+      (response.status === 503 && "mutated" in body && body.mutated === false);
     if (
-      (response.status === 400 || response.status === 413) &&
+      confirmedRejection &&
       "error" in body &&
       typeof body.error === "string" &&
       body.error.trim()

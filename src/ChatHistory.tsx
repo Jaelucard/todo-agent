@@ -6,25 +6,33 @@ const examplePrompts = ["提醒我买牛奶", "看看我的待办"];
 interface ChatHistoryProps {
   messages: ChatMessage[];
   pending: boolean;
+  visible?: boolean;
   onSelectPrompt: (prompt: string) => void;
 }
 
-export function ChatHistory({ messages, pending, onSelectPrompt }: ChatHistoryProps) {
+export function ChatHistory({
+  messages,
+  pending,
+  visible = true,
+  onSelectPrompt,
+}: ChatHistoryProps) {
   const viewport = useRef<HTMLDivElement>(null);
   useEffect(() => {
-    if (viewport.current) viewport.current.scrollTop = viewport.current.scrollHeight;
-  }, [messages, pending]);
+    if (viewport.current && (visible || viewport.current.scrollHeight > 0)) {
+      viewport.current.scrollTop = viewport.current.scrollHeight;
+    }
+  }, [messages, pending, visible]);
 
   return (
     <div className="scroll" ref={viewport}>
       {messages.length === 0 ? (
         <section className="welcome">
           <img src="/logo.png" alt="" />
-          <h1>小明智能体</h1>
+          <p className="welcome-title">小明智能体</p>
           <p>今天有什么待办？</p>
           <div className="examples">
             {examplePrompts.map((prompt) => (
-              <button key={prompt} onClick={() => onSelectPrompt(prompt)}>
+              <button key={prompt} type="button" onClick={() => onSelectPrompt(prompt)}>
                 {prompt}
                 <span aria-hidden="true">↗</span>
               </button>
