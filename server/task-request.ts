@@ -412,16 +412,21 @@ export interface ClauseAnalysis {
   hasPositiveCreateCommand: boolean;
 }
 
+const retractionClausePattern = /^(?:(?:还是)?算了(?:吧)?|罢了|没事了|不麻烦了)$/u;
+const keepNoOpClausePattern =
+  /^(?:(?:先|还是|就)?(?:留着|保留|保持原样|不动|别动|放着|搁着)(?:吧|好了|就行)?)$/u;
+const tentativeIntentPattern = /^(?:我)?(?:本来|原本|刚才|刚刚)想/u;
+const retractionCuePattern =
+  /(?:算了|(?:不用|不要|别|不必)(?:记|加|新增|创建|添加|删|改|做|办|完成|动|管)了?)/u;
+
 export function analyzeClauses(input: string): ClauseAnalysis {
   const trimmed = input.trim();
   const maskedWhole = maskQuotedTitles(trimmed);
   const clauses = splitClausesOutsideQuotes(trimmed);
 
   const forbiddenTitles = new Set<string>();
-  const positiveQuotedTitles: string[] = [];
-  const positiveMaskedClauses: string[] = [];
+  const positiveEntries: Array<{ masked: string; quoted: string[]; tentative: boolean }> = [];
   let previousWasProhibition = false;
-  let hasUnquotedPositiveActionClause = false;
 
   const isQuestion =
     /[?？]$/u.test(maskedWhole) ||
@@ -433,11 +438,16 @@ export function analyzeClauses(input: string): ClauseAnalysis {
   for (const clause of clauses) {
     const maskedClause = maskQuotedTitles(clause);
     const clauseQuoted = extractQuotedTitles(clause);
+    const isSelfCancelledTentative =
+      tentativeIntentPattern.test(maskedClause) && retractionCuePattern.test(maskedClause);
     const isProhibition =
+      isSelfCancelledTentative ||
       clauseNegationPattern.test(maskedClause) ||
-      /^(?:请(?:帮我)?|帮我|麻烦(?:帮我)?)?(?:不要|别|勿|不用|不必|先不要|先别|千万不要|千万别|暂不)/u.test(
+      /^(?:请(?:帮我)?|帮我|麻烦(?:帮我)?)?(?:(?:还是)?算了(?:吧)?\s*)?(?:还是|先)?(?:不要|别|勿|不用|不必|千万不要|千万别|暂不)/u.test(
         maskedClause,
       ) ||
+      retractionClausePattern.test(maskedClause) ||
+      keepNoOpClausePattern.test(maskedClause) ||
       (previousWasProhibition && /^(?:尤其是|特别是|包括)/u.test(maskedClause));
 
     if (isProhibition) {
@@ -445,19 +455,40 @@ export function analyzeClauses(input: string): ClauseAnalysis {
       for (const title of clauseQuoted) {
         forbiddenTitles.add(title);
       }
+      if (retractionClausePattern.test(maskedClause) || retractionCuePattern.test(maskedClause)) {
+        for (let i = positiveEntries.length - 1; i >= 0; i--) {
+          if (positiveEntries[i].tentative) {
+            for (const title of positiveEntries[i].quoted) {
+              forbiddenTitles.add(title);
+            }
+            positiveEntries.splice(i, 1);
+          }
+        }
+      }
       continue;
     }
 
     previousWasProhibition = false;
-    positiveMaskedClauses.push(maskedClause);
-    for (const title of clauseQuoted) {
+    positiveEntries.push({
+      masked: maskedClause,
+      quoted: clauseQuoted,
+      tentative: tentativeIntentPattern.test(maskedClause),
+    });
+  }
+
+  const positiveMaskedClauses: string[] = [];
+  const positiveQuotedTitles: string[] = [];
+  let hasUnquotedPositiveActionClause = false;
+  for (const entry of positiveEntries) {
+    positiveMaskedClauses.push(entry.masked);
+    for (const title of entry.quoted) {
       positiveQuotedTitles.push(title);
     }
     // Check if this positive clause performs an existing-task mutation without quoting its target.
     if (
-      clauseQuoted.length === 0 &&
+      entry.quoted.length === 0 &&
       /(?:完成|做好|买好|办好|交好|搞定|删掉|删除|移除|清空|改回|重命名|改名|改|设|调|优先级|工作量)/u.test(
-        maskedClause,
+        entry.masked,
       )
     ) {
       hasUnquotedPositiveActionClause = true;
@@ -569,6 +600,14 @@ export function analyzeClauses(input: string): ClauseAnalysis {
     !hasDeleteVerb &&
     !allowReopen &&
     !allowRename;
+  const isPureCreate =
+    isSinglePositiveClause &&
+    hasCreateVerb &&
+    !hasCompleteVerb &&
+    !hasDeleteVerb &&
+    !allowReopen &&
+    !allowRename &&
+    !hasMetadataMention;
   const isPureComplete =
     isSinglePositiveClause &&
     hasCompleteVerb &&
@@ -609,9 +648,19 @@ export function analyzeClauses(input: string): ClauseAnalysis {
     !isPureReopen &&
     !isPureRename;
   const allowComplete =
-    mutationsAllowed && !isPureMetadataRequest && !isPureDelete && !isPureReopen && !isPureRename;
+    mutationsAllowed &&
+    !isPureMetadataRequest &&
+    !isPureCreate &&
+    !isPureDelete &&
+    !isPureReopen &&
+    !isPureRename;
   const allowDelete =
-    mutationsAllowed && !isPureMetadataRequest && !isPureComplete && !isPureReopen && !isPureRename;
+    mutationsAllowed &&
+    !isPureMetadataRequest &&
+    !isPureCreate &&
+    !isPureComplete &&
+    !isPureReopen &&
+    !isPureRename;
 
   const hasPositiveCreateCommand =
     mutationsAllowed &&
@@ -637,7 +686,10 @@ export function analyzeClauses(input: string): ClauseAnalysis {
 }
 
 export function detectUnboundCommand(input: string): "anaphoric" | "positional" | undefined {
-  const trimmed = input.trim();
+  const trimmed = input
+    .trim()
+    .replace(/^(?:(?:还是)?算了(?:吧)?|好吧|好的|那|嗯|哎呀|对了)[，,；;\s]*/u, "")
+    .trim();
   const masked = maskQuotedTitles(trimmed);
   if (clarifiedTitle.test(trimmed)) return undefined;
   const clauses = splitClausesOutsideQuotes(trimmed);
