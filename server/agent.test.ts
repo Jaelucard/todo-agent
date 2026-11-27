@@ -103,7 +103,7 @@ test("a list reply reflects stored tasks even when the final model text is wrong
       : final("当前电话账单待支付。");
   });
 
-  const turn = await agent.runTurn([user("请列出我的待办")]);
+  const turn = await agent.runTurn([user("我手头都记了些什么？")]);
   assert.equal(requests.length, 2);
   assert.deepEqual(requests[1].messages.at(-1), {
     role: "tool",
@@ -116,6 +116,162 @@ test("a list reply reflects stored tasks even when the final model text is wrong
   assert.match(turn.reply, /取快递（已完成）/);
   assert.doesNotMatch(turn.reply, /电话账单/);
   assert.equal(await readFile(filename, "utf8"), before);
+});
+
+test("a list-only follow-up returns the saved list when the model would stop without tools", async (t) => {
+  const { filename, tasks } = await setup(t);
+  const milk = tasks.create("买牛奶");
+  tasks.update(milk.id, { done: true });
+  const before = await readFile(filename, "utf8");
+  const agent = createAgent(tasks, async () => final("收到。"));
+
+  const turn = await agent.runTurn([
+    user("我有哪些任务？"),
+    { role: "assistant", content: "当前清单：\n- 买牛奶（待完成）\n- 取快递（待完成）" },
+    user("再给我看看清单"),
+  ]);
+
+  assert.equal(turn.reply, "当前清单：\n- 买牛奶（已完成）");
+  assert.deepEqual(turn.displayedList, [{ ...milk, done: true }]);
+  assert.deepEqual(turn.outcomes, []);
+  assert.equal(await readFile(filename, "utf8"), before);
+});
+
+test("explicit list commands and questions show both saved statuses without allowing a write", async (t) => {
+  const { filename, tasks } = await setup(t);
+  const milk = tasks.create("买牛奶");
+  const parcel = tasks.create("取快递");
+  tasks.update(parcel.id, { done: true });
+  const before = await readFile(filename, "utf8");
+  let requests = 0;
+  const agent = createAgent(tasks, async (request) => {
+    requests++;
+    return request.messages.at(-1)?.role === "tool"
+      ? final("收到。")
+      : proposal(call("wrong-write", "create_task", '{"title":"意外新增"}'));
+  });
+
+  for (const input of [
+    "我有哪些任务？",
+    "请问我现在都有哪些待办事项？",
+    "我的任务有哪些？",
+    "请列出我的待办",
+    "麻烦再给我查看一下任务列表吧！",
+    "帮我看下当前的待办清单",
+    "显示所有任务",
+  ]) {
+    const turn = await agent.runTurn([user(input)]);
+    assert.equal(turn.reply, "当前清单：\n- 买牛奶（待完成）\n- 取快递（已完成）", input);
+    assert.deepEqual(turn.displayedList, [milk, { ...parcel, done: true }], input);
+    assert.deepEqual(turn.outcomes, [], input);
+    assert.equal(await readFile(filename, "utf8"), before, input);
+  }
+  assert.equal(requests, 0);
+});
+
+test("a local list distinguishes empty storage, a failed read and a cancelled turn", async (t) => {
+  const { filename, tasks } = await setup(t);
+  const agent = createAgent(tasks, async () => final("收到。"));
+  const input = [user("看看清单")];
+  assert.deepEqual(await agent.runTurn(input), {
+    reply: "当前没有待办。",
+    displayedList: [],
+    outcomes: [],
+  });
+  await assert.rejects(readFile(filename), { code: "ENOENT" });
+
+  await writeFile(filename, "{");
+  const failed = await agent.runTurn(input);
+  assert.equal(failed.failure, "storage_error");
+  assert.match(failed.reply, /任务存储暂时不可用/);
+  assert.equal(failed.displayedList, undefined);
+  assert.deepEqual(failed.outcomes, []);
+  const cancelled = await agent.runTurn(input, AbortSignal.abort());
+  assert.equal(cancelled.failure, "deadline");
+  assert.equal(cancelled.displayedList, undefined);
+  assert.equal(await readFile(filename, "utf8"), "{");
+});
+
+test("mixed, negated, scoped and ambiguous requests stay with the model", async (t) => {
+  const { filename, tasks } = await setup(t);
+  tasks.create("买牛奶");
+  const before = await readFile(filename, "utf8");
+  const received: Parameters<ModelProvider>[0][] = [];
+  const agent = createAgent(tasks, async (request) => {
+    received.push(request);
+    return final("需要澄清");
+  });
+  const inputs = [
+    "看看清单，再把买牛奶标为完成",
+    "别给我看清单",
+    "查看清单，不用列出来",
+    "请列出未完成的任务",
+    "我的清单有哪些问题？",
+    "看看那个清单",
+    "清单？",
+    "删掉清单里的那一条",
+  ];
+  for (const input of inputs) {
+    const turn = await agent.runTurn([user(input)]);
+    assert.equal(turn.failure, "ambiguous_reference", input);
+    assert.equal(turn.displayedList, undefined, input);
+    assert.deepEqual(turn.outcomes, [], input);
+  }
+  assert.deepEqual(
+    received.map((request) => request.messages.at(-1)),
+    inputs.map(user),
+  );
+  assert.equal(await readFile(filename, "utf8"), before);
+});
+
+test("mentioning a list command in a task title still creates exactly the requested task", async (t) => {
+  const { tasks } = await setup(t);
+  const agent = createAgent(tasks, async (request) =>
+    request.messages.at(-1)?.role === "tool"
+      ? final("收到。")
+      : proposal(call("create", "create_task", '{"title":"查看清单"}')),
+  );
+  const turn = await agent.runTurn([user("帮我记一条查看清单")]);
+  const [saved] = tasks.list();
+  assert.deepEqual(tasks.list(), [{ id: saved.id, title: "查看清单", done: false }]);
+  assert.deepEqual(turn.outcomes, [{ operation: "create_task", task: saved }]);
+  assert.equal(turn.reply, "已添加待办「查看清单」。");
+});
+
+test("a list command can be a task name when the preceding reply asks which task to delete", async (t) => {
+  const { filename, tasks } = await setup(t);
+  const target = tasks.create("查看清单");
+  const before = await readFile(filename, "utf8");
+  const deletion = user("帮我删一条待办");
+  const question = await createAgent(tasks, async () => final("需要澄清")).runTurn([deletion]);
+  const history: ChatMessage[] = [deletion, { role: "assistant", content: question.reply }];
+  const agent = createAgent(tasks, async () =>
+    proposal(call("guess", "delete_task", JSON.stringify({ candidateIds: [target.id] }))),
+  );
+
+  const browse = await agent.runTurn([...history, user("再给我看看清单")]);
+  assert.deepEqual(browse.displayedList, [target]);
+  const answer = await agent.runTurn([...history, user("查看清单")]);
+  assert.equal(
+    answer.failure,
+    "list_required",
+    "The model must see the list before proposing an ID",
+  );
+  assert.deepEqual(answer.outcomes, []);
+  assert.equal(await readFile(filename, "utf8"), before);
+
+  const resolvingAgent = createAgent(tasks, async (request) => {
+    const last = request.messages.at(-1);
+    if (last?.role !== "tool") return proposal(call("list", "list_tasks", "{}"));
+    if (last.tool_call_id !== "list") return final("收到。");
+    assert.ok(typeof last.content === "string");
+    const [listed] = JSON.parse(last.content).tasks;
+    return proposal(call("delete", "delete_task", JSON.stringify({ candidateIds: [listed.id] })));
+  });
+  const resolved = await resolvingAgent.runTurn([...history, user("查看清单")]);
+  assert.equal(resolved.reply, "已删除「查看清单」。");
+  assert.deepEqual(resolved.outcomes, [{ operation: "delete_task", task: target }]);
+  assert.deepEqual(tasks.list(), []);
 });
 
 test("clarification after observing a list is shown without any task changes", async (t) => {
@@ -302,7 +458,7 @@ test("tool proposals stop at the fourth model request", async (t) => {
       ? proposal(call("list-" + requests, "list_tasks", "{}"))
       : proposal(call("unexecuted", "create_task", '{"title":"买牛奶"}'));
   });
-  const result = await agent.runTurn([user("列出我的待办")]);
+  const result = await agent.runTurn([user("帮我梳理一下手头要做的事")]);
   assert.equal(requests, 4);
   assert.equal(result.failure, "execution_limit");
   assert.deepEqual(result.outcomes, []);
@@ -342,7 +498,9 @@ test("large history drops whole old exchanges and keeps the current input", asyn
   const recent = user("前一个问题");
   const recentReply: ChatMessage = { role: "assistant", content: "前一个回答" };
   const latest = user("打个招呼");
-  await agent.runTurn([old, oldReply, recent, recentReply, latest]);
+  const greeting = await agent.runTurn([old, oldReply, recent, recentReply, latest]);
+  assert.equal(greeting.reply, "请告诉我你想如何管理待办。\n本轮未修改任务。");
+  assert.equal(greeting.displayedList, undefined);
   assert.equal(requests.length, 1);
   assert.deepEqual(requests[0].messages.slice(1), [recent, recentReply, latest]);
   assert.ok(Buffer.byteLength(JSON.stringify(requests[0])) <= 64 * 1024);

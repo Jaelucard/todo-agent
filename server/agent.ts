@@ -118,6 +118,37 @@ const failureText: Record<Failure, string> = {
   input_limit: "本轮内容或任务清单过长，请缩小请求范围。",
 };
 
+function isExplicitListRequest(content: string): boolean {
+  // Only whole-list commands and questions qualify. Extra words belong to the model.
+  const text = content
+    .trim()
+    .replace(/^(?:请问|麻烦|请)/u, "")
+    .replace(/[吧呢]?[。！？.!?]?$/u, "");
+  const command =
+    /^再?(?:给我|帮我)?(?:看看|看一看|列出|(?:查看|显示|展示|看|列)(?:一下|下)?)/u.exec(text);
+  if (command) {
+    const object = text.slice(command[0].length);
+    return /^(?:我的)?(?:(?:当前|所有|全部)的?)?(?:待办(?:事项|清单|列表)?|任务(?:清单|列表)?|清单)$/u.test(
+      object,
+    );
+  }
+  return (
+    /^我?(?:现在)?都?有(?:哪些|什么)(?:任务|待办(?:事项)?)$/u.test(text) ||
+    /^我的(?:任务|待办(?:事项)?)都?有哪些$/u.test(text)
+  );
+}
+
+function answersTargetQuestion(previous: ChatMessage | undefined, text: string, tasks: Task[]) {
+  if (previous?.role !== "assistant" || !tasks.some((task) => task.title === text)) return false;
+  // finish() puts the clarification immediately before the saved/unchanged status line.
+  const question = previous.content.split("\n").at(-2);
+  return (
+    question === failureText.ambiguous_reference ||
+    question === failureText.reference_required ||
+    question === failureText.task_not_found
+  );
+}
+
 function historyPairs(messages: ChatMessage[]): ChatMessage[][] {
   const pairs: ChatMessage[][] = [];
   for (let i = messages.length - 2; i > 0 && pairs.length < maxHistoryPairs; i--) {
@@ -152,14 +183,10 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
     async runTurn(messages: ChatMessage[], cancellation?: AbortSignal) {
       const deadline = AbortSignal.timeout(MODEL_TIMEOUT_MS);
       const signal = cancellation ? AbortSignal.any([deadline, cancellation]) : deadline;
-      const toolkit = createTaskTools(tasks);
       const outcomes: Mutation[] = [];
       const confirmations: string[] = [];
       let displayedList: Task[] | undefined;
-      const history = historyPairs(messages);
       const latest = messages.at(-1);
-      const transcript: ChatCompletionMessageParam[] = latest ? [latest] : [];
-      const executedCallIds = new Set<string>();
 
       function finish(failure?: Failure) {
         const lines = [...confirmations];
@@ -189,6 +216,24 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
       }
 
       if (latest?.role !== "user") return finish("invalid_arguments");
+      if (isExplicitListRequest(latest.content)) {
+        if (signal.aborted) return finish("deadline");
+        const result = createTaskTools(tasks).execute("list_tasks", "{}");
+        if (!result.ok) return finish(result.error);
+        if (
+          result.tool === "list_tasks" &&
+          !answersTargetQuestion(messages.at(-2), latest.content.trim(), result.tasks)
+        ) {
+          displayedList = result.tasks;
+          return finish();
+        }
+      }
+
+      // The model must receive its own list before a mutation, even if we just read a task title.
+      const toolkit = createTaskTools(tasks);
+      const history = historyPairs(messages);
+      const transcript: ChatCompletionMessageParam[] = [latest];
+      const executedCallIds = new Set<string>();
       for (let round = 1; round <= maxModelRequests; round++) {
         if (signal.aborted) return finish("deadline");
         const request = () =>

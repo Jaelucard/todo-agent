@@ -50,7 +50,7 @@ npm ci
 npm run dev
 ```
 
-把 `.env.example` 复制为 `.env`，填写自己的 `DEEPSEEK_API_KEY`，再重启服务。打开 <http://127.0.0.1:3000> 后，发送聊天消息将调用 DeepSeek。详细步骤见[本地开发指南](GETTING_STARTED.md)。
+把 `.env.example` 复制为 `.env`，填写自己的 `DEEPSEEK_API_KEY`，再重启服务。打开 <http://127.0.0.1:3000> 后，在新对话中发送「看看清单」会直接读取本地任务。创建、完成和删除任务会调用 DeepSeek。详细步骤见[本地开发指南](GETTING_STARTED.md)。
 
 ## 模型费用
 
