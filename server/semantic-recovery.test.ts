@@ -79,7 +79,7 @@ test("a read-only semantic lookup recovers an unquoted deletion after the provid
           type: "function",
           function: { name: "verify_task_reference" },
         });
-        return proposal("verify_task_reference", { decision: "match" });
+        return proposal("verify_task_reference", { decision: "match", candidateIds: [alias.id] });
       default:
         assert.fail("The successful delete must not ask the provider to act again");
     }
@@ -93,6 +93,162 @@ test("a read-only semantic lookup recovers an unquoted deletion after the provid
 });
 
 const secondAlias = { ...alias, id: "other-dental-appointment", title: "改期口腔检查预约" };
+
+for (const command of ["把预约牙医删掉。", "预约牙医删掉。", "去掉预约牙医。", "清掉预约牙医。"]) {
+  test(`a model cannot hide the dental alternative with a filtered view for ${command}`, async (t) => {
+    const sibling = { ...secondAlias, title: "打电话预约牙科检查", done: true };
+    const { tasks, saved, fingerprint } = await fixture(t, [alias, unrelated, sibling]);
+    const initial = await fingerprint();
+    const replies = [
+      proposal("list_tasks", { done: false }),
+      proposal("delete_task", { candidateIds: [alias.id] }),
+      proposal("verify_task_reference", { decision: "match", candidateIds: [alias.id] }),
+    ];
+    const result = await createAgent(tasks, async () => replies.shift() ?? stop).runTurn([
+      { role: "user", content: command },
+    ]);
+
+    assert.deepEqual(await saved(), [alias, unrelated, sibling]);
+    assert.deepEqual(await fingerprint(), initial);
+    assert.deepEqual(result.outcomes, []);
+    assert.match(result.reply, /\[#1\].*联系口腔诊所约诊/u);
+    assert.match(result.reply, /\[#2\].*打电话预约牙科检查/u);
+    assert.doesNotMatch(result.reply, /已删除|申请补领门禁卡/u);
+  });
+}
+
+test("either dental alias can be omitted without letting the other alias be deleted", async (t) => {
+  const sibling = { ...secondAlias, title: "打电话预约牙科检查" };
+  const { tasks, saved, fingerprint } = await fixture(t, [alias, unrelated, sibling]);
+  const initial = await fingerprint();
+  const replies = [
+    proposal("list_tasks"),
+    proposal("delete_task", { candidateIds: [sibling.id] }),
+    proposal("verify_task_reference", { decision: "match", candidateIds: [sibling.id] }),
+  ];
+  const result = await createAgent(tasks, async () => replies.shift() ?? stop).runTurn(input);
+
+  assert.deepEqual(await saved(), [alias, unrelated, sibling]);
+  assert.deepEqual(await fingerprint(), initial);
+  assert.deepEqual(result.outcomes, []);
+  assert.match(result.reply, /\[#1\].*联系口腔诊所约诊/u);
+  assert.match(result.reply, /\[#2\].*打电话预约牙科检查/u);
+});
+
+for (const [wanted, stored] of [
+  ["预约牙医", "预约医院体检"],
+  ["预约牙医", "医院体检"],
+  ["预约牙医", "挂号医院体检"],
+  ["预约牙医", "预付物业费"],
+  ["预约牙医", "联系宠物诊所约诊"],
+  ["预约牙医", "联系骨科诊所约诊"],
+  ["预约牙医", "准备预约牙医"],
+  ["预约税务咨询", "预约法律咨询"],
+  ["预约牙医", "取消预约牙医"],
+  ["取消预约牙医", "预约牙医"],
+  ["预约牙医", "记得取消预约牙医"],
+  ["预约牙医", "打电话取消牙医预约"],
+  ["预约牙医", "牙医预约取消"],
+  ["预约牙医", "退掉牙医预约"],
+]) {
+  test(`two model proposals cannot turn ${wanted} into deletion of ${stored}`, async (t) => {
+    const other = { ...alias, title: stored };
+    const { tasks, saved, fingerprint } = await fixture(t, [other, unrelated]);
+    const initial = await fingerprint();
+    const replies = [
+      proposal("list_tasks"),
+      proposal("delete_task", { candidateIds: [other.id] }),
+      proposal("verify_task_reference", { decision: "match", candidateIds: [other.id] }),
+    ];
+    const result = await createAgent(tasks, async () => replies.shift() ?? stop).runTurn([
+      { role: "user", content: `删掉${wanted}。` },
+    ]);
+
+    assert.deepEqual(await saved(), [other, unrelated]);
+    assert.deepEqual(await fingerprint(), initial);
+    assert.deepEqual(result.outcomes, []);
+    assert.doesNotMatch(result.reply, /已删除/u);
+  });
+}
+
+for (const title of ["洗牙", "补牙复诊"]) {
+  test(`a hidden ${title} task must also be considered before semantic deletion`, async (t) => {
+    const other = { ...secondAlias, title, done: true };
+    const { tasks, saved, fingerprint } = await fixture(t, [alias, unrelated, other]);
+    const initial = await fingerprint();
+    const replies = [
+      proposal("list_tasks", { done: false }),
+      proposal("delete_task", { candidateIds: [alias.id] }),
+      proposal("verify_task_reference", { decision: "match", candidateIds: [alias.id] }),
+    ];
+    const result = await createAgent(tasks, async () => replies.shift() ?? stop).runTurn(input);
+    assert.deepEqual(await saved(), [alias, unrelated, other]);
+    assert.deepEqual(await fingerprint(), initial);
+    assert.deepEqual(result.outcomes, []);
+    assert.match(result.reply, /\[#1\].*联系口腔诊所约诊/u);
+    assert.ok(result.reply.includes(`[#2] ${title}`));
+  });
+}
+
+test("a matcher that omits a plausible alias cannot turn ambiguity into a deletion", async (t) => {
+  const otherAlias = { ...secondAlias, title: "预约牙科医师复诊" };
+  const { tasks, saved, fingerprint } = await fixture(t, [alias, unrelated, otherAlias]);
+  const initial = await fingerprint();
+  const replies = [
+    proposal("list_tasks"),
+    stop,
+    proposal("resolve_task_reference", { candidateIds: [alias.id] }),
+  ];
+  const agent = createAgent(tasks, async (request) => {
+    const next = replies.shift();
+    if (next) return next;
+    const payload = JSON.parse(String(request.messages.at(-1)?.content));
+    if (payload.tasks.some(({ id }: { id: string }) => id === otherAlias.id)) {
+      return proposal("verify_task_reference", {
+        decision: "match",
+        candidateIds: [alias.id, otherAlias.id],
+      });
+    }
+    return proposal("verify_task_reference", { decision: "match" });
+  });
+
+  const result = await agent.runTurn(input);
+
+  assert.deepEqual(await fingerprint(), initial);
+  assert.deepEqual(result.outcomes, []);
+  assert.match(result.reply, /\[#1\].*联系口腔诊所约诊/u);
+  assert.match(result.reply, /\[#2\].*预约牙科医师复诊/u);
+  assert.doesNotMatch(result.reply, /申请补领门禁卡|已删除/u);
+
+  const followUp = await agent.runTurn([
+    ...input,
+    { role: "assistant", content: result.reply },
+    { role: "user", content: "#2" },
+  ]);
+  assert.deepEqual(followUp.outcomes, [{ operation: "delete_task", task: otherAlias }]);
+  assert.deepEqual(await saved(), [alias, unrelated]);
+});
+
+for (const content of [input[0].content, "删掉预约牙医。"]) {
+  test(`a direct delete proposal cannot bypass semantic ambiguity checks for ${content}`, async (t) => {
+    const hiddenAlias = { ...secondAlias, done: true };
+    const { tasks, fingerprint } = await fixture(t, [alias, unrelated, hiddenAlias]);
+    const initial = await fingerprint();
+    const replies = [
+      proposal("list_tasks", { done: false }),
+      proposal("delete_task", { candidateIds: [alias.id] }),
+    ];
+    const result = await createAgent(tasks, async () => replies.shift() ?? stop).runTurn([
+      { role: "user", content },
+    ]);
+
+    assert.deepEqual(await fingerprint(), initial);
+    assert.deepEqual(result.outcomes, []);
+    assert.match(result.reply, /\[#1\].*联系口腔诊所约诊/u);
+    assert.match(result.reply, /\[#2\].*改期口腔检查预约/u);
+    assert.doesNotMatch(result.reply, /申请补领门禁卡|已删除/u);
+  });
+}
 
 for (const selected of [
   {
@@ -141,7 +297,10 @@ test("verification confirms ambiguity without deleting either plausible task", a
     proposal("list_tasks"),
     stop,
     proposal("resolve_task_reference", { candidateIds: [alias.id, secondAlias.id] }),
-    proposal("verify_task_reference", { decision: "match" }),
+    proposal("verify_task_reference", {
+      decision: "match",
+      candidateIds: [alias.id, secondAlias.id],
+    }),
   ];
   const result = await createAgent(tasks, async () => replies.shift() ?? stop).runTurn(input);
 
@@ -293,6 +452,107 @@ test("recovery cannot turn a mixed candidate set into a single authorized deleti
 
 const differentAppointment = { id: "physical", title: "预约体检", done: false };
 
+test("agreement on a shared action cannot authorize different objects", async (t) => {
+  const { tasks, fingerprint } = await fixture(t, [differentAppointment, unrelated]);
+  const initial = await fingerprint();
+  const replies = [
+    proposal("list_tasks"),
+    proposal("delete_task", { candidateIds: [differentAppointment.id] }),
+    proposal("verify_task_reference", {
+      decision: "match",
+      candidateIds: [differentAppointment.id],
+    }),
+  ];
+  const result = await createAgent(tasks, async () => replies.shift() ?? stop).runTurn(input);
+
+  assert.deepEqual(await fingerprint(), initial);
+  assert.deepEqual(result.outcomes, []);
+  assert.doesNotMatch(result.reply, /已删除/u);
+});
+
+test("direct alias selection can delete a verified unique match without touching a different appointment", async (t) => {
+  const { tasks, saved } = await fixture(t, [alias, differentAppointment, unrelated]);
+  const replies = [
+    proposal("list_tasks"),
+    proposal("delete_task", { candidateIds: [alias.id] }),
+    proposal("verify_task_reference", { decision: "match", candidateIds: [alias.id] }),
+  ];
+  const result = await createAgent(tasks, async () => replies.shift() ?? stop).runTurn(input);
+
+  assert.deepEqual(await saved(), [differentAppointment, unrelated]);
+  assert.deepEqual(result.outcomes, [{ operation: "delete_task", task: alias }]);
+  assert.match(result.reply, /已删除「联系口腔诊所约诊」/u);
+});
+
+test("a mixed request preserves the protected task and can delete a verified alias", async (t) => {
+  const { tasks, saved } = await fixture(t, [alias, unrelated]);
+  const replies = [
+    proposal("list_tasks"),
+    proposal("delete_task", { candidateIds: [alias.id] }),
+    proposal("verify_task_reference", { decision: "match", candidateIds: [alias.id] }),
+  ];
+  const result = await createAgent(tasks, async () => replies.shift() ?? stop).runTurn([
+    { role: "user", content: "保留申请补领门禁卡，把预约牙医删掉。" },
+  ]);
+  assert.deepEqual(await saved(), [unrelated]);
+  assert.deepEqual(result.outcomes, [{ operation: "delete_task", task: alias }]);
+  assert.match(result.reply, /已删除「联系口腔诊所约诊」/u);
+});
+
+test("an ungrounded model-resolved alias requires the user's exact task name before deletion", async (t) => {
+  const weakAlias = { id: "team-dinner", title: "联系餐厅排定包间", done: false };
+  const weakInput: ChatMessage[] = [{ role: "user", content: "把安排团建删掉。" }];
+  const { tasks, saved, fingerprint } = await fixture(t, [weakAlias, unrelated]);
+  const initial = await fingerprint();
+  const replies = [
+    proposal("list_tasks"),
+    proposal("delete_task", { candidateIds: [weakAlias.id] }),
+    proposal("verify_task_reference", { decision: "match", candidateIds: [weakAlias.id] }),
+    proposal("list_tasks"),
+    proposal("delete_task", { candidateIds: [weakAlias.id] }),
+  ];
+  const agent = createAgent(tasks, async () => replies.shift() ?? stop);
+  const pending = await agent.runTurn(weakInput);
+  assert.deepEqual(await saved(), [weakAlias, unrelated]);
+  assert.deepEqual(await fingerprint(), initial);
+  assert.deepEqual(pending.outcomes, []);
+  assert.match(pending.reply, /联系餐厅排定包间/u);
+  assert.match(pending.reply, /请用完整任务名称确认/u);
+  assert.doesNotMatch(pending.reply, /已删除/u);
+
+  const confirmed = await agent.runTurn([
+    ...weakInput,
+    { role: "assistant", content: pending.reply },
+    { role: "user", content: "把「联系餐厅排定包间」删掉。" },
+  ]);
+  assert.deepEqual(await saved(), [unrelated]);
+  assert.deepEqual(confirmed.outcomes, [{ operation: "delete_task", task: weakAlias }]);
+  assert.match(confirmed.reply, /已删除「联系餐厅排定包间」/u);
+});
+
+test("a clarification stop can identify an exact object without deleting it", async (t) => {
+  const report = { ...alias, title: "提交年度报告" };
+  const { tasks, saved, fingerprint } = await fixture(t, [report, unrelated]);
+  const initial = await fingerprint();
+  const clarification = {
+    finish_reason: "stop",
+    message: { role: "assistant", content: "需要澄清！请确认任务。" },
+  };
+  const replies = [
+    clarification,
+    proposal("resolve_task_reference", { candidateIds: [report.id] }),
+    proposal("verify_task_reference", { decision: "match", candidateIds: [report.id] }),
+  ];
+  const result = await createAgent(tasks, async () => replies.shift() ?? stop).runTurn([
+    { role: "user", content: "把年度报告删掉。" },
+  ]);
+  assert.deepEqual(await saved(), [report, unrelated]);
+  assert.deepEqual(await fingerprint(), initial);
+  assert.deepEqual(result.outcomes, []);
+  assert.match(result.reply, /提交年度报告[\s\S]*请用完整任务名称确认/u);
+  assert.doesNotMatch(result.reply, /已删除/u);
+});
+
 for (const decision of ["no_match", "uncertain"] as const) {
   test(`semantic recovery cannot delete a different appointment when verification returns ${decision}`, async (t) => {
     const { tasks, fingerprint } = await fixture(t, [differentAppointment, unrelated]);
@@ -301,7 +561,7 @@ for (const decision of ["no_match", "uncertain"] as const) {
       proposal("list_tasks"),
       stop,
       proposal("resolve_task_reference", { candidateIds: [differentAppointment.id] }),
-      proposal("verify_task_reference", { decision }),
+      proposal("verify_task_reference", { decision, candidateIds: [] }),
     ];
     const agent = createAgent(tasks, async () => replies.shift() ?? stop);
     const result = await agent.runTurn(input);

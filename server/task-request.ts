@@ -411,7 +411,10 @@ export function singleMetadataRequest(content: string): SingleMetadataRequest | 
 
 export interface ClauseAnalysis {
   mutationsAllowed: boolean;
+  hasProhibition: boolean;
   forbiddenTitles: Set<string>;
+  clauseCount: number;
+  positiveClauses: string[];
   positiveQuotedTitles: string[];
   hasUnquotedPositiveActionClause: boolean;
   allowedPriorities: Set<Priority>;
@@ -424,6 +427,10 @@ export interface ClauseAnalysis {
   allowReopen: boolean;
   allowRename: boolean;
   isPureCreate: boolean;
+  isPureComplete: boolean;
+  isPureDelete: boolean;
+  isPureReopen: boolean;
+  isPureRename: boolean;
   hasCompleteVerb: boolean;
   hasDeleteVerb: boolean;
   hasPositiveCreateCommand: boolean;
@@ -438,13 +445,51 @@ const tentativeIntentPattern = /^(?:我)?(?:本来|原本|刚才|刚刚)想/u;
 const retractionCuePattern =
   /(?:算了|(?:不用|不要|(?<!分|特|级|类|区|告|差|识|判|个|性)别(?!人|的|处|扭)|不必)(?:记|加|新增|创建|添加|删|改|做|办|完成|动|管)了?)/u;
 
+const deletionVerb = "(?:删掉|删除|删|移除|清掉|去掉|清除)";
+const deletionWithoutObject = new RegExp(`^${deletionVerb}(?:了|吧)?$`, "u");
+const deletionWithObjectFirst = new RegExp(
+  String.raw`^(?:把|将)\s*(.+?)\s*${deletionVerb}(?:了|吧)?$`,
+  "u",
+);
+const deletionWithVerbFirst = new RegExp(String.raw`^${deletionVerb}\s*(.+)$`, "u");
+
+function unquotedProhibitedDeletionTargets(clause: string): string[] {
+  const negation = clauseNegationPattern.exec(clause);
+  if (!negation) return [];
+  const before = clause.slice(0, negation.index).trim();
+  const after = clause
+    .slice(negation.index + negation[0].length)
+    .trimStart()
+    .replace(/^(?:先|再)\s*/u, "");
+  const objectBeforeNegation = deletionWithoutObject.test(after);
+  const target = objectBeforeNegation
+    ? before
+    : (deletionWithObjectFirst.exec(after)?.[1] ?? deletionWithVerbFirst.exec(after)?.[1]);
+  if (!target) return [];
+
+  const undecorated = (
+    objectBeforeNegation
+      ? target.replace(/^(?:但是|不过|并且|而且|另外|但)\s*/u, "").replace(/先$/u, "")
+      : target.replace(/吧$/u, "")
+  ).replace(/(?:这|那)(?:一)?[条项个](?:任务|待办(?:事项)?)?$/u, "");
+  return [...new Set([target, undecorated])].flatMap((title) => {
+    const parsed = taskTitleSchema.safeParse(title);
+    return parsed.success ? [parsed.data] : [];
+  });
+}
+
 export function analyzeClauses(input: string): ClauseAnalysis {
   const trimmed = input.trim();
   const maskedWhole = maskQuotedTitles(trimmed);
   const clauses = splitClausesOutsideQuotes(trimmed);
 
   const forbiddenTitles = new Set<string>();
-  const positiveEntries: Array<{ masked: string; quoted: string[]; tentative: boolean }> = [];
+  const positiveEntries: Array<{
+    text: string;
+    masked: string;
+    quoted: string[];
+    tentative: boolean;
+  }> = [];
   let previousWasProhibition = false;
   let sawAnyProhibition = false;
 
@@ -472,7 +517,10 @@ export function analyzeClauses(input: string): ClauseAnalysis {
     if (isProhibition) {
       sawAnyProhibition = true;
       previousWasProhibition = true;
-      for (const title of clauseQuoted) {
+      const prohibitedTitles = clauseQuoted.length
+        ? clauseQuoted
+        : unquotedProhibitedDeletionTargets(clause);
+      for (const title of prohibitedTitles) {
         forbiddenTitles.add(title);
       }
       if (isWholeRetraction) {
@@ -497,6 +545,7 @@ export function analyzeClauses(input: string): ClauseAnalysis {
 
     previousWasProhibition = false;
     positiveEntries.push({
+      text: clause,
       masked: maskedClause,
       quoted: clauseQuoted,
       tentative: tentativeIntentPattern.test(maskedClause),
@@ -682,7 +731,8 @@ export function analyzeClauses(input: string): ClauseAnalysis {
     !isPureComplete &&
     !isPureDelete &&
     !isPureReopen &&
-    !isPureRename;
+    !isPureRename &&
+    (hasCreateVerb || (!hasCompleteVerb && !hasDeleteVerb && !allowReopen && !allowRename));
   const allowComplete =
     mutationsAllowed &&
     !isPureMetadataRequest &&
@@ -705,7 +755,10 @@ export function analyzeClauses(input: string): ClauseAnalysis {
 
   return {
     mutationsAllowed,
+    hasProhibition: sawAnyProhibition,
     forbiddenTitles,
+    clauseCount: clauses.length,
+    positiveClauses: positiveEntries.map(({ text }) => text),
     positiveQuotedTitles,
     hasUnquotedPositiveActionClause,
     allowedPriorities,
@@ -718,6 +771,10 @@ export function analyzeClauses(input: string): ClauseAnalysis {
     allowReopen: mutationsAllowed && allowReopen,
     allowRename: mutationsAllowed && allowRename,
     isPureCreate: mutationsAllowed && isPureCreate,
+    isPureComplete: mutationsAllowed && isPureComplete,
+    isPureDelete: mutationsAllowed && isPureDelete,
+    isPureReopen: mutationsAllowed && isPureReopen,
+    isPureRename: mutationsAllowed && isPureRename,
     hasCompleteVerb: mutationsAllowed && hasCompleteVerb,
     hasDeleteVerb: mutationsAllowed && hasDeleteVerb,
     hasPositiveCreateCommand,

@@ -46,6 +46,22 @@ function scripted(...choices: unknown[]): ModelProvider {
   return async () => choices[next++] ?? stop;
 }
 
+test("unsupported bulk deletion explains the limit and writes nothing", async (t) => {
+  const tasksBefore = [
+    { id: "report", title: "交报告", done: false },
+    { id: "parcel", title: "取快递", done: true },
+  ];
+  const { tasks, saved, fingerprint } = await fixture(t, tasksBefore);
+  const before = await fingerprint();
+  const result = await createAgent(tasks, scripted(proposal("list", "list_tasks"), stop)).runTurn([
+    user("把所有任务全删了吧"),
+  ]);
+  assert.deepEqual(await saved(), tasksBefore);
+  assert.deepEqual(await fingerprint(), before);
+  assert.deepEqual(result.outcomes, []);
+  assert.match(result.reply, /不支持批量删除/u);
+});
+
 test("a known verb-object completion survives an ordinary model stop without rewriting metadata", async (t) => {
   const report = {
     id: "historical-report",
@@ -74,6 +90,68 @@ test("a known verb-object completion survives an ordinary model stop without rew
   assert.deepEqual(await fingerprint(), before);
   assert.deepEqual(repeated.outcomes, []);
   assert.match(repeated.reply, /「交报告」已经完成/u);
+});
+
+test("a compact completion survives an ordinary stop after an authoritative list", async (t) => {
+  const report = {
+    id: "report",
+    title: "交报告",
+    done: false,
+    priority: "high",
+    workload: "small",
+  };
+  const parcel = { id: "parcel", title: "取快递", done: false };
+  const { tasks, saved, fingerprint } = await fixture(t, [report, parcel]);
+  const agent = createAgent(tasks, scripted(proposal("list", "list_tasks"), stop));
+  const history = [
+    user("把「交报告」的工作量改成小。"),
+    assistant("已更新「交报告」。\n优先级：高 · 工作量：小"),
+    user("报告交好了。"),
+  ];
+  const completed = { ...report, done: true };
+  const result = await agent.runTurn(history);
+  assert.deepEqual(await saved(), [completed, parcel]);
+  assert.deepEqual(result.outcomes, [{ operation: "complete_task", task: completed }]);
+  assert.equal(result.reply, "已完成「交报告」。");
+
+  const before = await fingerprint();
+  const repeated = await createAgent(tasks, scripted(proposal("list", "list_tasks"), stop)).runTurn(
+    history,
+  );
+  assert.deepEqual(await fingerprint(), before);
+  assert.deepEqual(repeated.outcomes, []);
+  assert.match(repeated.reply, /「交报告」已经完成/u);
+});
+
+test("a stop after a filtered list does not recover compact completion", async (t) => {
+  const report = { id: "report", title: "交报告", done: false };
+  const { tasks, saved, fingerprint } = await fixture(t, [report]);
+  const before = await fingerprint();
+  const result = await createAgent(
+    tasks,
+    scripted(proposal("list", "list_tasks", { done: true }), stop),
+  ).runTurn([user("报告交好了。")]);
+
+  assert.deepEqual(await saved(), [report]);
+  assert.deepEqual(await fingerprint(), before);
+  assert.deepEqual(result.outcomes, []);
+  assert.doesNotMatch(result.reply, /已完成「/u);
+});
+
+test("a stop after an authoritative list cannot complete against a stale view", async (t) => {
+  const report = { id: "report", title: "交报告", done: false, workload: "small" };
+  const edited = { ...report, workload: "medium" };
+  const { tasks, saved } = await fixture(t, [report]);
+  const result = await createAgent(tasks, async ({ messages }) => {
+    if (messages.at(-1)?.role !== "tool") return proposal("list", "list_tasks");
+    tasks.update(report.id, { workload: "medium" });
+    return stop;
+  }).runTurn([user("报告交好了。")]);
+
+  assert.deepEqual(await saved(), [edited]);
+  assert.deepEqual(result.outcomes, []);
+  assert.equal(result.failure, "stale_view");
+  assert.doesNotMatch(result.reply, /已完成「/u);
 });
 
 for (const alternate of ["交季度报告", "提交报告"]) {
@@ -133,15 +211,21 @@ test("an explicit model clarification stop does not trigger compact completion r
   const report = { id: "report", title: "交报告", done: false };
   const { tasks, saved, fingerprint } = await fixture(t, [report]);
   const before = await fingerprint();
-  const result = await createAgent(
-    tasks,
-    scripted({ finish_reason: "stop", message: { role: "assistant", content: "需要澄清" } }),
-  ).runTurn([user("报告交好了。")]);
-
-  assert.deepEqual(await saved(), [report]);
-  assert.deepEqual(await fingerprint(), before);
-  assert.deepEqual(result.outcomes, []);
-  assert.equal(result.failure, "ambiguous_reference");
+  for (const content of [
+    "需要澄清",
+    "需要澄清。",
+    "需要澄清：你指哪一条？",
+    "需要澄清，请指定任务。",
+  ]) {
+    const clarification = { finish_reason: "stop", message: { role: "assistant", content } };
+    for (const choices of [[clarification], [proposal("list", "list_tasks"), clarification]]) {
+      const result = await createAgent(tasks, scripted(...choices)).runTurn([user("报告交好了。")]);
+      assert.deepEqual(await saved(), [report]);
+      assert.deepEqual(await fingerprint(), before);
+      assert.deepEqual(result.outcomes, []);
+      assert.equal(result.failure, "ambiguous_reference");
+    }
+  }
 });
 
 test("plain follow-up create persists once even when the provider would stop without an automatic tool", async (t) => {

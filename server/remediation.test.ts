@@ -1055,6 +1055,48 @@ test("BLOCKER-3A: object-first, subject-led, conjunction-led, and negated-create
   assert.equal(await readFile(filename, "utf8"), afterComplete);
 });
 
+test("a mixed deletion cannot target an unquoted task the user asked to keep", async (t) => {
+  const { tasks, filename } = await setup(t);
+  const accessCard = tasks.create("申请补领门禁卡", { priority: "high" });
+  const dentist = tasks.create("预约牙医", { workload: "small" });
+  const initial = await readFile(filename, "utf8");
+  for (const prohibition of [
+    "不要删申请补领门禁卡",
+    "请不要把申请补领门禁卡删掉",
+    "申请补领门禁卡先别删除",
+    "但申请补领门禁卡这条别移除",
+    "不要动申请补领门禁卡",
+    "保留申请补领门禁卡",
+    "不要删门禁卡",
+    "好的",
+  ]) {
+    const result = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("list", "list_tasks")),
+        proposal(call("delete", "delete_task", { candidateIds: [accessCard.id] })),
+        final("已删除。"),
+      ).provider,
+    ).runTurn([user(`${prohibition}，把预约牙医删掉。`)]);
+
+    assert.deepEqual(result.outcomes, [], prohibition);
+    assert.equal(await readFile(filename, "utf8"), initial, prohibition);
+    assert.doesNotMatch(result.reply, /已删除/u);
+  }
+
+  const allowed = await createAgent(
+    tasks,
+    scripted(
+      proposal(call("list", "list_tasks")),
+      proposal(call("delete", "delete_task", { candidateIds: [dentist.id] })),
+      final("已删除。"),
+    ).provider,
+  ).runTurn([user("不要删申请补领门禁卡，把预约牙医删掉。")]);
+  assert.deepEqual(tasks.list(), [accessCard]);
+  assert.match(allowed.reply, /已删除「预约牙医」/u);
+  assert.doesNotMatch(allowed.reply, /已删除「申请补领门禁卡」/u);
+});
+
 test("BLOCKER-3B: post-command retractions, metadata-bearing isPureCreate, negated disambiguation, and positive controls", async (t) => {
   const { tasks, filename } = await setup(t);
   const utility = tasks.create("交水电费");
@@ -1479,5 +1521,115 @@ test("REPAIR-4 (L4-T4): bare #1/#2 disambiguation executes deterministically wit
       assert.deepEqual(turn.outcomes, [], payload);
       assert.equal(await readFile(filename, "utf8"), before, payload);
     }
+  }
+});
+
+test("LIVE-SWEEP-1 regressions: compound create guard, bound delete force, plain create force, batch clause ordering, negated lookup reply", async (t) => {
+  // 1. Compound complete+delete without create verb forces list_tasks on round 1 and rejects unrequested create_task on round 2
+  {
+    const { tasks, filename } = await setup(t);
+    tasks.create("预约体检");
+    tasks.create("写周报");
+    tasks.create("交水电费");
+    const before = await readFile(filename, "utf8");
+    const mock = scripted(
+      proposal(call("l1", "list_tasks", {})),
+      proposal(call("c-bad", "create_task", { title: "体检预约" })),
+    );
+    const turn = await createAgent(tasks, mock.provider).runTurn([
+      user("体检预约好了，另外把写周报删掉"),
+    ]);
+    assert.deepEqual(mock.requests[0]?.tool_choice, {
+      type: "function",
+      function: { name: "list_tasks" },
+    });
+    assert.equal(turn.failure, "reference_required");
+    assert.deepEqual(turn.outcomes, []);
+    assert.equal(await readFile(filename, "utf8"), before);
+  }
+
+  // 2. Bound single-task delete ("把它删掉") forces delete_task on round 1
+  {
+    const { tasks } = await setup(t);
+    tasks.create("交水电费");
+    const t1 = await createAgent(
+      tasks,
+      scripted(proposal(call("c1", "create_task", { title: "交房租" })), final("已添加。"))
+        .provider,
+    ).runTurn([user("帮我记一下交房租")]);
+    const delMock = scripted(
+      proposal(call("d1", "delete_task", { useBoundReference: true })),
+      final("已删除。"),
+    );
+    const t2 = await createAgent(tasks, delMock.provider).runTurn([
+      user("帮我记一下交房租"),
+      { role: "assistant", content: t1.reply },
+      user("把它删掉"),
+    ]);
+    assert.deepEqual(delMock.requests[0]?.tool_choice, {
+      type: "function",
+      function: { name: "delete_task" },
+    });
+    assert.equal(t2.failure, undefined);
+    assert.equal(t2.reply, "已删除「交房租」。");
+  }
+
+  // 3. Explicit plain create ("帮我记一下取快递。") forces create_task on round 1
+  {
+    const { tasks } = await setup(t);
+    const mock = scripted(
+      proposal(call("c1", "create_task", { title: "取快递" })),
+      final("已添加。"),
+    );
+    const turn = await createAgent(tasks, mock.provider).runTurn([user("帮我记一下取快递。")]);
+    assert.deepEqual(mock.requests[0]?.tool_choice, {
+      type: "function",
+      function: { name: "create_task" },
+    });
+    assert.equal(turn.failure, undefined);
+    assert.equal(turn.reply, "已添加待办「取快递」。");
+  }
+
+  // 4. Out-of-order multi-write batch executes and confirms in user's stated clause order
+  {
+    const { tasks } = await setup(t);
+    const milk = tasks.create("买牛奶");
+    const parcel = tasks.create("取快递");
+    const utilities = tasks.create("交水电费");
+    const mock = scripted(
+      proposal(call("l1", "list_tasks", {})),
+      proposal(
+        call("d1", "delete_task", { candidateIds: [parcel.id] }),
+        call("a1", "create_task", { title: "预约牙医" }),
+        call("c1", "complete_task", { candidateIds: [milk.id] }),
+      ),
+      final("都办好了。"),
+    );
+    const turn = await createAgent(tasks, mock.provider).runTurn([
+      user("牛奶已经买好了，把取快递那条删掉，另外再帮我记一条「预约牙医」。"),
+    ]);
+    assert.equal(turn.failure, undefined);
+    assert.deepEqual(
+      turn.outcomes.map((o) => o.operation),
+      ["complete_task", "delete_task", "create_task"],
+    );
+    assert.equal(turn.reply, "已完成「买牛奶」。\n已删除「取快递」。\n已添加待办「预约牙医」。");
+    assert.equal(tasks.list().find((item) => item.id === utilities.id)?.done, false);
+  }
+
+  // 5. Pure negated turn after list_tasks confirms "本轮未修改任务。" with 0 writes
+  {
+    const { tasks, filename } = await setup(t);
+    tasks.create("买牛奶");
+    tasks.create("取快递");
+    const before = await readFile(filename, "utf8");
+    const turn = await createAgent(
+      tasks,
+      scripted(proposal(call("l1", "list_tasks", {})), final("没做任何改动。")).provider,
+    ).runTurn([user("不要把「买牛奶」标为完成。")]);
+    assert.equal(turn.failure, undefined);
+    assert.deepEqual(turn.outcomes, []);
+    assert.equal(turn.reply, "本轮未修改任务。");
+    assert.equal(await readFile(filename, "utf8"), before);
   }
 });
