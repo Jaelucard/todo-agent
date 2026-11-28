@@ -459,13 +459,15 @@ const courtesyFillerClausePattern =
   /^(?:(?:非常)?感谢(?:[你您])?|多谢(?:[你您])?(?:了|啦)?|谢谢(?:[你您])?(?:啦|啊|了)?|辛苦(?:[你您])?(?:了|啦)?|麻烦(?:[你您])?了?|好的?|行(?:吧)?|知道了?|明白了?|收到|拜托(?:[你您])?(?:了)?|没事(?:了)?|不用谢|嗯+|哦+|噢+)[。！!~～]*$/u;
 const tentativeIntentPattern = /^(?:我)?(?:本来|原本|刚才|刚刚)想/u;
 
-export function isPureListRequest(content: string): boolean {
-  const trimmed = content.trim();
+const bareListTitleCandidatePattern = /^(?:查看|显示|展示|看看|列出)(?:清单|列表|待办|任务)$/u;
+
+function isPureListClause(clause: string): boolean {
+  const trimmed = clause.trim();
   const masked = maskQuotedTitles(trimmed);
   if (
     clauseNegationPattern.test(masked) ||
     isUnsupportedDueDateQuery(trimmed) ||
-    /(?:把|将|删掉|删除|移除|清掉|去掉|清除|删了|新增|新建|创建|添加|加入|加上|记(?:一下|[一二两三四五六1-6]?[条项个]|下)|备忘|提醒我|改回|重新打开|恢复|退回|改名|重命名|更名|标(?:记)?(?:为|成)|设(?:置)?(?:为|成)|调(?:整)?(?:为|成|到)|(?:做好|买好|办好|交好|搞定)了)/u.test(
+    /(?:把|将|删掉|删除|移除|清掉|去掉|清除|删了|(?<![\p{Script=Han}])删(?![除掉了一节减改])|新增|新建|创建|添加|加入|加上|加(?:同名的?)?[一二两三四五六1-6]?[条项个]|记(?:一下|[一二两三四五六1-6]?[条项个]|下)|备忘|提醒我|改回|重新打开|恢复|退回|改名|重命名|更名|标(?:记)?(?:为|成)|设(?:置)?(?:为|成)|调(?:整)?(?:为|成|到)|(?<!已|已经|未|待|没|没有|还没|尚未|不)完成(?:了)?|(?:做好|买好|办好|交好|搞定)了)/u.test(
       masked,
     )
   ) {
@@ -483,11 +485,35 @@ export function isPureListRequest(content: string): boolean {
   return /(?:任务|待办|事项|清单|列表|事)/u.test(rest);
 }
 
+export function isPureListRequest(content: string): boolean {
+  const clauses = splitClausesOutsideQuotes(content.trim());
+  if (!clauses.length) return false;
+  const nonProhibition = clauses.filter((clause) => {
+    const masked = maskQuotedTitles(clause);
+    return !(
+      clauseNegationPattern.test(masked) ||
+      retractionClausePattern.test(masked) ||
+      keepNoOpClausePattern.test(masked) ||
+      courtesyFillerClausePattern.test(masked) ||
+      wholeTurnRetractionClausePattern.test(masked)
+    );
+  });
+  return (
+    nonProhibition.length > 0 &&
+    nonProhibition.every(
+      (clause) => isPureListClause(clause) && !bareListTitleCandidatePattern.test(clause.trim()),
+    )
+  );
+}
+
 export function expectedScopedListFilter(
   content: string,
 ): { done?: boolean; priority?: Priority; workload?: Workload } | undefined {
-  if (!isPureListRequest(content)) return undefined;
-  const masked = maskQuotedTitles(content.trim());
+  const trimmed = content.trim();
+  if (splitClausesOutsideQuotes(trimmed).length !== 1 || !isPureListClause(trimmed)) {
+    return undefined;
+  }
+  const masked = maskQuotedTitles(trimmed);
   const text = masked
     .replace(/^(?:请问|麻烦(?:[你您])?|请(?:[你您])?)\s*/u, "")
     .replace(/[吧呢]?[。！？.!?]?$/u, "");
@@ -646,12 +672,12 @@ export function analyzeClauses(input: string): ClauseAnalysis {
 
   const positiveText = positiveMaskedClauses.join("，");
   const hasAnyPositiveClause = positiveMaskedClauses.length > 0;
-  const isBareListTitleCandidate = /^(?:查看|显示|展示|看看|列出)(?:清单|列表|待办|任务)$/u.test(
-    trimmed,
-  );
   const isPureList =
     expectedScopedListFilter(trimmed) !== undefined ||
-    (isPureListRequest(trimmed) && !isBareListTitleCandidate);
+    (positiveEntries.length > 0 &&
+      positiveEntries.every(
+        ({ text }) => isPureListClause(text) && !bareListTitleCandidatePattern.test(text.trim()),
+      ));
   const mutationsAllowed = hasAnyPositiveClause && !isQuestion && !isHypothetical && !isPureList;
 
   // Extract explicit priority and workload values from positive clauses.
@@ -723,7 +749,7 @@ export function analyzeClauses(input: string): ClauseAnalysis {
       textWithoutReopenPhrases,
     );
   const leadingCreatePrefix =
-    /^(?:(?:然后|接着|随后|另外|此外|同时|顺便|顺手|并且|而且|还有|以及|并|也|再|先)\s*)*(?:请(?:[你您])?(?:帮我)?|帮我|麻烦(?:[你您])?(?:帮我)?)?\s*(?:再)?(?:新增|新建|创建|添加|加入|加上|加(?:同名的?)?[一二两三四五六1-6]?[条项个]|记(?:一下|[一二两三四五六1-6]?[条项个]|下)|记录(?:一下|[一二两三四五六1-6]?[条项个]|下)|(?:加(?:[一二两三四五六1-6]?[条项个])?|记(?:一下|[一二两三四五六1-6]?[条项个]|下)?|添加|新增|写(?:[一二两三四五六1-6]?[条项个])?)备忘|备忘(?:一下|[一二两三四五六1-6]?[条项个]|：|:)|提醒我)/u;
+    /^(?:(?:然后|接着|随后|另外|此外|同时|顺便|顺手|并且|而且|还有|以及|并|也|再|先)\s*)*(?:(?:请(?:[你您])?\s*(?:帮我|给我)?|帮我|给我|麻烦(?:[你您])?\s*(?:帮我|给我)?)\s*)?(?:再\s*)?(?:新增|新建|创建|添加|加入|加上|加(?:同名的?)?[一二两三四五六1-6]?[条项个]|记(?:一下|[一二两三四五六1-6]?[条项个]|下)|记录(?:一下|[一二两三四五六1-6]?[条项个]|下)|(?:加(?:[一二两三四五六1-6]?[条项个])?|记(?:一下|[一二两三四五六1-6]?[条项个]|下)?|添加|新增|写(?:[一二两三四五六1-6]?[条项个])?)备忘|备忘(?:一下|[一二两三四五六1-6]?[条项个]|：|:)|提醒我)/u;
   const hasDeleteVerb = positiveMaskedClauses.some((clause) => {
     const trimmedClause = clause.trim().replace(/[。！.!]+$/u, "");
     if (leadingCreatePrefix.test(trimmedClause)) return false;

@@ -2812,3 +2812,74 @@ test("CODEX-REVIEW-7 regressions: read-only quoted list, 先把买牛奶删 targ
     assert.match(turn.reply, /当前清单：\n- 完成季度架构评审/);
   }
 });
+
+test("CODEX-REVIEW-8 regressions: negated quoted list read-only, spaced 请 先把买牛奶删 binding, 给我记一条 create-only, quoted list + explicit complete", async (t) => {
+  // 1. P1 #1: "列出任务名称包含「已经完成」的任务，不要修改任何任务" stays read-only and blocks deleting 已经完成
+  {
+    const { tasks, filename } = await setup(t);
+    const literal = tasks.create("已经完成");
+    const before = await readFile(filename, "utf8");
+    const turn = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(call("d-bad", "delete_task", { candidateIds: [literal.id] })),
+      ).provider,
+    ).runTurn([user("列出任务名称包含「已经完成」的任务，不要修改任何任务")]);
+    assert.ok(turn.failure !== undefined);
+    assert.deepEqual(turn.outcomes, []);
+    assert.equal(await readFile(filename, "utf8"), before);
+  }
+
+  // 2. P1 #2: "请 先把买牛奶删" strips whitespace after 请, binds 买牛奶, and rejects deleting 取快递
+  {
+    const { tasks, filename } = await setup(t);
+    tasks.create("买牛奶");
+    const parcel = tasks.create("取快递");
+    const before = await readFile(filename, "utf8");
+    const turn = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(call("d-wrong", "delete_task", { candidateIds: [parcel.id] })),
+      ).provider,
+    ).runTurn([user("请 先把买牛奶删")]);
+    assert.equal(turn.failure, "reference_required");
+    assert.deepEqual(turn.outcomes, []);
+    assert.equal(await readFile(filename, "utf8"), before);
+  }
+
+  // 3. P1 #3: "给我记一条：把过期文件删掉" stays create-only and rejects deleting 取快递
+  {
+    const { tasks, filename } = await setup(t);
+    const parcel = tasks.create("取快递");
+    const before = await readFile(filename, "utf8");
+    const turn = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(call("d-wrong", "delete_task", { candidateIds: [parcel.id] })),
+      ).provider,
+    ).runTurn([user("给我记一条：把过期文件删掉")]);
+    assert.equal(turn.failure, "reference_required");
+    assert.deepEqual(turn.outcomes, []);
+    assert.equal(await readFile(filename, "utf8"), before);
+  }
+
+  // 4. P2 #4: "列出任务名称包含「已经完成」的任务，然后完成买牛奶" allows completing 买牛奶 after listing
+  {
+    const { tasks } = await setup(t);
+    const milk = tasks.create("买牛奶");
+    tasks.create("已经完成");
+    const turn = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(call("c1", "complete_task", { candidateIds: [milk.id] })),
+        final("已完成买牛奶。"),
+      ).provider,
+    ).runTurn([user("列出任务名称包含「已经完成」的任务，然后完成买牛奶")]);
+    assert.equal(turn.failure, undefined);
+    assert.equal(tasks.list().find((item) => item.id === milk.id)?.done, true);
+  }
+});

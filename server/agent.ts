@@ -549,8 +549,11 @@ const actionFirstBareDelete = /^(删)(?![除掉了一节减改])([\p{Script=Han}
 function taskCommand(content: string) {
   const text = content
     .trim()
-    .replace(/^(?:请(?:[你您])?(?:帮我)?|帮我|麻烦(?:[你您])?(?:帮我)?)/u, "")
-    .replace(/^(?:再|只|先)(?=把|将|给|删除|删掉|移除|完成|标记|删)/u, "")
+    .replace(
+      /^(?:请(?:[你您])?\s*(?:帮我|给我)?|帮我|给我|麻烦(?:[你您])?\s*(?:帮我|给我)?)\s*/u,
+      "",
+    )
+    .replace(/^(?:再|只|先)\s*(?=把|将|给|删除|删掉|移除|完成|标记|删)/u, "")
     .replace(clarifiedTitle, "把$1")
     .replace(/吧?[。！？.!?]?$/u, "");
   if (
@@ -1421,7 +1424,7 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
             (command?.explicit && deleteAction.test(command.action) ? target : undefined))
           : undefined;
       const explicitDelete =
-        /^(?:(?:请(?:[你您])?(?:帮我)?|帮我|麻烦(?:[你您])?(?:帮我)?)\s*)?(?:先|再|只)?(?:把|将)/u.test(
+        /^(?:(?:请(?:[你您])?\s*(?:帮我|给我)?|帮我|给我|麻烦(?:[你您])?\s*(?:帮我|给我)?)\s*)?(?:先|再|只)?\s*(?:把|将)/u.test(
           commandInput,
         )
           ? parsedDelete
