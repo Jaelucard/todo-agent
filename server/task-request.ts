@@ -459,9 +459,7 @@ const courtesyFillerClausePattern =
   /^(?:(?:非常)?感谢(?:[你您])?|多谢(?:[你您])?(?:了|啦)?|谢谢(?:[你您])?(?:啦|啊|了)?|辛苦(?:[你您])?(?:了|啦)?|麻烦(?:[你您])?了?|好的?|行(?:吧)?|知道了?|明白了?|收到|拜托(?:[你您])?(?:了)?|没事(?:了)?|不用谢|嗯+|哦+|噢+)[。！!~～]*$/u;
 const tentativeIntentPattern = /^(?:我)?(?:本来|原本|刚才|刚刚)想/u;
 
-export function expectedScopedListFilter(
-  content: string,
-): { done?: boolean; priority?: Priority; workload?: Workload } | undefined {
+export function isPureListRequest(content: string): boolean {
   const trimmed = content.trim();
   const masked = maskQuotedTitles(trimmed);
   if (
@@ -471,8 +469,25 @@ export function expectedScopedListFilter(
       masked,
     )
   ) {
-    return undefined;
+    return false;
   }
+  const text = masked
+    .replace(/^(?:请问|麻烦(?:[你您])?|请(?:[你您])?)\s*/u, "")
+    .replace(/[吧呢]?[。！？.!?]?$/u, "");
+  const prefix =
+    /^(?:再?(?:给我|帮我)?(?:看看|看一看|列出|(?:查看|显示|展示|看|列)(?:一下|下)?)|我?(?:现在|目前|手头)?都?(?:还)?有(?:哪些|什么))/u.exec(
+      text,
+    );
+  if (!prefix) return false;
+  const rest = text.slice(prefix[0].length);
+  return /(?:任务|待办|事项|清单|列表|事)/u.test(rest);
+}
+
+export function expectedScopedListFilter(
+  content: string,
+): { done?: boolean; priority?: Priority; workload?: Workload } | undefined {
+  if (!isPureListRequest(content)) return undefined;
+  const masked = maskQuotedTitles(content.trim());
   const text = masked
     .replace(/^(?:请问|麻烦(?:[你您])?|请(?:[你您])?)\s*/u, "")
     .replace(/[吧呢]?[。！？.!?]?$/u, "");
@@ -482,7 +497,6 @@ export function expectedScopedListFilter(
     );
   if (!prefix) return undefined;
   const rest = text.slice(prefix[0].length);
-  if (!/(?:任务|待办|事项|清单|列表|事)/u.test(rest)) return undefined;
   const filter = parseListFilterFromText(rest);
   return Object.keys(filter).length > 0 ? filter : undefined;
 }
@@ -632,9 +646,13 @@ export function analyzeClauses(input: string): ClauseAnalysis {
 
   const positiveText = positiveMaskedClauses.join("，");
   const hasAnyPositiveClause = positiveMaskedClauses.length > 0;
-  const isPureScopedList = expectedScopedListFilter(trimmed) !== undefined;
-  const mutationsAllowed =
-    hasAnyPositiveClause && !isQuestion && !isHypothetical && !isPureScopedList;
+  const isBareListTitleCandidate = /^(?:查看|显示|展示|看看|列出)(?:清单|列表|待办|任务)$/u.test(
+    trimmed,
+  );
+  const isPureList =
+    expectedScopedListFilter(trimmed) !== undefined ||
+    (isPureListRequest(trimmed) && !isBareListTitleCandidate);
+  const mutationsAllowed = hasAnyPositiveClause && !isQuestion && !isHypothetical && !isPureList;
 
   // Extract explicit priority and workload values from positive clauses.
   const allowedPriorities = new Set<Priority>();
@@ -705,7 +723,7 @@ export function analyzeClauses(input: string): ClauseAnalysis {
       textWithoutReopenPhrases,
     );
   const leadingCreatePrefix =
-    /^(?:(?:然后|接着|随后|另外|此外|同时|顺便|顺手|并且|而且|还有|以及|并|也|再|先)\s*)*(?:请(?:[你您])?(?:帮我)?|帮我|麻烦(?:[你您])?(?:帮我)?)?\s*(?:再)?(?:新增|新建|创建|添加|加入|加上|加[一二两三四五六1-6]?[条项个]|记(?:一下|[一二两三四五六1-6]?[条项个]|下)|记录(?:一下|[一二两三四五六1-6]?[条项个]|下))/u;
+    /^(?:(?:然后|接着|随后|另外|此外|同时|顺便|顺手|并且|而且|还有|以及|并|也|再|先)\s*)*(?:请(?:[你您])?(?:帮我)?|帮我|麻烦(?:[你您])?(?:帮我)?)?\s*(?:再)?(?:新增|新建|创建|添加|加入|加上|加(?:同名的?)?[一二两三四五六1-6]?[条项个]|记(?:一下|[一二两三四五六1-6]?[条项个]|下)|记录(?:一下|[一二两三四五六1-6]?[条项个]|下)|(?:加(?:[一二两三四五六1-6]?[条项个])?|记(?:一下|[一二两三四五六1-6]?[条项个]|下)?|添加|新增|写(?:[一二两三四五六1-6]?[条项个])?)备忘|备忘(?:一下|[一二两三四五六1-6]?[条项个]|：|:)|提醒我)/u;
   const hasDeleteVerb = positiveMaskedClauses.some((clause) => {
     const trimmedClause = clause.trim().replace(/[。！.!]+$/u, "");
     if (leadingCreatePrefix.test(trimmedClause)) return false;

@@ -2557,22 +2557,40 @@ test("CODEX-REVIEW-6 + orig-L2b regressions: 先把/并删, create-before-delete
     assert.equal(await readFile(filename, "utf8"), before);
   }
 
-  // 1b. P1 #1: "把买牛奶删，并删取快递。" triggers hasUnparsedMultiDelete and blocks deleting even the first item
+  // 1b. P1 #1: "把买牛奶删，并删取快递。" pins clause 0 -> 买牛奶 and clause 1 -> 取快递 (blocks 交水费/swapped, allows exact order)
   {
     const { tasks, filename } = await setup(t);
     const milk = tasks.create("买牛奶");
-    tasks.create("取快递");
+    const parcel = tasks.create("取快递");
+    const water = tasks.create("交水费");
     const before = await readFile(filename, "utf8");
-    const turn = await createAgent(
+    const wrongTarget = await createAgent(
       tasks,
       scripted(
         proposal(call("l1", "list_tasks", {})),
-        proposal(call("d1", "delete_task", { candidateIds: [milk.id] })),
+        proposal(call("d1", "delete_task", { candidateIds: [water.id] })),
       ).provider,
     ).runTurn([user("把买牛奶删，并删取快递。")]);
-    assert.equal(turn.failure, "reference_required");
-    assert.deepEqual(turn.outcomes, []);
+    assert.equal(wrongTarget.failure, "reference_required");
+    assert.deepEqual(wrongTarget.outcomes, []);
     assert.equal(await readFile(filename, "utf8"), before);
+
+    const exact = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(
+          call("d1", "delete_task", { candidateIds: [milk.id] }),
+          call("d2", "delete_task", { candidateIds: [parcel.id] }),
+        ),
+        final("已删除。"),
+      ).provider,
+    ).runTurn([user("把买牛奶删，并删取快递。")]);
+    assert.equal(exact.failure, undefined);
+    assert.deepEqual(
+      tasks.list().map((item) => item.title),
+      ["交水费"],
+    );
   }
 
   // 2. P1 #2: "记一条把过期文件删掉" stays pure create and never allows deleting 交水费
@@ -2665,6 +2683,132 @@ test("CODEX-REVIEW-6 + orig-L2b regressions: 先把/并删, create-before-delete
     assert.equal(turn.failure, undefined);
     assert.equal(turn.outcomes.length, 1);
     assert.equal(turn.outcomes[0]?.task.title, "完成季度架构评审");
+    assert.match(turn.reply, /当前清单：\n- 完成季度架构评审/);
+  }
+});
+
+test("CODEX-REVIEW-7 regressions: read-only quoted list, 先把买牛奶删 target binding, 加同名的一条 create-only, 牙科门诊 vs 给牙医打电话预约, malformed trailing list recovery", async (t) => {
+  // 1. P1 #1: "列出任务名称包含「已经完成」的任务" stays strictly read-only and blocks create_task / complete_task
+  for (const badChoice of [
+    proposal(call("c-bad", "create_task", { title: "未请求任务" })),
+    proposal(call("m-bad", "complete_task", { candidateIds: ["TASK_ID"] })),
+  ]) {
+    const { tasks, filename } = await setup(t);
+    const existing = tasks.create("检查已经完成状态");
+    const before = await readFile(filename, "utf8");
+    const resolvedChoice = {
+      ...badChoice,
+      message: {
+        ...badChoice.message,
+        tool_calls: badChoice.message.tool_calls?.map((tc) => ({
+          ...tc,
+          function: {
+            ...tc.function,
+            arguments: tc.function.arguments.replace("TASK_ID", existing.id),
+          },
+        })),
+      },
+    };
+    const turn = await createAgent(
+      tasks,
+      scripted(proposal(call("l1", "list_tasks", {})), resolvedChoice).provider,
+    ).runTurn([user("列出任务名称包含「已经完成」的任务")]);
+    assert.ok(turn.failure !== undefined);
+    assert.deepEqual(turn.outcomes, []);
+    assert.equal(await readFile(filename, "utf8"), before);
+  }
+
+  // 2. P1 #2: "先把买牛奶删" binds target to 买牛奶 and rejects deleting 取快递
+  {
+    const { tasks, filename } = await setup(t);
+    tasks.create("买牛奶");
+    const parcel = tasks.create("取快递");
+    const before = await readFile(filename, "utf8");
+    const turn = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(call("d-wrong", "delete_task", { candidateIds: [parcel.id] })),
+      ).provider,
+    ).runTurn([user("先把买牛奶删")]);
+    assert.equal(turn.failure, "reference_required");
+    assert.deepEqual(turn.outcomes, []);
+    assert.equal(await readFile(filename, "utf8"), before);
+  }
+
+  // 3. P1 #3: "加同名的一条：把过期文件删掉" never authorizes deleting 取快递
+  {
+    const { tasks, filename } = await setup(t);
+    const parcel = tasks.create("取快递");
+    const before = await readFile(filename, "utf8");
+    const turn = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(call("d-wrong", "delete_task", { candidateIds: [parcel.id] })),
+      ).provider,
+    ).runTurn([user("加同名的一条：把过期文件删掉")]);
+    assert.equal(turn.failure, "reference_required");
+    assert.deepEqual(turn.outcomes, []);
+    assert.equal(await readFile(filename, "utf8"), before);
+  }
+
+  // 4. P1 #4: 牙科门诊 does NOT match book_visit, while 给牙医打电话预约 DOES match for 预约牙医
+  {
+    const { tasks, filename } = await setup(t);
+    const dept = tasks.create("牙科门诊");
+    const before = await readFile(filename, "utf8");
+    const blocked = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(call("d1", "delete_task", { candidateIds: [dept.id] })),
+        proposal(
+          call("v1", "verify_task_reference", { decision: "match", candidateIds: [dept.id] }),
+        ),
+      ).provider,
+    ).runTurn([user("把预约牙医删掉")]);
+    assert.ok(
+      blocked.failure === "reference_required" || blocked.failure === "exact_title_not_found",
+    );
+    assert.equal(await readFile(filename, "utf8"), before);
+  }
+  {
+    const { tasks } = await setup(t);
+    const booking = tasks.create("给牙医打电话预约");
+    const allowed = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(call("d1", "delete_task", { candidateIds: [booking.id] })),
+        proposal(
+          call("v1", "verify_task_reference", { decision: "match", candidateIds: [booking.id] }),
+        ),
+      ).provider,
+    ).runTurn([user("把预约牙医删掉")]);
+    assert.equal(allowed.failure, undefined);
+    assert.deepEqual(tasks.list(), []);
+  }
+
+  // 5. P2 #5: forced create + malformed trailing list_tasks({"done":"false"}) still succeeds and renders server-verified trailing list
+  {
+    const { tasks } = await setup(t);
+    const turn = await createAgent(
+      tasks,
+      scripted(
+        proposal(
+          call("c1", "create_task", {
+            title: "完成季度架构评审",
+            priority: "high",
+            workload: "large",
+          }),
+          call("l1", "list_tasks", { done: "false" }),
+        ),
+      ).provider,
+    ).runTurn([user("加一个高优先级、大工作量的任务：完成季度架构评审，再给我看看待办清单")]);
+    assert.equal(turn.failure, undefined);
+    assert.equal(turn.outcomes.length, 1);
+    assert.equal(turn.displayedList?.length, 1);
     assert.match(turn.reply, /当前清单：\n- 完成季度架构评审/);
   }
 });

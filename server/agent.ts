@@ -27,6 +27,7 @@ import {
   explicitCreationList,
   explicitMutation,
   extractTrailingListRequest,
+  isPureListRequest,
   isUnboundTarget,
   isUnsupportedDueDateQuery,
   maskQuotedTitles,
@@ -144,7 +145,15 @@ function buildTools(allowBoundReference: boolean): ChatCompletionFunctionTool[] 
         name: "create_task",
         description: "创建一项待办。多个不同任务分别调用。",
         parameters: strictObject(
-          { title: { type: "string", minLength: 1, maxLength: 200 }, ...metadataProperties },
+          {
+            title: {
+              type: "string",
+              minLength: 1,
+              maxLength: 200,
+              description: "必须完整保留用户给出的任务名称，不要删减前缀或修饰词。",
+            },
+            ...metadataProperties,
+          },
           ["title"],
         ),
       },
@@ -263,7 +272,7 @@ const cancelsTaskAction = /取消|撤销|停止|终止|放弃|退订|退掉/u;
 const preparatoryTaskCue =
   /(?:准备|计划|打算|考虑|研究|了解|确认是否|查询|查一下|查看|检查|核对|核实|营业时间|咨询)/u;
 const bookingVisitAllowlist =
-  /^(?:(?:打电话|发微信|发消息|联系|去|到|找)?(?:预约|约诊|挂号|约)(?:一下|个|一)?(?:牙医|牙科(?:诊所|医院|检查|门诊)?|口腔(?:诊所|医院|科|检查|门诊)?|看牙|体检|体格检查|健康检查)|(?:打电话|发微信|发消息|联系|去|到|找)?(?:牙医|牙科(?:诊所|医院|科)?|口腔(?:诊所|医院|科)?|体检(?:中心)?|医院体检)(?:预约|约诊|挂号|复诊|门诊)|(?:去|到)?(?:看牙医?|口腔复诊|牙科复诊))$/u;
+  /^(?:(?:打电话|发微信|发消息|联系|去|到|找)?(?:预约|约诊|挂号|约)(?:一下|个|一)?(?:牙医|牙科(?:诊所|医院|检查|门诊)?|口腔(?:诊所|医院|科|检查|门诊)?|看牙|体检|体格检查|健康检查)|(?:打电话|发微信|发消息|联系|去|到|找)?(?:牙医|牙科(?:诊所|医院|科)?|口腔(?:诊所|医院|科)?|体检(?:中心)?|医院体检)(?:预约|约诊|挂号|复诊)|给(?:牙医|牙科(?:诊所|医院|科)?|口腔(?:诊所|医院|科)?|体检中心)(?:打电话|发微信|发消息)(?:预约|约诊|挂号)|(?:去|到)?(?:看牙医?|口腔复诊|牙科复诊))$/u;
 const semanticConceptGroups: ReadonlyArray<readonly [string, readonly string[]]> = [
   ["dental_clinic", ["牙医", "牙科", "口腔", "看牙"]],
   ["dental_cleaning", ["洗牙", "洁牙"]],
@@ -525,21 +534,23 @@ function answersTargetQuestion(previous: ChatMessage | undefined, text: string, 
 }
 
 const deleteActions = "删掉|删除|移除|清掉|去掉|清除|删了";
-const deleteAction = new RegExp(`^(?:${deleteActions})$`, "u");
+const deleteAction = new RegExp(`^(?:${deleteActions}|删)$`, "u");
 const targetFirstAction = new RegExp(
   `^(?:把|将)?(.+?)(标(?:记)?(?:为|成)?(?:已)?完成|(?<!未|待|没|不)完成(?:了)?|做完了|${deleteActions})$`,
   "u",
 );
+const targetFirstBareDelete = /^(?:把|将)(.+?)(删)$/u;
 const actionFirstTarget = new RegExp(
   `^(${deleteActions}|完成|标(?:记)?(?:为|成)?(?:已)?完成)(.+)$`,
   "u",
 );
+const actionFirstBareDelete = /^(删)(?![除掉了一节减改])([\p{Script=Han}「“"].+)$/u;
 
 function taskCommand(content: string) {
   const text = content
     .trim()
-    .replace(/^(?:请(?:帮我)?|帮我|麻烦(?:帮我)?)/u, "")
-    .replace(/^(?:再|只)(?=把|将|给|删除|删掉|移除|完成|标记)/u, "")
+    .replace(/^(?:请(?:[你您])?(?:帮我)?|帮我|麻烦(?:[你您])?(?:帮我)?)/u, "")
+    .replace(/^(?:再|只|先)(?=把|将|给|删除|删掉|移除|完成|标记|删)/u, "")
     .replace(clarifiedTitle, "把$1")
     .replace(/吧?[。！？.!?]?$/u, "");
   if (
@@ -547,8 +558,8 @@ function taskCommand(content: string) {
   ) {
     return undefined;
   }
-  const targetFirst = targetFirstAction.exec(text);
-  const actionFirst = actionFirstTarget.exec(text);
+  const targetFirst = targetFirstAction.exec(text) ?? targetFirstBareDelete.exec(text);
+  const actionFirst = actionFirstTarget.exec(text) ?? actionFirstBareDelete.exec(text);
   if (targetFirst) {
     const explicit =
       /^(?:把|将)/u.test(text) ||
@@ -1409,11 +1420,12 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
           ? (deleteGrant ??
             (command?.explicit && deleteAction.test(command.action) ? target : undefined))
           : undefined;
-      const explicitDelete = /^(?:(?:请(?:帮我)?|帮我|麻烦(?:帮我)?)\s*)?(?:把|将)/u.test(
-        commandInput,
-      )
-        ? parsedDelete
-        : undefined;
+      const explicitDelete =
+        /^(?:(?:请(?:[你您])?(?:帮我)?|帮我|麻烦(?:[你您])?(?:帮我)?)\s*)?(?:先|再|只)?(?:把|将)/u.test(
+          commandInput,
+        )
+          ? parsedDelete
+          : undefined;
       if (
         parsedDelete &&
         !parsedDelete.literal &&
@@ -1447,7 +1459,7 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
                         /^(?:(?:然后|接着|随后|另外|此外|同时|顺便|顺手|并且|而且|还有|以及)\s*)+/u,
                         "",
                       )
-                      .replace(/^(?:(?:也|再|并)(?=[把将请帮麻删移清去])\s*)+/u, "")
+                      .replace(/^(?:(?:也|再|并|先)(?=[把将请帮麻删移清去])\s*)+/u, "")
                   : clause;
               const action = taskCommand(stripped);
               if (!action?.explicit || !deleteAction.test(action.action)) return [];
@@ -2192,6 +2204,11 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
         !activeBoundReference && !trailingList.wantsList
           ? expectedScopedListFilter(input)
           : undefined;
+      const readOnlyListOnlyTurn =
+        !activeBoundReference &&
+        !trailingList.wantsList &&
+        !clauseAnalysis.mutationsAllowed &&
+        (scopedListFilter !== undefined || isPureListRequest(input));
       const completedClauseRanks = new Set<number>();
 
       for (let round = 1; round <= maxModelRequests; round++) {
@@ -2260,14 +2277,14 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
             ) {
               hintTool = "list_tasks";
             }
-          } else if (scopedListFilter) {
+          } else if (readOnlyListOnlyTurn) {
             hintTool = "list_tasks";
           }
         }
         const requestToolChoice = forcedTool ?? hintTool;
         const allowTrailingListWithForcedCreate =
           forcedTool === "create_task" && trailingList.wantsList;
-        const requestTools = scopedListFilter
+        const requestTools = readOnlyListOnlyTurn
           ? activeTools.filter(
               (tool) => tool.type === "function" && tool.function.name === "list_tasks",
             )
@@ -2652,7 +2669,13 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
         // When the model emits multiple independent writes in a single batch without a strict
         // orderedOperations plan, execute them in the order their operations appear in the user's clauses.
         // Enforce user clause order for multi-clause compound turns without a strict orderedOperations plan.
-        let orderedCalls = calls;
+        let orderedCalls =
+          allowTrailingListWithForcedCreate &&
+          calls.length === 2 &&
+          calls[0].function.name === "create_task" &&
+          calls[1].function.name === "list_tasks"
+            ? [calls[0]]
+            : calls;
         const batchCallRanks = new Map<string, number>();
         if (!orderedOperations && writes.length > 0 && clauseAnalysis.positiveClauses.length >= 2) {
           const clauseIntents = clauseAnalysis.positiveClauses.map((clause) =>
@@ -2722,7 +2745,9 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
               simulatedDone.add(entry.rank);
               batchCallRanks.set(entry.call.id, entry.rank);
             }
-            const trailingLists = calls.filter((call) => call.function.name === "list_tasks");
+            const trailingLists = allowTrailingListWithForcedCreate
+              ? []
+              : calls.filter((call) => call.function.name === "list_tasks");
             orderedCalls = [...sorted.map((entry) => entry.call), ...trailingLists];
           } else if (writeMatches.every((entry) => entry.matches.length > 0)) {
             const simulatedDone = new Set(completedClauseRanks);
