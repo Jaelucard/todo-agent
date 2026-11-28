@@ -2537,3 +2537,134 @@ test("CODEX-REVIEW-5 regressions: create with 删 in title & 顺便删 multi-del
     assert.doesNotMatch(turn.reply, /取快递/);
   }
 });
+
+test("CODEX-REVIEW-6 + orig-L2b regressions: 先把/并删, create-before-delete 删掉, zero-clause-match batch, book_visit allowlist, quoted scoped list mask, trailing-list forced create", async (t) => {
+  // 1a. P1 #1: "先把买牛奶删" retains delete intent and rejects complete_task on 交水费
+  {
+    const { tasks, filename } = await setup(t);
+    tasks.create("买牛奶");
+    const water = tasks.create("交水费");
+    const before = await readFile(filename, "utf8");
+    const turn = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(call("c-bad", "complete_task", { candidateIds: [water.id] })),
+      ).provider,
+    ).runTurn([user("先把买牛奶删")]);
+    assert.equal(turn.failure, "reference_required");
+    assert.deepEqual(turn.outcomes, []);
+    assert.equal(await readFile(filename, "utf8"), before);
+  }
+
+  // 1b. P1 #1: "把买牛奶删，并删取快递。" triggers hasUnparsedMultiDelete and blocks deleting even the first item
+  {
+    const { tasks, filename } = await setup(t);
+    const milk = tasks.create("买牛奶");
+    tasks.create("取快递");
+    const before = await readFile(filename, "utf8");
+    const turn = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(call("d1", "delete_task", { candidateIds: [milk.id] })),
+      ).provider,
+    ).runTurn([user("把买牛奶删，并删取快递。")]);
+    assert.equal(turn.failure, "reference_required");
+    assert.deepEqual(turn.outcomes, []);
+    assert.equal(await readFile(filename, "utf8"), before);
+  }
+
+  // 2. P1 #2: "记一条把过期文件删掉" stays pure create and never allows deleting 交水费
+  {
+    const { tasks } = await setup(t);
+    tasks.create("交水费");
+    const turn = await createAgent(tasks, async () => {
+      throw new Error("standalone create with explicit quantity must not invoke provider");
+    }).runTurn([user("记一条把过期文件删掉")]);
+    assert.equal(turn.failure, undefined);
+    assert.deepEqual(
+      tasks.list().map((item) => item.title),
+      ["交水费", "把过期文件删掉"],
+    );
+  }
+
+  // 3. P1 #3: "看看买牛奶，顺便看看取快递" rejects writes matching zero positive clauses
+  {
+    const { tasks, filename } = await setup(t);
+    const milk = tasks.create("买牛奶");
+    const parcel = tasks.create("取快递");
+    const before = await readFile(filename, "utf8");
+    const turn = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(
+          call("c-bad", "complete_task", { candidateIds: [milk.id] }),
+          call("d-bad", "delete_task", { candidateIds: [parcel.id] }),
+        ),
+        final("已处理。"),
+      ).provider,
+    ).runTurn([user("看看买牛奶，顺便看看取快递")]);
+    assert.equal(turn.failure, "reference_required");
+    assert.deepEqual(turn.outcomes, []);
+    assert.equal(await readFile(filename, "utf8"), before);
+  }
+
+  // 4. P1 #4: "口腔诊所预约诊费补缴" does not match book_visit allowlist for "把预约牙医删掉"
+  {
+    const { tasks, filename } = await setup(t);
+    const fee = tasks.create("口腔诊所预约诊费补缴");
+    const before = await readFile(filename, "utf8");
+    const turn = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(call("d1", "delete_task", { candidateIds: [fee.id] })),
+        proposal(
+          call("v1", "verify_task_reference", { decision: "match", candidateIds: [fee.id] }),
+        ),
+      ).provider,
+    ).runTurn([user("把预约牙医删掉")]);
+    assert.ok(
+      turn.failure === "reference_required" || turn.failure === "exact_title_not_found",
+      `got ${String(turn.failure)}`,
+    );
+    assert.deepEqual(turn.outcomes, []);
+    assert.equal(await readFile(filename, "utf8"), before);
+  }
+
+  // 5. P2 #5: "列出任务名称包含「已经完成」的任务" masks quoted text and accepts unfiltered list_tasks({})
+  {
+    const { tasks } = await setup(t);
+    const literal = tasks.create("检查已经完成状态");
+    const turn = await createAgent(
+      tasks,
+      scripted(proposal(call("l1", "list_tasks", {})), final("清单如下。")).provider,
+    ).runTurn([user("列出任务名称包含「已经完成」的任务")]);
+    assert.equal(turn.failure, undefined);
+    assert.deepEqual(turn.displayedList, [literal]);
+  }
+
+  // 6. Live orig-L2b: forced metadata create with trailing list accepts [create_task, list_tasks] batch
+  {
+    const { tasks } = await setup(t);
+    const turn = await createAgent(
+      tasks,
+      scripted(
+        proposal(
+          call("c1", "create_task", {
+            title: "完成季度架构评审",
+            priority: "high",
+            workload: "large",
+          }),
+          call("l1", "list_tasks", {}),
+        ),
+      ).provider,
+    ).runTurn([user("加一个高优先级、大工作量的任务：完成季度架构评审，再给我看看待办清单")]);
+    assert.equal(turn.failure, undefined);
+    assert.equal(turn.outcomes.length, 1);
+    assert.equal(turn.outcomes[0]?.task.title, "完成季度架构评审");
+    assert.match(turn.reply, /当前清单：\n- 完成季度架构评审/);
+  }
+});

@@ -262,10 +262,8 @@ function referenceWords(title: string) {
 const cancelsTaskAction = /取消|撤销|停止|终止|放弃|退订|退掉/u;
 const preparatoryTaskCue =
   /(?:准备|计划|打算|考虑|研究|了解|确认是否|查询|查一下|查看|检查|核对|核实|营业时间|咨询)/u;
-const nonBookingEndingCue =
-  /(?:结果|时间|地址|电话|费用|价格|报告|记录|清单|回执|确认单|进度|状态|定金|押金|订金|费|钱|款|单|票|账)$/u;
-const bookingDisqualifierCue =
-  /(?:定金|押金|订金|交费|交钱|缴费|缴款|付款|付钱|付账|支付|结账|结算|买单|收费|退款|退还|退费|报销|报税|购买|买药|取药|开药|取件|寄件)/u;
+const bookingVisitAllowlist =
+  /^(?:(?:打电话|发微信|发消息|联系|去|到|找)?(?:预约|约诊|挂号|约)(?:一下|个|一)?(?:牙医|牙科(?:诊所|医院|检查|门诊)?|口腔(?:诊所|医院|科|检查|门诊)?|看牙|体检|体格检查|健康检查)|(?:打电话|发微信|发消息|联系|去|到|找)?(?:牙医|牙科(?:诊所|医院|科)?|口腔(?:诊所|医院|科)?|体检(?:中心)?|医院体检)(?:预约|约诊|挂号|复诊|门诊)|(?:去|到)?(?:看牙医?|口腔复诊|牙科复诊))$/u;
 const semanticConceptGroups: ReadonlyArray<readonly [string, readonly string[]]> = [
   ["dental_clinic", ["牙医", "牙科", "口腔", "看牙"]],
   ["dental_cleaning", ["洗牙", "洁牙"]],
@@ -323,16 +321,7 @@ function semanticActionClass(text: string): SemanticActionClass | undefined {
   if (cancelsTaskAction.test(trimmed) || preparatoryTaskCue.test(trimmed)) return undefined;
   if (/^(?:退|退还|退款|退费)/u.test(trimmed)) return "refund";
   if (/^(?:交|缴|付|支付|缴纳|结清)/u.test(trimmed)) return "pay";
-  if (
-    !nonBookingEndingCue.test(trimmed) &&
-    !bookingDisqualifierCue.test(trimmed) &&
-    /(?:预约|约诊|挂号|看牙|复诊|门诊)/u.test(trimmed) &&
-    /^(?:打电话|发微信|发消息|联系|去|到|找)?[^，,。]{0,12}?(?:预约|约诊|挂号|看牙|复诊|门诊)[^，,。]{0,8}$/u.test(
-      trimmed,
-    )
-  ) {
-    return "book_visit";
-  }
+  if (bookingVisitAllowlist.test(trimmed)) return "book_visit";
   if (/^(?:取|拿|领)/u.test(trimmed)) return "pickup";
   if (/^(?:寄|发(?:快递|包裹|件|货|邮件|信)|送)/u.test(trimmed)) return "send";
   if (/^(?:报销|提交报销|申请报销|报税|申报)/u.test(trimmed)) return "file_claim";
@@ -2276,13 +2265,18 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
           }
         }
         const requestToolChoice = forcedTool ?? hintTool;
+        const allowTrailingListWithForcedCreate =
+          forcedTool === "create_task" && trailingList.wantsList;
         const requestTools = scopedListFilter
           ? activeTools.filter(
               (tool) => tool.type === "function" && tool.function.name === "list_tasks",
             )
           : forcedTool
             ? activeTools.filter(
-                (tool) => tool.type === "function" && tool.function.name === forcedTool,
+                (tool) =>
+                  tool.type === "function" &&
+                  (tool.function.name === forcedTool ||
+                    (allowTrailingListWithForcedCreate && tool.function.name === "list_tasks")),
               )
             : hintTool === "list_tasks"
               ? activeTools.filter(
@@ -2562,7 +2556,14 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
             return finish("unknown_tool");
           }
         }
-        if (forcedTool && (calls.length !== 1 || calls[0].function.name !== forcedTool)) {
+        const forcedToolMatches =
+          !forcedTool ||
+          (calls.length === 1 && calls[0].function.name === forcedTool) ||
+          (allowTrailingListWithForcedCreate &&
+            calls.length === 2 &&
+            calls[0].function.name === "create_task" &&
+            calls[1].function.name === "list_tasks");
+        if (!forcedToolMatches) {
           const prematureMutation =
             forcedTool === "list_tasks" &&
             calls.some((call) => call.function.name === namedMutation);
@@ -2700,10 +2701,7 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
             index,
             matches: matchingIndicesForTool(call.function.name),
           }));
-          if (
-            mutationClauseIndices.length > 0 &&
-            writeMatches.some((entry) => entry.matches.length === 0)
-          ) {
+          if (writeMatches.some((entry) => entry.matches.length === 0)) {
             return finish("reference_required");
           }
           const allUniqueMatches =
