@@ -876,9 +876,7 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
         const filter = listFilterOverride ?? displayedListFilter;
         const activeRequiredFilter =
           confirmations.length > 0 && trailingListSpec.wantsList
-            ? Object.keys(trailingListSpec.filter).length > 0
-              ? trailingListSpec.filter
-              : undefined
+            ? trailingListSpec.filter
             : requiredLeadingListFilter;
         if (
           displayedList !== undefined &&
@@ -1568,10 +1566,21 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
             isMetadata?: boolean;
           }
         | undefined {
-        const stripped = stripLeadingActionPrefixes(clause, { includeConnectors }).replace(
-          /吧?[。！？.!?]?$/u,
-          "",
-        );
+        const stripped = stripLeadingActionPrefixes(clause, { includeConnectors })
+          .replace(
+            includeConnectors
+              ? /^(?:也|再|并|先|只)\s*(?=重新(?:打开|开启)|恢复|退回|重置|取消|撤销|重命名|改名|更名)/u
+              : /^(?:再|先|只)\s*(?=重新(?:打开|开启)|恢复|退回|重置|取消|撤销|重命名|改名|更名)/u,
+            "",
+          )
+          .replace(/吧?[。！？.!?]?$/u, "");
+        const meta = singleMetadataRequest(stripped);
+        if (meta?.operation === "update_task" && meta.target && meta.changes) {
+          const resolved = resolveExplicitTargetName(meta.target.replace(/的$/u, ""));
+          if (resolved) {
+            return { ...resolved, requiredChanges: meta.changes, isMetadata: true };
+          }
+        }
         const reopenMatch =
           /^(?:把|将)\s*(.+?)\s*(?:(?:改回|恢复(?:为|成)?|退回(?:为|成)?|变回|重置(?:为|成)?|重新(?:打开|开启|标记(?:为|成)?|设为|变为)|标(?:记)?(?:为|成)?|设(?:置)?(?:为|成)?)\s*(?:未|待)完成(?:状态)?|(?:重新(?:打开|开启)|恢复|退回|重置)(?:一下|下)?)$/u.exec(
             stripped,
@@ -1585,7 +1594,7 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
           }
         }
         const renameMatch =
-          /^(?:把|将)\s*(.+?)\s*(?:重命名|改名|更名|改(?:一下|下)?(?:标题|名称|名字)?|换(?:一下|下)?(?:标题|名称|名字)?)(?:为|成|叫)\s*(.+)$/u.exec(
+          /^(?:把|将)\s*(.+?)\s*(?:重命名|改名|更名|改(?:一下|下)?(?:标题|名称|名字)|换(?:一下|下)?(?:标题|名称|名字)|(?<!优先级|工作量)(?:改|换))(?:为|成|叫)\s*(.+)$/u.exec(
             stripped,
           );
         if (renameMatch) {
@@ -1597,13 +1606,6 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
               ...(parsedNewTitle && { requiredChanges: { title: parsedNewTitle } }),
               isRename: true,
             };
-          }
-        }
-        const meta = singleMetadataRequest(stripped);
-        if (meta?.operation === "update_task" && meta.target && meta.changes) {
-          const resolved = resolveExplicitTargetName(meta.target.replace(/的$/u, ""));
-          if (resolved) {
-            return { ...resolved, requiredChanges: meta.changes, isMetadata: true };
           }
         }
         return undefined;
@@ -1631,7 +1633,7 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
           const rawSuffix = targetFirstAction.exec(rawTrimmed);
           if (rawSuffix && !deleteAction.test(rawSuffix[2])) {
             const rawTargetTrimmed = rawSuffix[1].trim();
-            if (namedTarget(rawTargetTrimmed)?.literal !== true) {
+            if (!/^[「“"]/u.test(rawTargetTrimmed)) {
               const fullTitle = rawTargetTrimmed.replace(/(?:已经|已)$/u, "");
               if (knownTitles.has(fullTitle)) {
                 return { title: fullTitle, literal: false, clauseIndex };
@@ -1708,25 +1710,6 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
         (clauseAnalysis.allowReopen || clauseAnalysis.allowRename)
           ? extractExplicitUpdateSpec(commandInput, false)
           : undefined;
-      const mixedUpdates =
-        !activeBoundReference &&
-        !singleGrant &&
-        (clauseAnalysis.allowReopen ||
-          clauseAnalysis.allowRename ||
-          clauseAnalysis.hasMetadataMention) &&
-        clauseAnalysis.clauseCount > 1
-          ? clauseAnalysis.positiveClauses.flatMap<
-              NonNullable<ReturnType<typeof extractExplicitUpdateSpec>> & { clauseIndex: number }
-            >((clause, clauseIndex) => {
-              if (isPureListClause(clause)) return [];
-              const parsed = extractExplicitUpdateSpec(clause, clauseIndex > 0);
-              return parsed ? [{ ...parsed, clauseIndex }] : [];
-            })
-          : [];
-      const mixedUpdateByClauseIndex = new Map(
-        mixedUpdates.map((entry) => [entry.clauseIndex, entry]),
-      );
-      const mixedUpdate = mixedUpdates.length === 1 ? mixedUpdates[0] : undefined;
       const leadingListFilter =
         !activeBoundReference &&
         clauseAnalysis.positiveClauses.length >= 2 &&
@@ -2072,14 +2055,19 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
         !clauseAnalysis.hasPositiveCreateCommand &&
         !clauseAnalysis.allowReopen &&
         !clauseAnalysis.allowRename &&
-        !clauseAnalysis.hasMetadataMention &&
+        clauseAnalysis.allowedPriorities.size === 0 &&
+        clauseAnalysis.allowedWorkloads.size === 0 &&
         !/^(?:把|将)/u.test(commandInput)
-          ? /^([^\r\n，,；;。？！!?]{2,200}?)(?:(?:这|那)(?:一)?[条项](?:任务|待办)?)?(?:已经|已)?(?:完成了|做完了|搞定了)[。！!]?$/u
+          ? /^([^\r\n，,；;。？！!?]{1,200}?)(?:(?:这|那)(?:一)?[条项](?:任务|待办)?)?(?:已经|已)?(?:完成了|做完了|搞定了)[。！!]?$/u
               .exec(commandInput)?.[1]
               ?.trim()
           : undefined;
       const completionName =
-        rawCompletionName && !isUnboundTarget(rawCompletionName) ? rawCompletionName : undefined;
+        rawCompletionName &&
+        !isUnboundTarget(rawCompletionName) &&
+        !/^(?:已|已经|快|刚|刚刚|都|全|全部|所有|它|这|那)$/u.test(rawCompletionName)
+          ? rawCompletionName
+          : undefined;
       const unquotedCompletionName = exactComplete?.literal
         ? undefined
         : (exactComplete?.title ?? completionName);
@@ -2281,11 +2269,14 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
       const orderedOperations = orderedMutationOperations(commandInput)?.map(
         ({ operation, text }) => {
           const exact = explicitMutation(text);
+          const explicitUpdate =
+            operation === "update_task" ? extractExplicitUpdateSpec(text, true) : undefined;
           const named = taskCommand(text);
           const namedTitle = named?.explicit && namedTarget(named.target);
           const metadata = singleMetadataRequest(text);
           const metadataEdit = metadata?.operation === "update_task" ? metadata : undefined;
-          const metadataTarget = metadataEdit?.target && namedTarget(metadataEdit.target);
+          const metadataTarget =
+            metadataEdit?.target && namedTarget(metadataEdit.target.replace(/的$/u, ""));
           const metadataCreate =
             metadata?.operation === "create_task"
               ? singleCreateGrant(metadata.target, metadata.changes)
@@ -2295,13 +2286,16 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
             text,
             title:
               exact?.title ??
+              explicitUpdate?.title ??
               metadataCreate?.title ??
               (metadataTarget ? metadataTarget.title : undefined) ??
               (namedTitle && (namedTitle.literal || !isUnboundTarget(namedTitle.title))
                 ? namedTitle.title
                 : undefined),
             requiredChanges:
-              exact?.operation === "update_task" ? exact.changes : metadataEdit?.changes,
+              exact?.operation === "update_task"
+                ? exact.changes
+                : (explicitUpdate?.requiredChanges ?? metadataEdit?.changes),
             creationMetadata: metadataCreate?.changes,
             unresolvedCreateMetadata:
               operation === "create_task" &&
@@ -3266,12 +3260,33 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
             liveMixedCompletions.length > 0 && liveMixedCompletions.length === completeClauseCount
               ? new Set(liveMixedCompletions.map((entry) => entry.title))
               : undefined;
+          const liveMixedUpdates =
+            name === "update_task" &&
+            !activeBoundReference &&
+            !singleGrant &&
+            (clauseAnalysis.allowReopen ||
+              clauseAnalysis.allowRename ||
+              clauseAnalysis.hasMetadataMention) &&
+            clauseAnalysis.clauseCount > 1
+              ? clauseAnalysis.positiveClauses.flatMap<
+                  NonNullable<ReturnType<typeof extractExplicitUpdateSpec>> & {
+                    clauseIndex: number;
+                  }
+                >((clause, idx) => {
+                  if (isPureListClause(clause)) return [];
+                  const parsed = extractExplicitUpdateSpec(clause, idx > 0);
+                  return parsed ? [{ ...parsed, clauseIndex: idx }] : [];
+                })
+              : [];
           const rankedUpdate =
             name === "update_task" && callRank !== undefined
-              ? mixedUpdateByClauseIndex.get(callRank)
+              ? liveMixedUpdates.find((entry) => entry.clauseIndex === callRank)
               : undefined;
+          const liveMixedUpdate = liveMixedUpdates.length === 1 ? liveMixedUpdates[0] : undefined;
           const activeUpdateSpec =
-            name === "update_task" ? (singleUpdateSpec ?? rankedUpdate ?? mixedUpdate) : undefined;
+            name === "update_task"
+              ? (singleUpdateSpec ?? rankedUpdate ?? liveMixedUpdate)
+              : undefined;
           const rankedUpdateIntent =
             name === "update_task" && callRank !== undefined && !activeBoundReference
               ? turnClauseIntents[callRank]

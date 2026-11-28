@@ -611,6 +611,13 @@ function unquotedProhibitedDeletionTargets(clause: string): string[] {
   });
 }
 
+function maskRenameValues(clause: string): string {
+  return clause.replace(
+    /(重命名|改名|更名|(?:改|修改|换)(?:一下|下)?(?:标题|名称|名字)|(?:的(?:标题|名称|名字)|(?:标题|名字))(?:改|换|设))(?:为|成|叫)(?!\s*(?:已|未|待)完成(?:\s|$|[，,；;。！？!?]))\s*[^，,；;。！？!?]+/gu,
+    "$1为「」",
+  );
+}
+
 export function analyzeClauses(input: string): ClauseAnalysis {
   const trimmed = input.trim();
   const maskedWhole = maskQuotedTitles(trimmed);
@@ -704,7 +711,8 @@ export function analyzeClauses(input: string): ClauseAnalysis {
   const positiveQuotedTitles: string[] = [];
   let hasUnquotedPositiveActionClause = false;
   for (const entry of mutationEntries) {
-    positiveMaskedClauses.push(entry.masked);
+    const actionMasked = maskRenameValues(entry.masked);
+    positiveMaskedClauses.push(actionMasked);
     for (const title of entry.quoted) {
       positiveQuotedTitles.push(title);
     }
@@ -712,7 +720,7 @@ export function analyzeClauses(input: string): ClauseAnalysis {
     if (
       entry.quoted.length === 0 &&
       /(?:完成|做好|买好|办好|交好|搞定|删掉|删除|移除|清空|改回|重命名|改名|改|设|调|优先级|工作量)/u.test(
-        entry.masked,
+        actionMasked,
       )
     ) {
       hasUnquotedPositiveActionClause = true;

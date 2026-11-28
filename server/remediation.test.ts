@@ -4040,3 +4040,178 @@ test("review round 13 regressions (0bf7d073): quoted completion unquoting, claus
     assert.match(turn.reply, /没有完全同名/u);
   }
 });
+
+test("review round 14 regressions (c0680b10): rename-value masking, compound metadata order, dynamic reopen after rename, 再重新打开, metadata/1-char completion pinning, quoted demonstrative completion, mismatched list on error, and ordered rename+reopen", async (t) => {
+  // 1. P1 #1: rename values "删除旧文件" and "完成周报" never authorize delete_task or complete_task
+  for (const [newTitle, rogueTool] of [
+    ["删除旧文件", "delete_task"],
+    ["完成周报", "complete_task"],
+  ] as const) {
+    const { tasks, filename } = await setup(t);
+    tasks.create("寄合同");
+    const rent = tasks.update(tasks.create("交房租").id, { done: true })!;
+    const milk = tasks.create("买牛奶");
+    const before = await readFile(filename, "utf8");
+    const turn = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(
+          call("r1", rogueTool, { candidateIds: [milk.id] }),
+          call("u1", "update_task", { candidateIds: [rent.id], changes: { done: false } }),
+        ),
+        final("收到。"),
+      ).provider,
+    ).runTurn([user(`把寄合同改名为${newTitle}，再把交房租改回未完成`)]);
+    assert.ok(turn.failure, `${newTitle}: must block ${rogueTool}`);
+    assert.equal(await readFile(filename, "utf8"), before, newTitle);
+  }
+
+  // 2. P1 #2: "把寄合同的优先级改为高，再把交房租的工作量改为大" accepts correct targets
+  {
+    const { tasks } = await setup(t);
+    const contract = tasks.create("寄合同");
+    const rent = tasks.create("交房租");
+    const turn = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(
+          call("u1", "update_task", { candidateIds: [contract.id], changes: { priority: "high" } }),
+          call("u2", "update_task", { candidateIds: [rent.id], changes: { workload: "large" } }),
+        ),
+        final("收到。"),
+      ).provider,
+    ).runTurn([user("把寄合同的优先级改为高，再把交房租的工作量改为大")]);
+    assert.equal(turn.failure, undefined);
+    assert.equal(tasks.list().find((item) => item.id === contract.id)?.priority, "high");
+    assert.equal(tasks.list().find((item) => item.id === rent.id)?.workload, "large");
+  }
+
+  // 3. P1 #3: "把交房租改名为寄合同这条任务，再把寄合同这条任务重新打开" resolves dynamically after rename
+  {
+    const { tasks } = await setup(t);
+    const rent = tasks.update(tasks.create("交房租").id, { done: true })!;
+    const contract = tasks.update(tasks.create("寄合同").id, { done: true })!;
+    const turn = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(
+          call("u1", "update_task", {
+            candidateIds: [rent.id],
+            changes: { title: "寄合同这条任务" },
+          }),
+          call("u2", "update_task", { candidateIds: [contract.id], changes: { done: false } }),
+        ),
+        final("收到。"),
+      ).provider,
+    ).runTurn([user("把交房租改名为寄合同这条任务，再把寄合同这条任务重新打开")]);
+    assert.ok(turn.failure);
+    assert.equal(tasks.list().find((item) => item.id === contract.id)?.done, true);
+  }
+
+  // 4. P1 #4: "删掉买牛奶，再重新打开寄合同" binds 寄合同 and rejects reopening 交房租
+  {
+    const { tasks } = await setup(t);
+    const milk = tasks.create("买牛奶");
+    tasks.update(tasks.create("寄合同").id, { done: true });
+    const rent = tasks.update(tasks.create("交房租").id, { done: true })!;
+    const turn = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(call("d1", "delete_task", { candidateIds: [milk.id] })),
+        proposal(call("u1", "update_task", { candidateIds: [rent.id], changes: { done: false } })),
+        final("收到。"),
+      ).provider,
+    ).runTurn([user("删掉买牛奶，再重新打开寄合同")]);
+    assert.ok(turn.failure);
+    assert.equal(tasks.list().find((item) => item.id === rent.id)?.done, true);
+  }
+
+  // 5. P1 #5: metadata-keyword long title and 1-char title standalone completions pin exact title
+  for (const title of [`检查工作量${"预算".repeat(23)}`, "甲"]) {
+    const { tasks, filename } = await setup(t);
+    const milk = tasks.create("买牛奶");
+    tasks.create(title);
+    const before = await readFile(filename, "utf8");
+    const wrong = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(call("c1", "complete_task", { candidateIds: [milk.id] })),
+        final("收到。"),
+      ).provider,
+    ).runTurn([user(`${title}完成了`)]);
+    assert.ok(wrong.failure, `${title}: must reject completing 买牛奶`);
+    assert.equal(await readFile(filename, "utf8"), before, title);
+  }
+
+  // 6. P1 #6: "删掉买牛奶，「寄合同」这件任务完成了" completes 寄合同 and rejects literal 「寄合同」这件任务
+  {
+    const { tasks } = await setup(t);
+    const milk = tasks.create("买牛奶");
+    const contract = tasks.create("寄合同");
+    const literal = tasks.create("「寄合同」这件任务");
+    const wrong = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(
+          call("d1", "delete_task", { candidateIds: [milk.id] }),
+          call("c1", "complete_task", { candidateIds: [literal.id] }),
+        ),
+        final("收到。"),
+      ).provider,
+    ).runTurn([user("删掉买牛奶，「寄合同」这件任务完成了")]);
+    assert.ok(wrong.failure);
+    assert.equal(tasks.list().find((item) => item.id === literal.id)?.done, false);
+    assert.equal(tasks.list().find((item) => item.id === contract.id)?.done, false);
+  }
+
+  // 7. P2 #1: mismatched list_tasks({done:false}) on error after delete is cleared when final list is unfiltered
+  {
+    const { tasks } = await setup(t);
+    const milk = tasks.create("买牛奶");
+    tasks.create("寄合同");
+    tasks.update(tasks.create("交房租").id, { done: true });
+    const turn = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(
+          call("d1", "delete_task", { candidateIds: [milk.id] }),
+          call("l2", "list_tasks", { done: false }),
+        ),
+        proposal(call("u9", "bogus_tool", {})),
+      ).provider,
+    ).runTurn([user("列出已完成的任务，然后删掉买牛奶，最后查看所有任务")]);
+    assert.equal(turn.failure, "unknown_tool");
+    assert.equal(turn.displayedList, undefined);
+  }
+
+  // 8. P2 #2: ordered path "把寄合同改名为寄新合同，然后把交房租改回未完成" succeeds with provider
+  {
+    const { tasks } = await setup(t);
+    const contract = tasks.update(tasks.create("寄合同").id, { done: true })!;
+    const rent = tasks.update(tasks.create("交房租").id, { done: true })!;
+    const turn = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(
+          call("u1", "update_task", {
+            candidateIds: [contract.id],
+            changes: { title: "寄新合同" },
+          }),
+          call("u2", "update_task", { candidateIds: [rent.id], changes: { done: false } }),
+        ),
+        final("收到。"),
+      ).provider,
+    ).runTurn([user("把寄合同改名为寄新合同，然后把交房租改回未完成")]);
+    assert.equal(turn.failure, undefined);
+    assert.equal(tasks.list().find((item) => item.id === contract.id)?.title, "寄新合同");
+    assert.equal(tasks.list().find((item) => item.id === rent.id)?.done, false);
+  }
+});
