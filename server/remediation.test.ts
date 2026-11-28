@@ -2398,3 +2398,142 @@ test("CODEX-REVIEW-4 regressions: booking vs deposit/refund, per-clause repeated
     assert.doesNotMatch(turn.reply, /取快递/);
   }
 });
+
+test("CODEX-REVIEW-5 regressions: create with 删 in title & 顺便删 multi-delete, extra unrequested write in batch, 口腔诊所预约交费, filtered-lookup stale_view + quoted/empty-candidates, trailing 已经完成 list", async (t) => {
+  // 1a. P1 #1: "记一条把过期文件删" creates the task locally and never authorizes deleting 交水费
+  {
+    const { tasks } = await setup(t);
+    tasks.create("交水费");
+    const turn = await createAgent(tasks, async () => {
+      throw new Error("standalone create with explicit quantity must not call provider");
+    }).runTurn([user("记一条把过期文件删")]);
+    assert.equal(turn.failure, undefined);
+    assert.deepEqual(
+      tasks.list().map((item) => item.title),
+      ["交水费", "把过期文件删"],
+    );
+  }
+
+  // 1b. P1 #1: "把买牛奶删，顺便删取快递。" triggers multi-delete guard and never deletes 交水费
+  {
+    const { tasks, filename } = await setup(t);
+    tasks.create("买牛奶");
+    tasks.create("取快递");
+    const water = tasks.create("交水费");
+    const before = await readFile(filename, "utf8");
+    const turn = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(call("d-wrong", "delete_task", { candidateIds: [water.id] })),
+      ).provider,
+    ).runTurn([user("把买牛奶删，顺便删取快递。")]);
+    assert.equal(turn.failure, "reference_required");
+    assert.deepEqual(turn.outcomes, []);
+    assert.equal(await readFile(filename, "utf8"), before);
+  }
+
+  // 2. P1 #2: extra unrequested complete_task in a multi-delete+create batch fails closed with 0 writes
+  {
+    const { tasks, filename } = await setup(t);
+    tasks.create("买牛奶");
+    const rent = tasks.create("交房租");
+    const parcel = tasks.create("取快递");
+    const before = await readFile(filename, "utf8");
+    const turn = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(
+          call("d1", "delete_task", { candidateIds: [rent.id] }),
+          call("c-bad", "complete_task", { candidateIds: [parcel.id] }),
+        ),
+        final("已处理。"),
+      ).provider,
+    ).runTurn([user("把买牛奶删掉，再记一条预约牙医，另外把交房租删掉")]);
+    assert.equal(turn.failure, "reference_required");
+    assert.deepEqual(turn.outcomes, []);
+    assert.equal(await readFile(filename, "utf8"), before);
+  }
+
+  // 3. P1 #3: "口腔诊所预约交费" does NOT auto-delete for "把预约牙医删掉"
+  {
+    const { tasks, filename } = await setup(t);
+    const fee = tasks.create("口腔诊所预约交费");
+    const before = await readFile(filename, "utf8");
+    const turn = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(call("d1", "delete_task", { candidateIds: [fee.id] })),
+        proposal(
+          call("v1", "verify_task_reference", { decision: "match", candidateIds: [fee.id] }),
+        ),
+      ).provider,
+    ).runTurn([user("把预约牙医删掉")]);
+    assert.ok(
+      turn.failure === "reference_required" || turn.failure === "exact_title_not_found",
+      `got ${String(turn.failure)}`,
+    );
+    assert.deepEqual(turn.outcomes, []);
+    assert.equal(await readFile(filename, "utf8"), before);
+  }
+
+  // 4a. P2 #4: concurrent store change after filtered lookup preserves stale_view
+  {
+    const { tasks } = await setup(t);
+    const gym = tasks.create("去健身房", { priority: "low" });
+    tasks.create("交水电费", { priority: "high" });
+    let round = 0;
+    const turn = await createAgent(tasks, async () => {
+      round++;
+      if (round === 1) return proposal(call("l1", "list_tasks", { priority: "high" }));
+      tasks.update(gym.id, { priority: "medium" });
+      return final("没有找到「去健身房」。");
+    }).runTurn([user("把去健身房标记完成")]);
+    assert.equal(turn.failure, "stale_view");
+    assert.equal(turn.displayedList, undefined);
+  }
+
+  // 4b. P2 #4: filtered lookup hiding existing task never returns missing for quoted target or empty candidateIds
+  for (const [prompt, secondChoice] of [
+    ["把「去健身房」标记完成", final("没有找到「去健身房」。")],
+    ["把去健身房标记完成", proposal(call("c-empty", "complete_task", { candidateIds: [] }))],
+  ] as const) {
+    const { tasks, filename } = await setup(t);
+    tasks.create("去健身房", { priority: "low" });
+    tasks.create("交水电费", { priority: "high" });
+    const before = await readFile(filename, "utf8");
+    const turn = await createAgent(
+      tasks,
+      scripted(proposal(call("l1", "list_tasks", { priority: "high" })), secondChoice).provider,
+    ).runTurn([user(prompt)]);
+    assert.equal(turn.failure, "action_not_executed", prompt);
+    assert.doesNotMatch(turn.reply, /找不到指定的任务|没有完全同名/, prompt);
+    assert.deepEqual(turn.outcomes, [], prompt);
+    assert.equal(await readFile(filename, "utf8"), before, prompt);
+  }
+
+  // 5. P2 #5: trailing "最后列出已经完成的任务" displays ONLY completed tasks
+  {
+    const { tasks } = await setup(t);
+    const milk = tasks.create("买牛奶");
+    tasks.create("取快递");
+    const turn = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(call("c1", "complete_task", { candidateIds: [milk.id] })),
+        proposal(call("l2", "list_tasks", { done: true })),
+        final("已完成并列出。"),
+      ).provider,
+    ).runTurn([user("把买牛奶标为完成，最后列出已经完成的任务")]);
+    assert.equal(turn.failure, undefined);
+    assert.deepEqual(
+      turn.displayedList?.map((item) => item.title),
+      ["买牛奶"],
+    );
+    assert.match(turn.reply, /已完成清单：\n- 买牛奶（已完成）/);
+    assert.doesNotMatch(turn.reply, /取快递/);
+  }
+});

@@ -224,6 +224,24 @@ const trailingListClausePattern =
 const clauseNegationPattern =
   /(?:千万)?(?:不要|(?<!分|特|级|类|区|告|差|识|判|个|性)别(?!人|的|处|扭)|勿|不用|不必|暂不|不想|不打算|不要动|别动)/u;
 
+function parseListFilterFromText(text: string): ListTasksFilter {
+  const filter: ListTasksFilter = {};
+  const hasPending = /(?:待|未|还没|没有|尚未|没)(?:完成|办完|做完)|还没完/u.test(text);
+  const hasCompleted =
+    /(?<!未|待|没|不|没有|还没|尚未)(?:(?:已|已经)(?:完成|办完|做完)|(?:完成|办完|做完)了)/u.test(
+      text,
+    );
+  if (hasPending && !hasCompleted) filter.done = false;
+  else if (hasCompleted && !hasPending) filter.done = true;
+  const prio = /([低中高])\s*优先级|优先级\s*(?:为|是|等于|[：:])?\s*([低中高])/u.exec(text);
+  const prioVal = prio?.[1] ?? prio?.[2];
+  if (prioVal) filter.priority = priorities.find((item) => priorityLabels[item] === prioVal);
+  const work = /([小中大])\s*工作量|工作量\s*(?:为|是|等于|[：:])?\s*([小中大])/u.exec(text);
+  const workVal = work?.[1] ?? work?.[2];
+  if (workVal) filter.workload = workloads.find((item) => workloadLabels[item] === workVal);
+  return filter;
+}
+
 export function extractTrailingListRequest(input: string): {
   wantsList: boolean;
   commandText: string;
@@ -238,19 +256,7 @@ export function extractTrailingListRequest(input: string): {
   if (clauseNegationPattern.test(maskedLast) || !trailingListClausePattern.test(maskedLast)) {
     return { wantsList: false, commandText: input.trim(), filter: {} };
   }
-  const filter: ListTasksFilter = {};
-  const hasPending = /(?:待|未|还没|没有|尚未|没)(?:完成|办完|做完)|还没完/u.test(maskedLast);
-  const hasCompleted = /(?<!未|待|没|不|没有|还没|尚未)(?:已完成|完成了|办完了|做完了)/u.test(
-    maskedLast,
-  );
-  if (hasPending && !hasCompleted) filter.done = false;
-  else if (hasCompleted && !hasPending) filter.done = true;
-  const prio = /([低中高])\s*优先级|优先级\s*(?:为|是|等于|[：:])?\s*([低中高])/u.exec(maskedLast);
-  const prioVal = prio?.[1] ?? prio?.[2];
-  if (prioVal) filter.priority = priorities.find((item) => priorityLabels[item] === prioVal);
-  const work = /([小中大])\s*工作量|工作量\s*(?:为|是|等于|[：:])?\s*([小中大])/u.exec(maskedLast);
-  const workVal = work?.[1] ?? work?.[2];
-  if (workVal) filter.workload = workloads.find((item) => workloadLabels[item] === workVal);
+  const filter = parseListFilterFromText(maskedLast);
 
   const commandText = clauses.slice(0, -1).join("，");
   return { wantsList: true, commandText, filter };
@@ -477,24 +483,7 @@ export function expectedScopedListFilter(
   if (!prefix) return undefined;
   const rest = text.slice(prefix[0].length);
   if (!/(?:任务|待办|事项|清单|列表|事)/u.test(rest)) return undefined;
-  const filter: { done?: boolean; priority?: Priority; workload?: Workload } = {};
-  const hasPending = /(?:待|未|还没|没有|尚未|没)(?:完成|办完)|还没完/u.test(rest);
-  const hasCompleted = /(?<!未|待|没|不|没有|还没|尚未)(?:已完成|完成了|办完了)/u.test(rest);
-  if (hasPending && hasCompleted) return undefined;
-  if (hasPending) filter.done = false;
-  if (hasCompleted) filter.done = true;
-  const prioMatch = /([低中高])\s*优先级|优先级\s*(?:为|是|等于|[：:])?\s*([低中高])/u.exec(rest);
-  const prioVal = prioMatch?.[1] ?? prioMatch?.[2];
-  if (prioVal) {
-    const p = priorities.find((item) => priorityLabels[item] === prioVal);
-    if (p) filter.priority = p;
-  }
-  const workMatch = /([小中大])\s*工作量|工作量\s*(?:为|是|等于|[：:])?\s*([小中大])/u.exec(rest);
-  const workVal = workMatch?.[1] ?? workMatch?.[2];
-  if (workVal) {
-    const w = workloads.find((item) => workloadLabels[item] === workVal);
-    if (w) filter.workload = w;
-  }
+  const filter = parseListFilterFromText(rest);
   return Object.keys(filter).length > 0 ? filter : undefined;
 }
 const retractionCuePattern =
@@ -715,10 +704,23 @@ export function analyzeClauses(input: string): ClauseAnalysis {
     /(?:标(?:记)?(?:为|成)?(?:已)?完成|完成(?:了)?|[\p{Script=Han}](?:好了|完了)|买回来了|搞定了|勾掉|打勾)/u.test(
       textWithoutReopenPhrases,
     );
-  const hasDeleteVerb =
-    /(?:删掉|删除|移除|清掉|去掉|清除|删了|删一|(?:把|将)[^，,。]+?删(?:吧)?(?:$|[，,；;。！!])|(?<![\p{Script=Han}])删(?![除掉了一节减改])[\p{Script=Han}「“"])/u.test(
-      positiveText,
+  const leadingCreatePrefix =
+    /^(?:(?:然后|接着|随后|另外|此外|同时|顺便|顺手|并且|而且|还有|以及|也|再)\s*)*(?:请(?:[你您])?(?:帮我)?|帮我|麻烦(?:[你您])?(?:帮我)?)?\s*(?:再)?(?:新增|新建|创建|添加|加入|加上|加[一二两三四五六1-6]?[条项个]|记(?:一下|[一二两三四五六1-6]?[条项个]|下)|记录(?:一下|[一二两三四五六1-6]?[条项个]|下))/u;
+  const hasDeleteVerb = positiveMaskedClauses.some((clause) => {
+    const trimmedClause = clause.trim().replace(/[。！.!]+$/u, "");
+    if (/(?:删掉|删除|移除|清掉|去掉|清除|删了|删一)/u.test(trimmedClause)) return true;
+    if (leadingCreatePrefix.test(trimmedClause)) return false;
+    const stripped = trimmedClause
+      .replace(
+        /^(?:(?:然后|接着|随后|另外|此外|同时|顺便|顺手|并且|而且|还有|以及|也|再)\s*)+/u,
+        "",
+      )
+      .replace(/^(?:请(?:[你您])?(?:帮我)?|帮我|麻烦(?:[你您])?(?:帮我)?)\s*/u, "");
+    return (
+      /^(?:把|将)[^，,。]+?删(?:吧)?$/u.test(stripped) ||
+      /^删(?![除掉了一节减改])[\p{Script=Han}「“"]/u.test(stripped)
     );
+  });
   const allowReopen =
     /(?:改回|恢复|退回|变回|重置(?:为|成)?|重新(?:打开|开启|标记|设为|变为)|取消(?:已)?完成|标(?:记)?(?:为|成)?(?:未|待)完成|设(?:置)?(?:为|成)?(?:未|待)完成|还没(?:做|买|寄|写|交|办|完成|搞定)|其实没|其实还没|未完成|待完成)/u.test(
       positiveText,
@@ -801,14 +803,16 @@ export function analyzeClauses(input: string): ClauseAnalysis {
     !isPureCreate &&
     !isPureDelete &&
     !isPureReopen &&
-    !isPureRename;
+    !isPureRename &&
+    (hasCompleteVerb || (!hasCreateVerb && !hasDeleteVerb && !allowReopen && !allowRename));
   const allowDelete =
     mutationsAllowed &&
     !isPureMetadataRequest &&
     !isPureCreate &&
     !isPureComplete &&
     !isPureReopen &&
-    !isPureRename;
+    !isPureRename &&
+    (hasDeleteVerb || (!hasCreateVerb && !hasCompleteVerb && !allowReopen && !allowRename));
 
   const hasPositiveCreateCommand =
     mutationsAllowed &&

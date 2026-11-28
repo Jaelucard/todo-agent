@@ -263,8 +263,9 @@ const cancelsTaskAction = /取消|撤销|停止|终止|放弃|退订|退掉/u;
 const preparatoryTaskCue =
   /(?:准备|计划|打算|考虑|研究|了解|确认是否|查询|查一下|查看|检查|核对|核实|营业时间|咨询)/u;
 const nonBookingEndingCue =
-  /(?:结果|时间|地址|电话|费用|价格|报告|记录|清单|回执|确认单|进度|状态|定金|押金|订金)$/u;
-const bookingDisqualifierCue = /(?:定金|押金|订金|缴费|付款|支付|结账|付钱|退款|退还|退费)/u;
+  /(?:结果|时间|地址|电话|费用|价格|报告|记录|清单|回执|确认单|进度|状态|定金|押金|订金|费|钱|款|单|票|账)$/u;
+const bookingDisqualifierCue =
+  /(?:定金|押金|订金|交费|交钱|缴费|缴款|付款|付钱|付账|支付|结账|结算|买单|收费|退款|退还|退费|报销|报税|购买|买药|取药|开药|取件|寄件)/u;
 const semanticConceptGroups: ReadonlyArray<readonly [string, readonly string[]]> = [
   ["dental_clinic", ["牙医", "牙科", "口腔", "看牙"]],
   ["dental_cleaning", ["洗牙", "洁牙"]],
@@ -1523,14 +1524,16 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
           );
         }
         if (error === "task_not_found") {
-          if (
-            explicitDelete &&
-            pendingOperation === "delete_task" &&
-            Object.keys(displayedListFilter).length
-          ) {
+          if (Object.keys(displayedListFilter).length) {
             const fullView = createTaskTools(tasks).execute("list_tasks", "{}");
             if (!fullView.ok) return finish(fullView.error);
-            if (fullView.tool === "list_tasks") view = fullView.tasks;
+            if (fullView.tool === "list_tasks") {
+              if (fullView.tasks.some((task) => task.title === name.title)) {
+                displayedList = undefined;
+                return finish("action_not_executed");
+              }
+              view = fullView.tasks;
+            }
           }
           const candidates = possibleMatches(view, name.title);
           if (
@@ -1845,36 +1848,17 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
               : deleteAction.test(command.action)
                 ? "delete_task"
                 : "complete_task";
-          let effectiveView = view;
-          let fullStoreMissing = true;
-          if (
-            !clarification &&
-            pendingOp === "complete_task" &&
-            !parsedTarget.literal &&
-            Object.keys(displayedListFilter).length > 0
-          ) {
-            const fullView = createTaskTools(tasks).execute("list_tasks", "{}");
-            if (!fullView.ok) return finish(fullView.error);
-            if (fullView.tool === "list_tasks") {
-              effectiveView = fullView.tasks;
-              fullStoreMissing = !fullView.tasks.some((task) => task.title === parsedTarget.title);
-            }
-          }
-          if (!fullStoreMissing) {
-            displayedList = undefined;
-            return finish("action_not_executed");
-          }
           const modelReportedMissing =
             !clarification &&
+            resolved.error === "task_not_found" &&
             pendingOp === "complete_task" &&
             !parsedTarget.literal &&
-            fullStoreMissing &&
             Boolean(
               modelStopText && /(?:没有找到|找不到|未找到|不存在|清单里没有)/u.test(modelStopText),
             );
           return finishLookupFailure(
             resolved.error,
-            effectiveView,
+            view,
             parsedTarget,
             modelReportedMissing ? "task_not_found" : clarification,
             pendingOp,
@@ -2716,6 +2700,12 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
             index,
             matches: matchingIndicesForTool(call.function.name),
           }));
+          if (
+            mutationClauseIndices.length > 0 &&
+            writeMatches.some((entry) => entry.matches.length === 0)
+          ) {
+            return finish("reference_required");
+          }
           const allUniqueMatches =
             writeMatches.every((entry) => entry.matches.length === 1) &&
             new Set(writeMatches.map((entry) => entry.matches[0])).size === writeMatches.length;
