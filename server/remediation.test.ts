@@ -1690,29 +1690,48 @@ test("LIVE-SWEEP-2 regressions: forced tool narrowing, same-domain semantic isol
     assert.equal(await readFile(filename, "utf8"), before, `${prompt} -> ${storedTitle}`);
   }
 
-  // 3. Repeated-operation compound batch does not mis-rank calls when a tool matches >1 positive clause
+  // 3. Repeated-operation compound batch enforces clause order and preserves valid in-order execution
   {
-    const { tasks } = await setup(t);
+    const { tasks, filename } = await setup(t);
     const milk = tasks.create("买牛奶");
     const rent = tasks.create("交房租");
-    const mock = scripted(
-      proposal(call("l1", "list_tasks", {})),
-      proposal(
-        call("c1", "create_task", { title: "预约牙医" }),
-        call("d2", "delete_task", { candidateIds: [rent.id] }),
-      ),
-      final("已处理。"),
-    );
-    const turn = await createAgent(tasks, mock.provider).runTurn([
-      user("把买牛奶删掉，再记一条预约牙医，另外把交房租删掉"),
-    ]);
-    assert.equal(turn.failure, undefined);
+    const before = await readFile(filename, "utf8");
+    const skipped = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(
+          call("c1", "create_task", { title: "预约牙医" }),
+          call("d2", "delete_task", { candidateIds: [rent.id] }),
+        ),
+        final("已处理。"),
+      ).provider,
+    ).runTurn([user("把买牛奶删掉，再记一条预约牙医，另外把交房租删掉")]);
+    assert.equal(skipped.failure, "action_not_executed");
+    assert.deepEqual(skipped.outcomes, []);
+    assert.equal(await readFile(filename, "utf8"), before);
+
+    const ordered = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(
+          call("d1", "delete_task", { candidateIds: [milk.id] }),
+          call("c1", "create_task", { title: "预约牙医" }),
+          call("d2", "delete_task", { candidateIds: [rent.id] }),
+        ),
+        final("已处理。"),
+      ).provider,
+    ).runTurn([user("把买牛奶删掉，再记一条预约牙医，另外把交房租删掉")]);
+    assert.equal(ordered.failure, undefined);
     assert.deepEqual(
-      turn.outcomes.map((o) => o.operation),
-      ["create_task", "delete_task"],
+      ordered.outcomes.map((o) => o.operation),
+      ["delete_task", "create_task", "delete_task"],
     );
-    assert.ok(tasks.list().some((item) => item.id === milk.id));
-    assert.ok(!tasks.list().some((item) => item.id === rent.id));
+    assert.deepEqual(
+      tasks.list().map((item) => item.title),
+      ["预约牙医"],
+    );
   }
 });
 
@@ -2049,6 +2068,196 @@ test("CODEX-REVIEW-2 + L4-context-T2 regressions: action-class grounding, multi-
       user("把买牛奶删掉，顺便把取快递删掉。"),
     ]);
     assert.equal(turn.failure, "reference_required");
+    assert.deepEqual(turn.outcomes, []);
+    assert.equal(await readFile(filename, "utf8"), before);
+  }
+});
+
+test("CODEX-REVIEW-3 + L4-forged-missing regressions: clause-0 preservation, chained connectors & fail-closed multi-delete, scoped list variants & priority-after filter, mixed-list batch order & stop-on-not-found, 发消息预约口腔诊所, missing prose stop", async (t) => {
+  // 1a. P1 #1: clause 0 starting with 并 ("并发测试删掉，另外把取快递删掉。") preserves 并发测试 and blocks 发测试
+  {
+    const { tasks, filename } = await setup(t);
+    const concurrent = tasks.create("并发测试");
+    const wrong = tasks.create("发测试");
+    const parcel = tasks.create("取快递");
+    const before = await readFile(filename, "utf8");
+    const blocked = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(call("d-wrong", "delete_task", { candidateIds: [wrong.id] })),
+      ).provider,
+    ).runTurn([user("并发测试删掉，另外把取快递删掉。")]);
+    assert.equal(blocked.failure, "reference_required");
+    assert.equal(await readFile(filename, "utf8"), before);
+
+    const ok = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(
+          call("d1", "delete_task", { candidateIds: [concurrent.id] }),
+          call("d2", "delete_task", { candidateIds: [parcel.id] }),
+        ),
+        final("已删除。"),
+      ).provider,
+    ).runTurn([user("并发测试删掉，另外把取快递删掉。")]);
+    assert.equal(ok.failure, undefined);
+    assert.deepEqual(
+      tasks.list().map((item) => item.title),
+      ["发测试"],
+    );
+  }
+
+  // 1b. P1 #1: chained connectors ("还有也帮我删掉交报告") keep title pinning and block 交水费
+  {
+    const { tasks, filename } = await setup(t);
+    tasks.create("买牛奶");
+    tasks.create("取快递");
+    tasks.create("交报告");
+    const water = tasks.create("交水费");
+    const before = await readFile(filename, "utf8");
+    const turn = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(call("d-wrong", "delete_task", { candidateIds: [water.id] })),
+      ).provider,
+    ).runTurn([user("把买牛奶删掉，顺便把取快递删掉，还有也帮我删掉交报告。")]);
+    assert.equal(turn.failure, "reference_required");
+    assert.deepEqual(turn.outcomes, []);
+    assert.equal(await readFile(filename, "utf8"), before);
+  }
+
+  // 2. P1 #2: "麻烦您列出待完成的任务" and "列出没有完成的任务" stay strictly read-only across all rounds
+  for (const [prompt, badCall] of [
+    [
+      "麻烦您列出待完成的任务",
+      (id: string) => call("u1", "update_task", { candidateIds: [id], changes: { done: false } }),
+    ],
+    ["列出没有完成的任务", (id: string) => call("c1", "complete_task", { candidateIds: [id] })],
+  ] as const) {
+    const { tasks, filename } = await setup(t);
+    const report = tasks.create("交报告");
+    if (prompt.includes("待完成")) tasks.update(report.id, { done: true });
+    const before = await readFile(filename, "utf8");
+    const mock = scripted(
+      proposal(call("l1", "list_tasks", { done: false })),
+      proposal(badCall(report.id)),
+    );
+    const turn = await createAgent(tasks, mock.provider).runTurn([user(prompt)]);
+    assert.ok(turn.failure !== undefined, prompt);
+    assert.deepEqual(turn.outcomes, [], prompt);
+    assert.equal(await readFile(filename, "utf8"), before, prompt);
+  }
+
+  // 3a. P1 #3: batch containing [delete, complete, list] executes complete BEFORE delete
+  {
+    const { tasks } = await setup(t);
+    const milk = tasks.create("买牛奶");
+    const parcel = tasks.create("取快递");
+    const turn = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(
+          call("d1", "delete_task", { candidateIds: [parcel.id] }),
+          call("c1", "complete_task", { candidateIds: [milk.id] }),
+          call("l2", "list_tasks", {}),
+        ),
+        final("已处理。"),
+      ).provider,
+    ).runTurn([user("买牛奶已经完成了，再把取快递删掉。")]);
+    assert.equal(turn.failure, undefined);
+    assert.deepEqual(
+      turn.outcomes.map((o) => o.operation),
+      ["complete_task", "delete_task"],
+    );
+  }
+
+  // 3b. P1 #3: all-write batch stops on task_not_found instead of persisting later delete
+  {
+    const { tasks, filename } = await setup(t);
+    const parcel = tasks.create("取快递");
+    const before = await readFile(filename, "utf8");
+    const turn = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(
+          call("c1", "complete_task", { candidateIds: [] }),
+          call("d1", "delete_task", { candidateIds: [parcel.id] }),
+        ),
+        final("已处理。"),
+      ).provider,
+    ).runTurn([user("买牛奶已经完成了，再把取快递删掉。")]);
+    assert.equal(turn.failure, "task_not_found");
+    assert.deepEqual(turn.outcomes, []);
+    assert.equal(await readFile(filename, "utf8"), before);
+  }
+
+  // 4. P2 #4: "列出优先级为高的待完成任务" requires BOTH done:false and priority:"high"
+  {
+    const { tasks } = await setup(t);
+    tasks.create("高优任务", { priority: "high" });
+    tasks.create("低优任务", { priority: "low" });
+    const bad = await createAgent(
+      tasks,
+      scripted(proposal(call("l1", "list_tasks", { done: false })), final("列表如下。")).provider,
+    ).runTurn([user("列出优先级为高的待完成任务")]);
+    assert.equal(bad.failure, "invalid_arguments");
+    assert.equal(bad.displayedList, undefined);
+
+    const good = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", { done: false, priority: "high" })),
+        final("列表如下。"),
+      ).provider,
+    ).runTurn([user("列出优先级为高的待完成任务")]);
+    assert.equal(good.failure, undefined);
+    assert.deepEqual(
+      good.displayedList?.map((item) => item.title),
+      ["高优任务"],
+    );
+  }
+
+  // 5. P2 #5: "发消息预约口腔诊所" classifies as book_visit and deletes when verified for "预约牙医"
+  {
+    const { tasks } = await setup(t);
+    const dentist = tasks.create("发消息预约口腔诊所");
+    const turn = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(call("d1", "delete_task", { candidateIds: [dentist.id] })),
+        proposal(
+          call("v1", "verify_task_reference", { decision: "match", candidateIds: [dentist.id] }),
+        ),
+      ).provider,
+    ).runTurn([user("把预约牙医删掉")]);
+    assert.equal(turn.failure, undefined);
+    assert.deepEqual(tasks.list(), []);
+  }
+
+  // 6. Live L4-forged-missing: stop prose reporting missing task after lookup returns task_not_found
+  {
+    const { tasks, filename } = await setup(t);
+    tasks.create("交水电费");
+    const before = await readFile(filename, "utf8");
+    const turn = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        final("清单里目前只有「交水电费」，没有找到「去健身房」。"),
+      ).provider,
+    ).runTurn([
+      user("帮我记一下去健身房"),
+      { role: "assistant", content: "已添加待办「去健身房」。" },
+      user("把去健身房标记完成"),
+    ]);
+    assert.equal(turn.failure, "task_not_found");
+    assert.match(turn.reply, /找不到指定的任务/);
     assert.deepEqual(turn.outcomes, []);
     assert.equal(await readFile(filename, "utf8"), before);
   }

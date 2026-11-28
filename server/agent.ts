@@ -319,21 +319,21 @@ type SemanticActionClass =
 function semanticActionClass(text: string): SemanticActionClass | undefined {
   const trimmed = text.trim();
   if (cancelsTaskAction.test(trimmed) || preparatoryTaskCue.test(trimmed)) return undefined;
-  if (/^(?:退|退还|退款|退费)/u.test(trimmed)) return "refund";
-  if (/^(?:交|缴|付|支付|缴纳|结清)/u.test(trimmed)) return "pay";
-  if (/^(?:取|拿|领)/u.test(trimmed)) return "pickup";
-  if (/^(?:寄|发|送)/u.test(trimmed)) return "send";
-  if (/^(?:报销|提交报销|申请报销|报税|申报)/u.test(trimmed)) return "file_claim";
-  if (/^(?:申请|补领|补办|办理|换领)/u.test(trimmed)) return "apply_replace";
   if (
     !nonBookingEndingCue.test(trimmed) &&
     /(?:预约|约诊|挂号|看牙|复诊|门诊)/u.test(trimmed) &&
-    /^(?:(?:打电话|发微信|发消息|联系|去|到|找)?[^，,。]{0,12}?(?:预约|约诊|挂号|看牙|复诊|门诊)|(?:预约|约诊|挂号|看牙|复诊|门诊)[^，,。]{0,8})$/u.test(
+    /^(?:打电话|发微信|发消息|联系|去|到|找)?[^，,。]{0,12}?(?:预约|约诊|挂号|看牙|复诊|门诊)[^，,。]{0,8}$/u.test(
       trimmed,
     )
   ) {
     return "book_visit";
   }
+  if (/^(?:退|退还|退款|退费)/u.test(trimmed)) return "refund";
+  if (/^(?:交|缴|付|支付|缴纳|结清)/u.test(trimmed)) return "pay";
+  if (/^(?:取|拿|领)/u.test(trimmed)) return "pickup";
+  if (/^(?:寄|发(?:快递|包裹|件|货|邮件|信)|送)/u.test(trimmed)) return "send";
+  if (/^(?:报销|提交报销|申请报销|报税|申报)/u.test(trimmed)) return "file_claim";
+  if (/^(?:申请|补领|补办|办理|换领)/u.test(trimmed)) return "apply_replace";
   return undefined;
 }
 
@@ -1446,13 +1446,17 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
               title: string;
               literal: boolean;
               suffixedTitle?: string;
-            }>((clause) => {
-              const action = taskCommand(
-                clause.replace(
-                  /^(?:然后|接着|随后|另外|此外|同时|顺便|顺手|并且|而且|还有|以及|并|也|再)\s*/u,
-                  "",
-                ),
-              );
+            }>((clause, clauseIndex) => {
+              const stripped =
+                clauseIndex > 0
+                  ? clause
+                      .replace(
+                        /^(?:(?:然后|接着|随后|另外|此外|同时|顺便|顺手|并且|而且|还有|以及)\s*)+/u,
+                        "",
+                      )
+                      .replace(/^(?:(?:也|再|并)(?=[把将请帮麻删移清去])\s*)+/u, "")
+                  : clause;
+              const action = taskCommand(stripped);
               if (!action?.explicit || !deleteAction.test(action.action)) return [];
               const name = namedTarget(action.target);
               if (name) return isUnboundTarget(name.title) && !name.literal ? [] : [name];
@@ -1468,6 +1472,11 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
       const deleteClauseCount = clauseAnalysis.positiveClauses.filter(
         (clause) => analyzeClauses(clause).hasDeleteVerb,
       ).length;
+      const hasUnparsedMultiDelete =
+        !parsedDelete &&
+        !activeBoundReference &&
+        deleteClauseCount >= 2 &&
+        mixedDeletions.length < deleteClauseCount;
       const mixedDeletionAllowedTitles =
         mixedDeletions.length > 0 && mixedDeletions.length === deleteClauseCount
           ? new Set(mixedDeletions.map((entry) => entry.title))
@@ -1826,11 +1835,18 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
               : deleteAction.test(command.action)
                 ? "delete_task"
                 : "complete_task";
+          const modelReportedMissing =
+            !clarification &&
+            pendingOp === "complete_task" &&
+            !parsedTarget.literal &&
+            Boolean(
+              modelStopText && /(?:没有找到|找不到|未找到|不存在|清单里没有)/u.test(modelStopText),
+            );
           return finishLookupFailure(
             resolved.error,
             view,
             parsedTarget,
-            clarification,
+            modelReportedMissing ? "task_not_found" : clarification,
             pendingOp,
             editGrant?.changes,
           );
@@ -2564,6 +2580,9 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
         for (const writeCall of writes) {
           const auth = isToolAuthorized(writeCall.function.name);
           if (!auth.ok) return finish(auth.error);
+          if (writeCall.function.name === "delete_task" && hasUnparsedMultiDelete) {
+            return finish("reference_required");
+          }
         }
         if (singleGrant && writes.length && (writes.length > 1 || confirmations.length)) {
           return finish(
@@ -2617,6 +2636,7 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
 
         // When the model emits multiple independent writes in a single batch without a strict
         // orderedOperations plan, execute them in the order their operations appear in the user's clauses.
+        // Enforce user clause order for multi-clause compound turns without a strict orderedOperations plan.
         let orderedCalls = calls;
         const batchCallRanks = new Map<string, number>();
         if (!orderedOperations && writes.length > 0 && clauseAnalysis.positiveClauses.length >= 2) {
@@ -2651,23 +2671,28 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
                 intent.hasMetadataMention,
             )
             .map(({ idx }) => idx);
-          const rankForTool = (toolName: string): number => {
-            const matchingIndices = clauseIntents
+          const matchingIndicesForTool = (toolName: string): number[] =>
+            clauseIntents
               .map((intent, idx) => ({ intent, idx }))
-              .filter(({ intent }) => clauseMatchesTool(intent, toolName));
-            return matchingIndices.length === 1 ? matchingIndices[0].idx : -1;
-          };
-          const rankedWrites = writes.map((call, index) => ({
+              .filter(({ intent }) => clauseMatchesTool(intent, toolName))
+              .map(({ idx }) => idx);
+          const firstListIdx = calls.findIndex((call) => call.function.name === "list_tasks");
+          const lastWriteIdx = calls.findLastIndex((call) => call.function.name !== "list_tasks");
+          if (firstListIdx !== -1 && firstListIdx < lastWriteIdx) {
+            return finish("list_required");
+          }
+          const writeMatches = writes.map((call, index) => ({
             call,
             index,
-            rank: rankForTool(call.function.name),
+            matches: matchingIndicesForTool(call.function.name),
           }));
-          const uniqueRanks = new Set(rankedWrites.map((entry) => entry.rank));
-          if (
-            rankedWrites.every((entry) => entry.rank >= 0) &&
-            uniqueRanks.size === rankedWrites.length
-          ) {
-            const sorted = rankedWrites.sort((a, b) => a.rank - b.rank || a.index - b.index);
+          const allUniqueMatches =
+            writeMatches.every((entry) => entry.matches.length === 1) &&
+            new Set(writeMatches.map((entry) => entry.matches[0])).size === writeMatches.length;
+          if (allUniqueMatches) {
+            const sorted = writeMatches
+              .map((entry) => ({ call: entry.call, index: entry.index, rank: entry.matches[0] }))
+              .sort((a, b) => a.rank - b.rank || a.index - b.index);
             const simulatedDone = new Set(completedClauseRanks);
             for (const entry of sorted) {
               const skippedEarlier = mutationClauseIndices.some(
@@ -2679,19 +2704,32 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
               simulatedDone.add(entry.rank);
               batchCallRanks.set(entry.call.id, entry.rank);
             }
-            if (writes.length === calls.length && calls.length > 1) {
-              orderedCalls = sorted.map((entry) => entry.call);
+            const trailingLists = calls.filter((call) => call.function.name === "list_tasks");
+            orderedCalls = [...sorted.map((entry) => entry.call), ...trailingLists];
+          } else if (writeMatches.every((entry) => entry.matches.length > 0)) {
+            const simulatedDone = new Set(completedClauseRanks);
+            for (const entry of writeMatches) {
+              const assigned = entry.matches.find((idx) => !simulatedDone.has(idx));
+              if (assigned === undefined) {
+                return finish("action_not_executed");
+              }
+              const skippedEarlier = mutationClauseIndices.some(
+                (prevIdx) => prevIdx < assigned && !simulatedDone.has(prevIdx),
+              );
+              if (skippedEarlier) {
+                return finish("action_not_executed");
+              }
+              simulatedDone.add(assigned);
+              batchCallRanks.set(entry.call.id, assigned);
             }
           }
         }
 
         let listedInBatch = false;
-        for (let idx = 0; idx < orderedCalls.length; idx++) {
-          const call = orderedCalls[idx];
+        for (const call of orderedCalls) {
           if (signal.aborted) return finish("deadline");
           const { name } = call.function;
           let args = call.function.arguments;
-          const hasRemainingCallsInBatch = idx < orderedCalls.length - 1;
 
           if (listedInBatch && ["complete_task", "delete_task", "update_task"].includes(name)) {
             return finish("list_required");
@@ -2852,18 +2890,16 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
               });
               continue;
             }
-            // Safe continuation for recoverable task_not_found in compound batches or after earlier writes.
-            if (
-              result.error === "task_not_found" &&
-              (hasRemainingCallsInBatch || outcomes.length > 0 || trailingList.wantsList)
-            ) {
-              deferredFailure = "task_not_found";
-              transcript.push({
-                role: "tool",
-                tool_call_id: call.id,
-                content: JSON.stringify(result),
-              });
-              continue;
+            // Stop immediately when a write returns task_not_found instead of continuing to later writes.
+            if (result.error === "task_not_found") {
+              if (outcomes.length > 0) {
+                ensurePostMutationListIfRequested();
+                return finish("task_not_found");
+              }
+              if (displayedList !== undefined) {
+                return finishAfterLookup("task_not_found");
+              }
+              return finish("task_not_found");
             }
             // Safe continuation for recoverable list_required after earlier writes succeeded in a compound turn.
             if (result.error === "list_required" && outcomes.length > 0) {
@@ -2873,9 +2909,6 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
                 content: JSON.stringify(result),
               });
               continue;
-            }
-            if (result.error === "task_not_found" && displayedList !== undefined) {
-              return finishAfterLookup("task_not_found");
             }
             return finish(result.error);
           }
