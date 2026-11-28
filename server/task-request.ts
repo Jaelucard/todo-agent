@@ -284,7 +284,14 @@ export function extractTrailingListRequest(input: string): {
   }
   const lastClause = clauses.at(-1)!;
   const maskedLast = maskQuotedTitles(lastClause);
-  if (clauseNegationPattern.test(maskedLast) || !trailingListClausePattern.test(maskedLast)) {
+  const compactMaskedLast = compactCjkSpaces(maskedLast);
+  const strippedLast = lastClause
+    .trim()
+    .replace(/^(?:(?:再|然后|最后|顺便|顺手|并|并且|同时|接着|之后|另外)\s*)+/u, "");
+  if (
+    clauseNegationPattern.test(compactMaskedLast) ||
+    !(trailingListClausePattern.test(compactMaskedLast) || isPureListClause(strippedLast))
+  ) {
     return { wantsList: false, commandText: input.trim(), filter: {} };
   }
   const filter = parseListFilterFromText(maskedLast);

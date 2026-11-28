@@ -3762,3 +3762,281 @@ test("review round 12 regressions (80339550): known-title preservation across de
     assert.doesNotMatch(turn.reply, /买牛奶/u);
   }
 });
+
+test("review round 13 regressions (0bf7d073): quoted completion unquoting, clause-scoped disambiguation policy, seenTaskTitles across create+delete, compound update value/target pinning, trailing 只查看, verb-first/long-title/demonstrative reopen, final list preservation, and orig-L5d stop prose", async (t) => {
+  // 1. P1 #1: "删掉买牛奶，「寄合同」完成了" completes 寄合同 and rejects literal bracketed 「寄合同」
+  {
+    const { tasks } = await setup(t);
+    const milk = tasks.create("买牛奶");
+    const contract = tasks.create("寄合同");
+    const bracketed = tasks.create("「寄合同」");
+    const wrong = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(
+          call("d1", "delete_task", { candidateIds: [milk.id] }),
+          call("c1", "complete_task", { candidateIds: [bracketed.id] }),
+        ),
+        final("收到。"),
+      ).provider,
+    ).runTurn([user("删掉买牛奶，「寄合同」完成了")]);
+    assert.ok(wrong.failure);
+    assert.equal(tasks.list().find((item) => item.id === bracketed.id)?.done, false);
+    assert.equal(tasks.list().find((item) => item.id === contract.id)?.done, false);
+  }
+  {
+    const { tasks } = await setup(t);
+    const milk = tasks.create("买牛奶");
+    const contract = tasks.create("寄合同");
+    tasks.create("「寄合同」");
+    const right = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(
+          call("d1", "delete_task", { candidateIds: [milk.id] }),
+          call("c1", "complete_task", { candidateIds: [contract.id] }),
+        ),
+        final("收到。"),
+      ).provider,
+    ).runTurn([user("删掉买牛奶，「寄合同」完成了")]);
+    assert.equal(right.failure, undefined);
+    assert.equal(tasks.list().find((item) => item.id === contract.id)?.done, true);
+  }
+
+  // 2. P1 #2: duplicate-title disambiguation keeps rename clause's policy (rejects done:false on follow-up #1)
+  {
+    const { tasks } = await setup(t);
+    const c1 = tasks.update(tasks.create("寄合同").id, { done: true })!;
+    const c2 = tasks.update(tasks.create("寄合同").id, { done: true })!;
+    tasks.update(tasks.create("交房租").id, { done: true });
+    const agent = createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(
+          call("u1", "update_task", {
+            candidateIds: [c1.id, c2.id],
+            changes: { title: "寄新合同" },
+          }),
+        ),
+        proposal(
+          call("u2", "update_task", {
+            useBoundReference: true,
+            changes: { done: false },
+          }),
+        ),
+      ).provider,
+    );
+    const q = await agent.runTurn([user("把寄合同改名为寄新合同，再把交房租改回未完成")]);
+    assert.equal(q.failure, "ambiguous_reference");
+    const follow = await agent.runTurn([
+      user("把寄合同改名为寄新合同，再把交房租改回未完成"),
+      { role: "assistant", content: q.reply },
+      user("#1"),
+    ]);
+    assert.ok(follow.failure);
+    assert.equal(tasks.list().find((item) => item.id === c1.id)?.done, true);
+  }
+
+  // 3. P1 #3: "新增「再看合同」，删掉「再看合同」，再看合同完成了" does not redirect completion to 看合同
+  {
+    const { tasks } = await setup(t);
+    const existing = tasks.create("看合同");
+    const turn = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("add1", "create_task", { title: "再看合同" })),
+        proposal(call("l1", "list_tasks", {})),
+        (request: Parameters<ModelProvider>[0]) => {
+          const last = request.messages.at(-1);
+          const listed = JSON.parse(String(last?.content ?? "{}")).tasks as Array<{
+            id: string;
+            title: string;
+          }>;
+          const added = listed.find((item) => item.title === "再看合同")!;
+          return proposal(
+            call("d1", "delete_task", { candidateIds: [added.id] }),
+            call("c1", "complete_task", { candidateIds: [existing.id] }),
+          );
+        },
+        final("收到。"),
+      ).provider,
+    ).runTurn([user("新增「再看合同」，删掉「再看合同」，再看合同完成了")]);
+    assert.ok(turn.failure);
+    assert.equal(tasks.list().find((item) => item.id === existing.id)?.done, false);
+  }
+
+  // 4. P1 #4: compound update enforces explicit rename value, blocks done:true from title "完成周报", and pins metadata targets
+  {
+    const { tasks, filename } = await setup(t);
+    const contract = tasks.update(tasks.create("寄合同").id, { done: true })!;
+    const rent = tasks.update(tasks.create("交房租").id, { done: true })!;
+    const before = await readFile(filename, "utf8");
+    const wrongTitle = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(
+          call("u1", "update_task", { candidateIds: [contract.id], changes: { title: "写周报" } }),
+          call("u2", "update_task", { candidateIds: [rent.id], changes: { done: false } }),
+        ),
+        final("收到。"),
+      ).provider,
+    ).runTurn([user("把寄合同改名为寄新合同，再把交房租改回未完成")]);
+    assert.ok(wrongTitle.failure);
+    assert.equal(await readFile(filename, "utf8"), before);
+  }
+  {
+    const { tasks, filename } = await setup(t);
+    const contract = tasks.create("寄合同");
+    const rent = tasks.update(tasks.create("交房租").id, { done: true })!;
+    const before = await readFile(filename, "utf8");
+    const extraDone = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(
+          call("u1", "update_task", {
+            candidateIds: [contract.id],
+            changes: { title: "完成周报", done: true },
+          }),
+          call("u2", "update_task", { candidateIds: [rent.id], changes: { done: false } }),
+        ),
+        final("收到。"),
+      ).provider,
+    ).runTurn([user("把寄合同改名为完成周报，再把交房租改回未完成")]);
+    assert.ok(extraDone.failure);
+    assert.equal(await readFile(filename, "utf8"), before);
+  }
+  {
+    const { tasks, filename } = await setup(t);
+    const contract = tasks.create("寄合同");
+    const rent = tasks.create("交房租");
+    const before = await readFile(filename, "utf8");
+    const swapped = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(
+          call("u1", "update_task", { candidateIds: [rent.id], changes: { priority: "high" } }),
+          call("u2", "update_task", {
+            candidateIds: [contract.id],
+            changes: { workload: "large" },
+          }),
+        ),
+        final("收到。"),
+      ).provider,
+    ).runTurn([user("把寄合同的优先级改为高，再把交房租的工作量改为大")]);
+    assert.ok(swapped.failure);
+    assert.equal(await readFile(filename, "utf8"), before);
+  }
+
+  // 5. P1 #5: "删掉买牛奶，最后只查看未完成的任务" strips trailing list and blocks reopening 寄合同
+  {
+    const { tasks } = await setup(t);
+    const milk = tasks.create("买牛奶");
+    const contract = tasks.update(tasks.create("寄合同").id, { done: true })!;
+    const turn = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(
+          call("d1", "delete_task", { candidateIds: [milk.id] }),
+          call("u1", "update_task", { candidateIds: [contract.id], changes: { done: false } }),
+        ),
+        final("收到。"),
+      ).provider,
+    ).runTurn([user("删掉买牛奶，最后只查看未完成的任务")]);
+    assert.ok(turn.failure);
+    assert.equal(tasks.list().find((item) => item.id === contract.id)?.done, true);
+  }
+
+  // 6. P1 #6: "重新打开寄合同" pins 寄合同; >40-char standalone completion pins full title
+  {
+    const { tasks, filename } = await setup(t);
+    tasks.update(tasks.create("寄合同").id, { done: true });
+    const rent = tasks.update(tasks.create("交房租").id, { done: true })!;
+    const before = await readFile(filename, "utf8");
+    const wrong = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(call("u1", "update_task", { candidateIds: [rent.id], changes: { done: false } })),
+        final("收到。"),
+      ).provider,
+    ).runTurn([user("重新打开寄合同")]);
+    assert.ok(wrong.failure);
+    assert.equal(await readFile(filename, "utf8"), before);
+  }
+  {
+    const { tasks, filename } = await setup(t);
+    const longTitle = `完成 Q3${"预算".repeat(19)}`;
+    tasks.create(longTitle);
+    const milk = tasks.create("买牛奶");
+    const before = await readFile(filename, "utf8");
+    const wrong = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(call("c1", "complete_task", { candidateIds: [milk.id] })),
+        final("收到。"),
+      ).provider,
+    ).runTurn([user(`${longTitle}完成了`)]);
+    assert.ok(wrong.failure);
+    assert.equal(await readFile(filename, "utf8"), before);
+  }
+
+  // 7. P2 #1 & #2: "把寄合同这条任务重新打开" succeeds; "列出已完成的任务，然后删掉买牛奶，最后查看所有任务" returns final list
+  {
+    const { tasks } = await setup(t);
+    const contract = tasks.update(tasks.create("寄合同").id, { done: true })!;
+    const turn = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(
+          call("u1", "update_task", { candidateIds: [contract.id], changes: { done: false } }),
+        ),
+        final("收到。"),
+      ).provider,
+    ).runTurn([user("把寄合同这条任务重新打开")]);
+    assert.equal(turn.failure, undefined);
+    assert.equal(tasks.list().find((item) => item.id === contract.id)?.done, false);
+  }
+  {
+    const { tasks } = await setup(t);
+    const milk = tasks.create("买牛奶");
+    tasks.update(tasks.create("取快递").id, { done: true });
+    tasks.create("写周报");
+    const turn = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(call("d1", "delete_task", { candidateIds: [milk.id] })),
+        final("收到。"),
+      ).provider,
+    ).runTurn([user("列出已完成的任务，然后删掉买牛奶，最后查看所有任务")]);
+    assert.equal(turn.failure, undefined);
+    assert.deepEqual(
+      turn.displayedList?.map((item) => item.title),
+      ["取快递", "写周报"],
+    );
+  }
+
+  // 8. Live orig-L5d stop-prose variant: "把不存在的「修电脑」删掉" with stop prose returns exact_title_not_found
+  {
+    const { tasks } = await setup(t);
+    tasks.create("写周报");
+    const turn = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        final("当前清单里没有“修电脑”这个任务，只有“写周报”，所以没有删除任何内容。"),
+      ).provider,
+    ).runTurn([user("把不存在的「修电脑」删掉")]);
+    assert.equal(turn.failure, "exact_title_not_found");
+    assert.match(turn.reply, /没有完全同名/u);
+  }
+});
