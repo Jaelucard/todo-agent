@@ -1492,6 +1492,13 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
         mixedDeletions.length > 0 && mixedDeletions.length === deleteClauseCount
           ? new Set(mixedDeletions.map((entry) => entry.title))
           : undefined;
+      let initialStoredTitles = new Set<string>();
+      try {
+        initialStoredTitles = new Set(tasks.list().map((task) => task.title));
+      } catch {
+        initialStoredTitles = new Set<string>();
+      }
+
       function extractExplicitUpdateTarget(
         clause: string,
         includeConnectors: boolean,
@@ -1501,7 +1508,7 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
           "",
         );
         const reopenMatch =
-          /^(?:把|将)\s*(.+?)\s*(?:改回|恢复(?:为|成)?|退回(?:为|成)?|变回|重置(?:为|成)?|重新(?:打开|开启|标记(?:为|成)?|设为|变为)|标(?:记)?(?:为|成)?|设(?:置)?(?:为|成)?)(?:未|待)完成$/u.exec(
+          /^(?:把|将)\s*(.+?)\s*(?:(?:改回|恢复(?:为|成)?|退回(?:为|成)?|变回|重置(?:为|成)?|重新(?:打开|开启|标记(?:为|成)?|设为|变为)|标(?:记)?(?:为|成)?|设(?:置)?(?:为|成)?)\s*(?:未|待)完成(?:状态)?|(?:重新(?:打开|开启)|恢复|退回|重置)(?:一下|下)?)$/u.exec(
             stripped,
           ) ?? /^(?:取消|撤销)\s*(.+?)\s*的?(?:已)?完成(?:状态)?$/u.exec(stripped);
         const renameMatch =
@@ -1519,7 +1526,7 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
 
       function resolveMixedCompletionForClause(
         clauseIndex: number,
-        storedTitles: Set<string>,
+        knownTitles: Set<string>,
       ): { clauseIndex: number; title: string; literal: boolean } | undefined {
         if (
           activeBoundReference ||
@@ -1530,6 +1537,20 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
         }
         const clause = clauseAnalysis.positiveClauses[clauseIndex];
         if (!clause || isPureListClause(clause)) return undefined;
+        const rawTrimmed = clause.trim().replace(/吧?[。！？.!?]?$/u, "");
+        if (
+          !/(?:改回|未完成|待完成|取消(?:已)?完成|重新打开|重命名|改名|更名)/u.test(
+            maskQuotedTitles(rawTrimmed),
+          )
+        ) {
+          const rawSuffix = targetFirstAction.exec(rawTrimmed);
+          if (rawSuffix && !deleteAction.test(rawSuffix[2])) {
+            const fullTitle = rawSuffix[1].trim().replace(/(?:已经|已)$/u, "");
+            if (knownTitles.has(fullTitle)) {
+              return { title: fullTitle, literal: false, clauseIndex };
+            }
+          }
+        }
         const action = taskCommand(clause, clauseIndex > 0);
         let rawTarget: string | undefined;
         let isExplicit = false;
@@ -1561,7 +1582,7 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
             if (!suffixMatch || deleteAction.test(suffixMatch[2])) continue;
             const possibleTitle = suffixMatch[1].trim().replace(/(?:已经|已)$/u, "");
             if (candidate === baseStripped && candidateTexts.length > 1) {
-              if (storedTitles.has(possibleTitle)) {
+              if (knownTitles.has(possibleTitle)) {
                 rawTarget = suffixMatch[1];
                 break;
               }
@@ -1616,6 +1637,12 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
         mixedUpdates.map((entry) => [entry.clauseIndex, entry]),
       );
       const mixedUpdate = mixedUpdates.length === 1 ? mixedUpdates[0] : undefined;
+      const leadingListFilter =
+        !activeBoundReference &&
+        clauseAnalysis.positiveClauses.length >= 2 &&
+        isPureListClause(clauseAnalysis.positiveClauses[0])
+          ? expectedScopedListFilter(clauseAnalysis.positiveClauses[0])
+          : undefined;
       const leadingList =
         !activeBoundReference &&
         !trailingList.wantsList &&
@@ -1623,13 +1650,13 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
         isPureListClause(clauseAnalysis.positiveClauses[0])
           ? {
               wantsList: true,
-              filter: expectedScopedListFilter(clauseAnalysis.positiveClauses[0]) ?? {},
+              filter: leadingListFilter ?? {},
             }
           : { wantsList: false, filter: {} as ListTasksFilter };
       requiredLeadingListFilter =
-        leadingList.wantsList && Object.keys(leadingList.filter).length > 0
-          ? leadingList.filter
-          : undefined;
+        (trailingList.wantsList && Object.keys(trailingList.filter).length > 0
+          ? trailingList.filter
+          : undefined) ?? leadingListFilter;
       const rawTurnClauseIntents =
         clauseAnalysis.positiveClauses.length >= 2
           ? clauseAnalysis.positiveClauses.map((clause) =>
@@ -1949,17 +1976,20 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
 
       // For a short completion fragment, use the written name only to suggest choices.
       // A single partial match still requires normal resolution.
-      const completionName =
+      const rawCompletionName =
         clauseAnalysis.hasCompleteVerb &&
         !clauseAnalysis.hasDeleteVerb &&
         !clauseAnalysis.hasPositiveCreateCommand &&
         !clauseAnalysis.allowReopen &&
         !clauseAnalysis.allowRename &&
-        !clauseAnalysis.hasMetadataMention
-          ? /^([\p{L}\p{N}]{2,40}?)(?:(?:这|那)(?:一)?[条项](?:任务|待办)?)?(?:已经|已)?(?:完成了|做完了|搞定了)[。！!]?$/u.exec(
-              commandInput,
-            )?.[1]
+        !clauseAnalysis.hasMetadataMention &&
+        !/^(?:把|将)/u.test(commandInput)
+          ? /^([^\r\n，,；;。？！!?]{2,40}?)(?:(?:这|那)(?:一)?[条项](?:任务|待办)?)?(?:已经|已)?(?:完成了|做完了|搞定了)[。！!]?$/u
+              .exec(commandInput)?.[1]
+              ?.trim()
           : undefined;
+      const completionName =
+        rawCompletionName && !isUnboundTarget(rawCompletionName) ? rawCompletionName : undefined;
       const unquotedCompletionName = exactComplete?.literal
         ? undefined
         : (exactComplete?.title ?? completionName);
@@ -3106,18 +3136,20 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
             name === "delete_task" && callRank !== undefined
               ? mixedDeleteByClauseIndex.get(callRank)
               : undefined;
-          let liveStoredTitles = new Set<string>();
+          let knownStoredTitles = new Set<string>(initialStoredTitles);
           if (name === "complete_task" && clauseAnalysis.clauseCount > 1 && !activeBoundReference) {
             try {
-              liveStoredTitles = new Set(tasks.list().map((task) => task.title));
+              for (const task of tasks.list()) {
+                knownStoredTitles.add(task.title);
+              }
             } catch {
-              liveStoredTitles = new Set<string>();
+              knownStoredTitles = new Set<string>(initialStoredTitles);
             }
           }
           const liveMixedCompletions =
             name === "complete_task" && clauseAnalysis.clauseCount > 1 && !activeBoundReference
               ? clauseAnalysis.positiveClauses.flatMap((_, idx) => {
-                  const resolved = resolveMixedCompletionForClause(idx, liveStoredTitles);
+                  const resolved = resolveMixedCompletionForClause(idx, knownStoredTitles);
                   return resolved ? [resolved] : [];
                 })
               : [];
@@ -3136,6 +3168,10 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
           const rankedUpdate =
             name === "update_task" && callRank !== undefined
               ? mixedUpdateByClauseIndex.get(callRank)
+              : undefined;
+          const rankedUpdateIntent =
+            name === "update_task" && callRank !== undefined && !activeBoundReference
+              ? turnClauseIntents[callRank]
               : undefined;
           const title =
             planned?.title ??
@@ -3161,7 +3197,20 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
               });
             }
           }
-          const baseGrant = grantForTool(name);
+          const rawBaseGrant = grantForTool(name);
+          const baseGrant =
+            rankedUpdateIntent && !singleGrant
+              ? {
+                  ...rawBaseGrant,
+                  allowedPriorities: rankedUpdateIntent.allowedPriorities,
+                  allowedWorkloads: rankedUpdateIntent.allowedWorkloads,
+                  allowTitleChange: rankedUpdateIntent.allowRename,
+                  allowDoneValues: new Set<boolean>([
+                    ...(rankedUpdateIntent.allowReopen ? [false] : []),
+                    ...(rankedUpdateIntent.hasCompleteVerb ? [true] : []),
+                  ]),
+                }
+              : rawBaseGrant;
           const mixedAllowedTitles =
             name === "delete_task"
               ? mixedDeletionAllowedTitles

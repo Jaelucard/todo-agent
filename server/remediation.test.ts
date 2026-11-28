@@ -3605,3 +3605,160 @@ test("review round 11 regressions (e34070b0): 只/spaced list filters, narrative
     assert.doesNotMatch(turn.reply, /买牛奶/u);
   }
 });
+
+test("review round 12 regressions (80339550): known-title preservation across delete/create, 完成过的 list, 重新打开 reopen pinning, per-clause update field auth, spaced completion title, and trailing list filter on error", async (t) => {
+  // 1. P1 #1: "删掉「再看合同」，再看合同完成了" does not redirect completion to 看合同 after deleting 再看合同
+  {
+    const { tasks } = await setup(t);
+    const full = tasks.create("再看合同");
+    const short = tasks.create("看合同");
+    const turn = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(
+          call("d1", "delete_task", { candidateIds: [full.id] }),
+          call("c1", "complete_task", { candidateIds: [short.id] }),
+        ),
+        final("收到。"),
+      ).provider,
+    ).runTurn([user("删掉「再看合同」，再看合同完成了")]);
+    assert.ok(turn.failure);
+    assert.equal(tasks.list().find((item) => item.id === short.id)?.done, false);
+  }
+
+  // 2. P1 #2: "新增「再完成预算」，再完成预算完成了" checks live store before stripping 再
+  {
+    const { tasks } = await setup(t);
+    const existing = tasks.create("完成预算");
+    const turn = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("add1", "create_task", { title: "再完成预算" })),
+        proposal(call("l1", "list_tasks", {})),
+        proposal(call("c1", "complete_task", { candidateIds: [existing.id] })),
+        final("收到。"),
+      ).provider,
+    ).runTurn([user("新增「再完成预算」，再完成预算完成了")]);
+    assert.ok(turn.failure);
+    assert.equal(tasks.list().find((item) => item.id === existing.id)?.done, false);
+    assert.equal(tasks.list().find((item) => item.title === "再完成预算")?.done, false);
+  }
+
+  // 3. P1 #3: "只看完成过的任务" stays strictly read-only
+  {
+    const { tasks, filename } = await setup(t);
+    const milk = tasks.create("买牛奶");
+    const before = await readFile(filename, "utf8");
+    const turn = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(call("c1", "complete_task", { candidateIds: [milk.id] })),
+        final("已完成。"),
+      ).provider,
+    ).runTurn([user("只看完成过的任务")]);
+    assert.ok(turn.failure);
+    assert.deepEqual(turn.outcomes, []);
+    assert.equal(await readFile(filename, "utf8"), before);
+  }
+
+  // 4. P1 #4: "把寄合同重新打开" pins reopen target to 寄合同
+  {
+    const { tasks, filename } = await setup(t);
+    const contract = tasks.update(tasks.create("寄合同").id, { done: true })!;
+    const rent = tasks.update(tasks.create("交房租").id, { done: true })!;
+    const before = await readFile(filename, "utf8");
+    const wrong = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(call("u1", "update_task", { candidateIds: [rent.id], changes: { done: false } })),
+        final("收到。"),
+      ).provider,
+    ).runTurn([user("把寄合同重新打开")]);
+    assert.ok(wrong.failure);
+    assert.equal(await readFile(filename, "utf8"), before);
+
+    const right = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(
+          call("u1", "update_task", { candidateIds: [contract.id], changes: { done: false } }),
+        ),
+        final("收到。"),
+      ).provider,
+    ).runTurn([user("把寄合同重新打开")]);
+    assert.equal(right.failure, undefined);
+    assert.equal(tasks.list().find((item) => item.id === contract.id)?.done, false);
+  }
+
+  // 5. P1 #5: "把寄合同改名为寄新合同，再把交房租改回未完成" enforces per-clause update field authorization
+  {
+    const { tasks, filename } = await setup(t);
+    const contract = tasks.update(tasks.create("寄合同").id, { done: true })!;
+    tasks.update(tasks.create("交房租").id, { done: true });
+    const before = await readFile(filename, "utf8");
+    const wrongField = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(
+          call("u1", "update_task", { candidateIds: [contract.id], changes: { done: false } }),
+        ),
+        final("收到。"),
+      ).provider,
+    ).runTurn([user("把寄合同改名为寄新合同，再把交房租改回未完成")]);
+    assert.ok(wrongField.failure);
+    assert.deepEqual(wrongField.outcomes, []);
+    assert.equal(await readFile(filename, "utf8"), before);
+  }
+
+  // 6. P1 #6: "完成 Q3预算完成了" binds spaced title and rejects completing 取快递
+  {
+    const { tasks, filename } = await setup(t);
+    const budget = tasks.create("完成 Q3预算");
+    const parcel = tasks.create("取快递");
+    const before = await readFile(filename, "utf8");
+    const wrong = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(call("c1", "complete_task", { candidateIds: [parcel.id] })),
+        final("收到。"),
+      ).provider,
+    ).runTurn([user("完成 Q3预算完成了")]);
+    assert.ok(wrong.failure);
+    assert.equal(await readFile(filename, "utf8"), before);
+
+    const right = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(call("c1", "complete_task", { candidateIds: [budget.id] })),
+        final("收到。"),
+      ).provider,
+    ).runTurn([user("完成 Q3预算完成了")]);
+    assert.equal(right.failure, undefined);
+    assert.equal(tasks.list().find((item) => item.id === budget.id)?.done, true);
+  }
+
+  // 7. P2 #1: "列出完成了的任务，然后删掉买牛奶，最后查看未完成的任务" clears unfiltered displayedList on rejected write
+  {
+    const { tasks } = await setup(t);
+    tasks.create("买牛奶");
+    const parcel = tasks.update(tasks.create("取快递").id, { done: true })!;
+    const turn = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(call("d1", "delete_task", { candidateIds: [parcel.id] })),
+        final("收到。"),
+      ).provider,
+    ).runTurn([user("列出完成了的任务，然后删掉买牛奶，最后查看未完成的任务")]);
+    assert.equal(turn.failure, "reference_required");
+    assert.equal(turn.displayedList, undefined);
+    assert.doesNotMatch(turn.reply, /买牛奶/u);
+  }
+});
