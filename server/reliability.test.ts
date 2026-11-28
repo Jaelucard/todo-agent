@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { reliabilityCases } from "./reliability-cases.ts";
 import { evaluateReliabilityCase, summarizeReliability } from "./reliability-eval.ts";
+import { createJsonTaskStore } from "./task-store.ts";
 
 const missingTask = reliabilityCases.find((fixture) => fixture.id === "nonexistent-named-task");
 assert.ok(missingTask);
@@ -118,41 +119,52 @@ test("the reliability evaluator catches a committed change to the wrong task", a
     { id: "milk", title: "买牛奶", done: false },
     { id: "parcel", title: "取快递", done: false },
   ];
-  const result = await evaluateReliabilityCase({
-    id: "evaluator-wrong-target",
-    category: "scoring",
-    initial: before,
-    turns: [
-      {
-        input: "牛奶买好了",
-        state: [{ ...before[0], done: true }, before[1]],
-        mutations: [{ operation: "complete_task", title: "买牛奶", id: "milk" }],
-        mock(index) {
-          if (index > 1) {
-            return { finish_reason: "stop", message: { role: "assistant", content: "好。" } };
-          }
-          const list = index === 0;
-          return {
-            finish_reason: "tool_calls",
-            message: {
-              role: "assistant",
-              content: null,
-              tool_calls: [
-                {
-                  id: String(index),
-                  type: "function",
-                  function: {
-                    name: list ? "list_tasks" : "complete_task",
-                    arguments: list ? "{}" : '{"candidateIds":["parcel"]}',
+  const result = await evaluateReliabilityCase(
+    {
+      id: "evaluator-wrong-target",
+      category: "scoring",
+      initial: before,
+      turns: [
+        {
+          input: "牛奶买好了",
+          state: [{ ...before[0], done: true }, before[1]],
+          mutations: [{ operation: "complete_task", title: "买牛奶", id: "milk" }],
+          mock(index) {
+            if (index > 1) {
+              return { finish_reason: "stop", message: { role: "assistant", content: "好。" } };
+            }
+            const list = index === 0;
+            return {
+              finish_reason: "tool_calls",
+              message: {
+                role: "assistant",
+                content: null,
+                tool_calls: [
+                  {
+                    id: String(index),
+                    type: "function",
+                    function: {
+                      name: list ? "list_tasks" : "complete_task",
+                      arguments: list ? "{}" : '{"candidateIds":["milk"]}',
+                    },
                   },
-                },
-              ],
-            },
-          };
+                ],
+              },
+            };
+          },
         },
-      },
-    ],
-  });
+      ],
+    },
+    undefined,
+    (filename) => {
+      const store = createJsonTaskStore(filename);
+      return {
+        ...store,
+        // Inject a persisted misdirection even though the agent authorizes the right ID.
+        update: (_id, changes) => store.update("parcel", changes),
+      };
+    },
+  );
   assert.equal(result.passed, false);
   assert.deepEqual(result.turns[0].after, [before[0], { ...before[1], done: true }]);
   assert.equal(result.turns[0].taskStateCorrect, false);

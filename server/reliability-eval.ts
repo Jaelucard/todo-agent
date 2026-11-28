@@ -145,11 +145,11 @@ async function snapshot(file: string) {
 
 async function evaluateTurn(
   filename: string,
+  tasks: ReturnType<typeof createJsonTaskStore>,
   messages: ChatMessage[],
   expected: ReliabilityTurn,
   provider?: ModelProvider,
 ) {
-  const tasks = createJsonTaskStore(filename);
   const before = tasks.list().map(readTaskSummary);
   const beforeSnapshot = await snapshot(filename);
   const proposedTools: string[] = [];
@@ -302,18 +302,23 @@ async function evaluateTurn(
   };
 }
 
-export async function evaluateReliabilityCase(fixture: ReliabilityCase, provider?: ModelProvider) {
+export async function evaluateReliabilityCase(
+  fixture: ReliabilityCase,
+  provider?: ModelProvider,
+  createStore = createJsonTaskStore,
+) {
   const directory = await mkdtemp(join(tmpdir(), "todo-agent-c4-"));
   const filename = join(directory, "tasks.json");
   const messages: ChatMessage[] = [];
   const turns: Awaited<ReturnType<typeof evaluateTurn>>[] = [];
   try {
     await writeFile(filename, JSON.stringify(fixture.initial), { mode: 0o600 });
+    const tasks = createStore(filename);
     for (const expected of fixture.turns) {
       const blocked = `${filename}.tmp`;
       if (expected.blockedWrite) await mkdir(blocked);
       try {
-        turns.push(await evaluateTurn(filename, messages, expected, provider));
+        turns.push(await evaluateTurn(filename, tasks, messages, expected, provider));
       } finally {
         if (expected.blockedWrite) await rm(blocked, { recursive: true, force: true });
       }

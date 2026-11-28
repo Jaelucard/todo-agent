@@ -227,7 +227,7 @@ export const reliabilityCases: ReliabilityCase[] = [
         mock: script(calls(create(milk.title), create(parcel.title)), stop("还需要帮忙吗？")),
         state: [newMilk, newParcel],
         mutations: [addMilk, addParcel],
-        mockRequestCount: 2,
+        mockRequestCount: 0,
       },
     ],
   },
@@ -323,7 +323,7 @@ export const reliabilityCases: ReliabilityCase[] = [
     initial: [],
     turns: [
       {
-        input: "记一条买牛奶",
+        input: "帮我记一下买牛奶",
         mock: script(
           calls(create(milk.title)),
           calls(call("different-id", "create_task", { title: milk.title })),

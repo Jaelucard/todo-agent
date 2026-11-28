@@ -16,6 +16,7 @@ export type ListTasksFilter = z.infer<typeof listTaskFilterSchema>;
 export interface RequestedTarget {
   title?: string;
   changes?: TaskUpdateChanges;
+  requiredChanges?: TaskUpdateChanges;
   requireExactMetadata?: boolean;
   allowedPriorities?: ReadonlySet<NonNullable<TaskMetadata["priority"]>>;
   allowedWorkloads?: ReadonlySet<NonNullable<TaskMetadata["workload"]>>;
@@ -71,6 +72,14 @@ function matchesFilter(task: Task, filter: ListTasksFilter): boolean {
   if (filter.priority !== undefined && task.priority !== filter.priority) return false;
   if (filter.workload !== undefined && task.workload !== filter.workload) return false;
   return true;
+}
+
+function allowsTargetTitle(title: string, grant?: RequestedTarget): boolean {
+  return (
+    !grant?.forbiddenTitles?.has(title) &&
+    (grant?.title === undefined || grant.title === title) &&
+    (!grant?.allowedTitles || grant.allowedTitles.has(title))
+  );
 }
 
 // Create one toolkit per turn. A bound reference comes from trusted server context.
@@ -137,6 +146,9 @@ export function createTaskTools(tasks: TaskStore, boundReference?: BoundReferenc
           const titles = new Set(matched.map((item) => item.title));
           if (titles.size === 1) {
             const sharedTitle = matched[0].title;
+            if (!allowsTargetTitle(sharedTitle, grant)) {
+              return { ok: false, error: "reference_required" };
+            }
             const allWithTitle = current.filter((item) => item.title === sharedTitle);
             const pendingWithTitle = allWithTitle.filter((item) => !item.done);
             if (
@@ -160,6 +172,9 @@ export function createTaskTools(tasks: TaskStore, boundReference?: BoundReferenc
         if (!found) return { ok: false, error: "task_not_found" };
         if (!observedIds.has(id)) return { ok: false, error: "list_required" };
         if (duplicateId) return { ok: false, error: "ambiguous_reference" };
+        if (!allowsTargetTitle(found.title, grant)) {
+          return { ok: false, error: "reference_required" };
+        }
         const sameTitleTasks = current.filter((task) => task.title === found.title);
         if (sameTitleTasks.length > 1) {
           // For complete_task ONLY: allow unambiguous completion when uniquely one copy is pending.
@@ -183,13 +198,7 @@ export function createTaskTools(tasks: TaskStore, boundReference?: BoundReferenc
       target = found;
     }
 
-    if (grant?.forbiddenTitles?.has(target.title)) {
-      return { ok: false, error: "reference_required" };
-    }
-    if (grant?.title !== undefined && target.title !== grant.title) {
-      return { ok: false, error: "reference_required" };
-    }
-    if (grant?.allowedTitles && !grant.allowedTitles.has(target.title)) {
+    if (!allowsTargetTitle(target.title, grant)) {
       return { ok: false, error: "reference_required" };
     }
     return { ok: true, task: target };
@@ -238,6 +247,15 @@ export function createTaskTools(tasks: TaskStore, boundReference?: BoundReferenc
     const changes = input.data.changes;
 
     if (grant) {
+      const required = grant.requiredChanges;
+      if (
+        required &&
+        (["title", "done", "priority", "workload"] as const).some(
+          (field) => changes[field] !== required[field],
+        )
+      ) {
+        return { ok: false, error: "invalid_arguments" };
+      }
       if (grant.requireExactMetadata) {
         if (
           changes.title !== undefined ||

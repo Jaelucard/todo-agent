@@ -53,17 +53,18 @@ function listThenStop(
   return { agent, requests };
 }
 
-for (const [name, input, done, expectedFailure, expectedReply] of [
+for (const [name, input, done, expectedFailure, expectedReply, providerRequests] of [
   [
     "missing named task",
     "请删掉「预约牙医」这项任务。",
     false,
     "exact_title_not_found",
     "当前清单中没有完全同名的任务，请确认名称。",
+    2,
   ],
-  ["already completed task", "再把买牛奶标记完成", true, undefined, "「买牛奶」已经完成。"],
+  ["already completed task", "再把买牛奶标记完成", true, undefined, "「买牛奶」已经完成。", 0],
 ] as const) {
-  test(`a lookup followed by stop explains the ${name} without a write`, async (t) => {
+  test(`a current lookup explains the ${name} without a write`, async (t) => {
     const { filename, tasks } = await setup(t);
     const initial = [
       { id: "milk", title: "买牛奶", done },
@@ -73,7 +74,7 @@ for (const [name, input, done, expectedFailure, expectedReply] of [
     const fileBefore = await stat(filename, { bigint: true });
     const { agent, requests } = listThenStop(tasks);
     const turn = await agent.runTurn([user(input)]);
-    assert.equal(requests.length, 2);
+    assert.equal(requests.length, providerRequests);
     assert.deepEqual(tasks.list(), initial);
     assert.equal(await readFile(filename, "utf8"), JSON.stringify(initial));
     const fileAfter = await stat(filename, { bigint: true });
@@ -196,7 +197,7 @@ test("a stop without a lookup cannot establish that a named task is missing or a
   const task = tasks.create("买牛奶");
   tasks.update(task.id, { done: true });
   const agent = createAgent(tasks, async () => final("已经完成。找不到指定的任务。"));
-  for (const input of ["请移除「写报告」", "再把买牛奶标记完成"]) {
+  for (const input of ["请移除「写报告」", "牛奶已经买回来了"]) {
     const turn = await agent.runTurn([user(input)]);
     assert.deepEqual(turn.outcomes, []);
     assert.doesNotMatch(turn.reply, /已经完成|找不到/);
@@ -228,7 +229,6 @@ test("a stop after a saved create and a lookup reports only the committed part o
 test("terminal inspection reports a failed read and respects cancellation after a lookup", async (t) => {
   const { tasks } = await setup(t);
   const task = tasks.create("写报告");
-  tasks.update(task.id, { done: true });
   const input = [user("把写报告标记完成")];
   const controller = new AbortController();
   const cancelled = await listThenStop(tasks, () => controller.abort()).agent.runTurn(
@@ -250,7 +250,7 @@ test("terminal inspection reports a failed read and respects cancellation after 
   assert.equal(failed.failure, "storage_error");
   assert.equal(failed.displayedList, undefined);
   assert.deepEqual(failed.outcomes, []);
-  assert.deepEqual(tasks.list(), [{ ...task, done: true }]);
+  assert.deepEqual(tasks.list(), [task]);
 });
 
 test("the production app composition shares chat writes with the task API", async (t) => {
@@ -770,6 +770,7 @@ test("a list result allows a targeted completion and deletion on separate turns"
     ["delete_task", bread, "删掉买面包"],
   ] as const) {
     const latest = user(input);
+    const before = tasks.list();
     const requests: Parameters<ModelProvider>[0][] = [];
     const agent = createAgent(tasks, async (request) => {
       requests.push(request);
@@ -782,15 +783,43 @@ test("a list result allows a targeted completion and deletion on separate turns"
     const turn = await agent.runTurn([...history, latest]);
     assert.equal(turn.failure, undefined);
     assert.deepEqual(requests[0].messages.slice(1), [...history, latest]);
-    assert.equal(requests.length, 3);
+    assert.equal(requests.length, 2);
+    assert.deepEqual(requests[1].messages.at(-1), {
+      role: "tool",
+      tool_call_id: "lookup",
+      content: JSON.stringify({ ok: true, tool: "list_tasks", tasks: before }),
+    });
     const written = action === "complete_task" ? { ...task, done: true } : task;
     assert.deepEqual(turn.outcomes, [{ operation: action, task: written }]);
+    assert.equal(
+      turn.reply,
+      action === "complete_task" ? "已完成「买牛奶」。" : "已删除「买面包」。",
+    );
     assert.deepEqual(
       tasks.list(),
       action === "complete_task" ? [written, bread] : [{ ...milk, done: true }],
     );
     history.push(latest, { role: "assistant", content: turn.reply });
   }
+});
+
+test("a completion does not end a turn that has a second completion in another sentence", async (t) => {
+  const { tasks } = await setup(t);
+  const milk = tasks.create("买牛奶");
+  const coffee = tasks.create("买咖啡");
+  const parcel = tasks.create("取快递");
+  const script = [
+    proposal(call("lookup", "list_tasks", "{}")),
+    proposal(call("milk", "complete_task", JSON.stringify({ candidateIds: [milk.id] }))),
+    proposal(call("coffee", "complete_task", JSON.stringify({ candidateIds: [coffee.id] }))),
+    final("收到。"),
+  ];
+  const turn = await createAgent(tasks, async () => script.shift()).runTurn([
+    user("把买牛奶标为完成。把买咖啡标为完成。"),
+  ]);
+  assert.equal(turn.failure, undefined);
+  assert.deepEqual(tasks.list(), [{ ...milk, done: true }, { ...coffee, done: true }, parcel]);
+  assert.equal(turn.reply, "已完成「买牛奶」。\n已完成「买咖啡」。");
 });
 
 test("bad arguments and unknown tools skip later writes in the same batch", async (t) => {

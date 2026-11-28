@@ -1,4 +1,4 @@
-import { createTaskSchema } from "../shared/task-input.ts";
+import { createTaskSchema, taskTitleSchema } from "../shared/task-input.ts";
 import {
   priorities,
   priorityLabels,
@@ -26,6 +26,20 @@ const adjectiveCreateWithMetadata = new RegExp(
   String.raw`^(?:加|新增|新建|创建|添加|再?记)(?:一?[个条项])?(?:的)?(.+?)(?:的)?(?:任务|待办(?:事项)?)[：:]\s*(.+)$`,
   "u",
 );
+const standaloneCreate =
+  /^(?:请(?:帮我)?|帮我|麻烦(?:帮我)?)?\s*(?:再?记(?:(一[条项个])|一下|下)|再?(?:新增|新建|创建|添加)(一[条项个])?)\s*(?:(?:任务|待办)(?=[\s：:])\s*)?[：:]?\s*(.+)$/u;
+const standaloneNamedEdit = new RegExp(
+  String.raw`^(?:请(?:帮我)?|帮我|麻烦(?:帮我)?)?\s*再?(?:把|将)\s*(${quotedName})\s*(.+)$`,
+  "u",
+);
+const standaloneQuotedTitle = new RegExp(`^(${quotedName})$`, "u");
+const renameAssignment =
+  /^(?:(?:重命名|改名|更名)(?:为|成|叫)|(?:的)?(?:标题|名称|名字)(?:改|修改|换|设)(?:为|成))\s*[：:]?\s*(.+)$/u;
+const reopenAssignment =
+  /^(?:(?:改(?:回|为|成)|恢复(?:为|成)?|重新标记为|设(?:置)?为|标记为)(?:未|待)完成|取消(?:已)?完成)(?:状态)?$/u;
+const plainTitle = /^[\p{L}\p{N}][\p{L}\p{N} \t]*$/u;
+const ambiguousTitle =
+  /(?:和|与|或|并|以及|然后|再|新增|新建|创建|添加|加上|接着|顺便|同时|另外|还有|还要|算了|还是|如果|假如|若是|先不|不用|不必|同名|一样的|相同的|随便|任选|到期|截止|逾期|提醒|[吗呢嘛吧啊呀呗]$|^(?:上次|前面|之前|刚才|刚刚|上述|上面)(?:的|这个|那个))/u;
 
 export const clarifiedTitle = new RegExp(
   String.raw`^我说的是(${quotedName})[，,]\s*请?(?:把|将)它`,
@@ -584,7 +598,7 @@ export function analyzeClauses(input: string): ClauseAnalysis {
 
   // Detect action intents in positive clauses.
   const hasCreateVerb =
-    /(?:新增|新建|创建|添加|加入|加上|加一|加个|加条|再?记(?:一下|一条|下|个|条|住|录)?|备忘|提醒我)/u.test(
+    /(?:新增|新建|创建|添加|加入|加上|加一|加个|加条|(?<!标)(?:再)?记(?:一下|一条|下|个|条|住|录)?|备忘|提醒我)/u.test(
       positiveText,
     );
   const textWithoutReopenPhrases = positiveText
@@ -708,6 +722,116 @@ export function analyzeClauses(input: string): ClauseAnalysis {
     hasDeleteVerb: mutationsAllowed && hasDeleteVerb,
     hasPositiveCreateCommand,
   };
+}
+
+export type ExplicitMutation =
+  | { operation: "create_task"; title: string; explicitQuantity: boolean }
+  | { operation: "update_task"; title: string; changes: { title: string } | { done: false } };
+
+function parsePlainTitle(value: string): string | undefined {
+  const title = value.trim();
+  if (
+    !plainTitle.test(title) ||
+    /^(?:一[条项个])?(?:任务|待办(?:事项)?)$|^一[条项个]$/u.test(title) ||
+    ambiguousTitle.test(title) ||
+    isUnboundTarget(title)
+  ) {
+    return;
+  }
+  const parsed = taskTitleSchema.safeParse(title);
+  return parsed.success ? parsed.data : undefined;
+}
+
+export function explicitMutation(
+  input: string,
+  clauses = analyzeClauses(input),
+): ExplicitMutation | undefined {
+  if (!clauses.mutationsAllowed || clauses.hasMetadataMention || /[\r\n]/u.test(input)) return;
+  const text = input
+    .trim()
+    .replace(/[。！.!]+$/u, "")
+    .trimEnd();
+  const create = clauses.isPureCreate && standaloneCreate.exec(text);
+  if (create) {
+    const title = parsePlainTitle(create[3]);
+    if (title) {
+      return {
+        operation: "create_task",
+        title,
+        explicitQuantity: create[1] !== undefined || create[2] !== undefined,
+      };
+    }
+  }
+
+  const edit = standaloneNamedEdit.exec(text);
+  if (!edit) return;
+  const title = edit[1].slice(1, -1);
+  const parsedTarget = taskTitleSchema.safeParse(title);
+  if (!parsedTarget.success || parsedTarget.data !== title) return;
+  if (clauses.allowReopen && reopenAssignment.test(edit[2])) {
+    return { operation: "update_task", title, changes: { done: false } };
+  }
+
+  const rename = clauses.allowRename && renameAssignment.exec(edit[2]);
+  if (!rename || clauses.hasCompleteVerb || clauses.hasDeleteVerb || clauses.allowReopen) return;
+  const literal = standaloneQuotedTitle.exec(rename[1]);
+  const parsedTitle = literal
+    ? taskTitleSchema.safeParse(literal[1].slice(1, -1)).data
+    : parsePlainTitle(rename[1]);
+  if (parsedTitle) return { operation: "update_task", title, changes: { title: parsedTitle } };
+}
+
+export function orderedMutationOperations(input: string) {
+  const parts = splitClausesOutsideQuotes(input);
+  if (
+    parts.length < 2 ||
+    parts.length > 6 ||
+    parts.slice(1).some((part) => !/^(?:然后|接着|随后)/u.test(part))
+  ) {
+    return undefined;
+  }
+  const operations = parts.map((part) => {
+    const text = part.replace(/^(?:然后|接着|随后)\s*/u, "");
+    const intent = analyzeClauses(text);
+    const candidates = [
+      ...(intent.hasPositiveCreateCommand ? ["create_task" as const] : []),
+      ...(intent.hasCompleteVerb ? ["complete_task" as const] : []),
+      ...(intent.hasDeleteVerb ? ["delete_task" as const] : []),
+      ...(intent.allowRename ||
+      intent.allowReopen ||
+      (intent.hasMetadataMention && !intent.hasPositiveCreateCommand)
+        ? ["update_task" as const]
+        : []),
+    ];
+    return intent.mutationsAllowed && candidates.length === 1
+      ? { operation: candidates[0], text }
+      : undefined;
+  });
+  return operations.every((operation) => operation !== undefined) ? operations : undefined;
+}
+
+export function explicitCreationList(input: string, clauses: ClauseAnalysis): string[] | undefined {
+  if (
+    !clauses.hasPositiveCreateCommand ||
+    clauses.hasCompleteVerb ||
+    clauses.hasDeleteVerb ||
+    clauses.allowRename ||
+    clauses.allowReopen ||
+    clauses.hasMetadataMention
+  )
+    return undefined;
+  const command =
+    /^(?:请(?:帮我)?|帮我|麻烦(?:帮我)?)?\s*(?:记|添加|新增)([二两三四五六2-6])(?:条|项|个)(?:任务|待办)?[，,：:]\s*(.+)$/u.exec(
+      input.trim().replace(/[。！!]$/u, ""),
+    );
+  if (!command) return undefined;
+  const count = parseChineseOrArabicNumber(command[1]);
+  const titles = command[2].split(/、|和|以及|[，,]/u).map(parsePlainTitle);
+  return titles.length === count &&
+    new Set(titles).size === titles.length &&
+    titles.every((title) => title !== undefined)
+    ? titles
+    : undefined;
 }
 
 export function detectUnboundCommand(input: string): "anaphoric" | "positional" | undefined {

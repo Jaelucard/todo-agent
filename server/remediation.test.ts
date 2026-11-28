@@ -905,7 +905,7 @@ test("BLOCKER-2A: zero-mutation prose blocks subtle Chinese false claims on unex
   for (const [input, spoofedReply] of [
     ["把买牛奶改回未完成", "好的，我已经把买牛奶改回未完成了。"],
     ["把买牛奶重命名为买鲜奶", "没问题，帮你把买牛奶改名成买鲜奶了。"],
-    ["牛奶买好了", "好的，帮你把买牛奶标记为完成了。"],
+    ["牛奶已经买回来了", "好的，帮你把买牛奶标记为完成了。"],
   ] as const) {
     const turn = await createAgent(tasks, scripted(final(spoofedReply)).provider).runTurn([
       user(input),

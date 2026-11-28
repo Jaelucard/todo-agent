@@ -49,7 +49,11 @@ test("the official six-turn conversation preserves task identity and exact saved
     return response.json();
   }
 
-  async function turn(input: string, calls: ReturnType<typeof toolCall>[] = []) {
+  async function turn(
+    input: string,
+    calls: ReturnType<typeof toolCall>[] = [],
+    terminalOnWrite = false,
+  ) {
     script = calls;
     requests.length = 0;
     const messages: ChatMessage[] = [...history, { role: "user", content: input }];
@@ -62,14 +66,14 @@ test("the official six-turn conversation preserves task identity and exact saved
     const { reply } = await response.json();
     assert.equal(typeof reply, "string");
     if (calls.length) {
-      assert.equal(requests.length, calls.length + 1);
+      assert.equal(requests.length, calls.length + (terminalOnWrite ? 0 : 1));
       const first = requests[0].messages;
       assert.equal(first[0].role, "system");
       assert.deepEqual(first.slice(1), messages);
     } else {
-      assert.equal(requests.length, 0, "An explicit list request only needs the local store");
+      assert.equal(requests.length, 0, "This action only needs the local task store");
     }
-    const results = calls.map((call, index) => {
+    const results = calls.slice(0, requests.length - 1).map((call, index) => {
       const [assistant, result] = requests[index + 1].messages.slice(-2);
       assert.deepEqual(assistant, { role: "assistant", content: null, tool_calls: [call] });
       assert.ok(result.role === "tool" && result.tool_call_id === call.id);
@@ -101,44 +105,35 @@ test("the official six-turn conversation preserves task identity and exact saved
   assert.deepEqual(createMilk.results, [{ ok: true, tool: "create_task", task: milk }]);
   assert.match(createMilk.reply, /已添加.*买牛奶/u);
 
-  const createParcel = await turn("再记一条取快递", [
-    toolCall("create-parcel", "create_task", { title: "取快递" }),
-  ]);
+  const createParcel = await turn("再记一条取快递");
   const { state: both, bytes: bothBytes } = await saved();
   assert.equal(both.length, 2);
   assert.match(both[1].id, /^[0-9a-f-]{36}$/u);
   assert.notEqual(both[1].id, milk.id);
   const parcel = { id: both[1].id, title: "取快递", done: false };
   assert.deepEqual(both, [milk, parcel]);
-  assert.deepEqual(createParcel.results, [{ ok: true, tool: "create_task", task: parcel }]);
   assert.match(createParcel.reply, /已添加.*取快递/u);
 
   const list = await turn("我有哪些任务？");
   assert.deepEqual(await saved(), { state: [milk, parcel], bytes: bothBytes });
   assert.equal(list.reply, "当前清单：\n- 买牛奶（待完成）\n- 取快递（待完成）");
 
-  const complete = await turn("牛奶买好了", [
-    toolCall("lookup-milk", "list_tasks", {}),
-    toolCall("write-milk", "complete_task", { candidateIds: [milk.id] }),
-  ]);
+  const complete = await turn(
+    "牛奶买好了",
+    [
+      toolCall("lookup-milk", "list_tasks", {}),
+      toolCall("write-milk", "complete_task", { candidateIds: [milk.id] }),
+    ],
+    true,
+  );
   const completedMilk = { ...milk, done: true };
   assert.deepEqual((await saved()).state, [completedMilk, parcel]);
-  assert.deepEqual(complete.results, [
-    { ok: true, tool: "list_tasks", tasks: [milk, parcel] },
-    { ok: true, tool: "complete_task", task: completedMilk, changed: true },
-  ]);
+  assert.deepEqual(complete.results, [{ ok: true, tool: "list_tasks", tasks: [milk, parcel] }]);
   assert.match(complete.reply, /已完成.*买牛奶/u);
 
-  const remove = await turn("取快递这条删掉吧", [
-    toolCall("lookup-parcel", "list_tasks", {}),
-    toolCall("delete-parcel", "delete_task", { candidateIds: [parcel.id] }),
-  ]);
+  const remove = await turn("取快递这条删掉吧");
   const { state: finalState, bytes: finalBytes } = await saved();
   assert.deepEqual(finalState, [completedMilk]);
-  assert.deepEqual(remove.results, [
-    { ok: true, tool: "list_tasks", tasks: [completedMilk, parcel] },
-    { ok: true, tool: "delete_task", task: parcel },
-  ]);
   assert.match(remove.reply, /已删除.*取快递/u);
 
   const finalList = await turn("再给我看看清单");
