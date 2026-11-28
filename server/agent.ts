@@ -1576,13 +1576,13 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
           .replace(/吧?[。！？.!?]?$/u, "");
         const meta = singleMetadataRequest(stripped);
         if (meta?.operation === "update_task" && meta.target && meta.changes) {
-          const resolved = resolveExplicitTargetName(meta.target.replace(/的$/u, ""));
+          const resolved = resolveExplicitTargetName(meta.target);
           if (resolved) {
             return { ...resolved, requiredChanges: meta.changes, isMetadata: true };
           }
         }
         const reopenMatch =
-          /^(?:把|将)\s*(.+?)\s*(?:(?:改回|恢复(?:为|成)?|退回(?:为|成)?|变回|重置(?:为|成)?|重新(?:打开|开启|标记(?:为|成)?|设为|变为)|标(?:记)?(?:为|成)?|设(?:置)?(?:为|成)?)\s*(?:未|待)完成(?:状态)?|(?:重新(?:打开|开启)|恢复|退回|重置)(?:一下|下)?)$/u.exec(
+          /^(?:把|将)\s*(.+?)\s*(?:(?:改回(?:为|成|到|至)?|恢复(?:为|成|到|至)?|退回(?:为|成|到|至)?|变回(?:为|成|到|至)?|重置(?:为|成|到|至)?|重新(?:打开|开启|标记(?:为|成)?|设为|变为)|标(?:记)?(?:为|成)?|设(?:置)?(?:为|成|到|至)?)\s*(?:未|待)完成(?:状态)?|(?:重新(?:打开|开启)|恢复|退回|重置)(?:一下|下)?)$/u.exec(
             stripped,
           ) ??
           /^(?:取消|撤销)\s*(.+?)\s*的?(?:已)?完成(?:状态)?$/u.exec(stripped) ??
@@ -1594,7 +1594,7 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
           }
         }
         const renameMatch =
-          /^(?:把|将)\s*(.+?)\s*(?:重命名|改名|更名|改(?:一下|下)?(?:标题|名称|名字)|换(?:一下|下)?(?:标题|名称|名字)|(?<!优先级|工作量)(?:改|换))(?:为|成|叫)\s*(.+)$/u.exec(
+          /^(?:把|将)\s*(.+?)\s*(?:的?(?:标题|名称|名字)\s*(?:改|修改|换|设)|重命名|改名|更名|改(?:一下|下)?(?:标题|名称|名字)|换(?:一下|下)?(?:标题|名称|名字)|(?<!优先级|工作量)(?:改|换))(?:为|成|叫)\s*(.+)$/u.exec(
             stripped,
           );
         if (renameMatch) {
@@ -1633,7 +1633,7 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
           const rawSuffix = targetFirstAction.exec(rawTrimmed);
           if (rawSuffix && !deleteAction.test(rawSuffix[2])) {
             const rawTargetTrimmed = rawSuffix[1].trim();
-            if (!/^[「“"]/u.test(rawTargetTrimmed)) {
+            if (!/^[「『“"‘']/u.test(rawTargetTrimmed)) {
               const fullTitle = rawTargetTrimmed.replace(/(?:已经|已)$/u, "");
               if (knownTitles.has(fullTitle)) {
                 return { title: fullTitle, literal: false, clauseIndex };
@@ -2055,8 +2055,9 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
         !clauseAnalysis.hasPositiveCreateCommand &&
         !clauseAnalysis.allowReopen &&
         !clauseAnalysis.allowRename &&
-        clauseAnalysis.allowedPriorities.size === 0 &&
-        clauseAnalysis.allowedWorkloads.size === 0 &&
+        !/(?:优先级|工作量)\s*(?:改|设|调|降|升)|(?:提高|降低|调高|调低)/u.test(
+          maskQuotedTitles(commandInput),
+        ) &&
         !/^(?:把|将)/u.test(commandInput)
           ? /^([^\r\n，,；;。？！!?]{1,200}?)(?:(?:这|那)(?:一)?[条项](?:任务|待办)?)?(?:已经|已)?(?:完成了|做完了|搞定了)[。！!]?$/u
               .exec(commandInput)?.[1]
@@ -2275,8 +2276,7 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
           const namedTitle = named?.explicit && namedTarget(named.target);
           const metadata = singleMetadataRequest(text);
           const metadataEdit = metadata?.operation === "update_task" ? metadata : undefined;
-          const metadataTarget =
-            metadataEdit?.target && namedTarget(metadataEdit.target.replace(/的$/u, ""));
+          const metadataTarget = metadataEdit?.target && namedTarget(metadataEdit.target);
           const metadataCreate =
             metadata?.operation === "create_task"
               ? singleCreateGrant(metadata.target, metadata.changes)
@@ -3260,6 +3260,10 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
             liveMixedCompletions.length > 0 && liveMixedCompletions.length === completeClauseCount
               ? new Set(liveMixedCompletions.map((entry) => entry.title))
               : undefined;
+          const livePlannedUpdate =
+            planned?.operation === "update_task"
+              ? extractExplicitUpdateSpec(planned.text, true)
+              : undefined;
           const liveMixedUpdates =
             name === "update_task" &&
             !activeBoundReference &&
@@ -3278,20 +3282,31 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
                   return parsed ? [{ ...parsed, clauseIndex: idx }] : [];
                 })
               : [];
+          const updateClauseCount = turnClauseIntents.filter(
+            (intent) =>
+              Boolean(intent) &&
+              (intent!.allowRename ||
+                intent!.allowReopen ||
+                (intent!.hasMetadataMention && !intent!.hasPositiveCreateCommand)),
+          ).length;
           const rankedUpdate =
             name === "update_task" && callRank !== undefined
               ? liveMixedUpdates.find((entry) => entry.clauseIndex === callRank)
               : undefined;
-          const liveMixedUpdate = liveMixedUpdates.length === 1 ? liveMixedUpdates[0] : undefined;
+          const liveMixedUpdate =
+            liveMixedUpdates.length === 1 && updateClauseCount === 1
+              ? liveMixedUpdates[0]
+              : undefined;
           const activeUpdateSpec =
             name === "update_task"
-              ? (singleUpdateSpec ?? rankedUpdate ?? liveMixedUpdate)
+              ? (singleUpdateSpec ?? (callRank !== undefined ? rankedUpdate : liveMixedUpdate))
               : undefined;
           const rankedUpdateIntent =
             name === "update_task" && callRank !== undefined && !activeBoundReference
               ? turnClauseIntents[callRank]
               : undefined;
           const title =
+            livePlannedUpdate?.title ??
             planned?.title ??
             (name === "delete_task"
               ? (exactDeleteTitle ?? rankedDelete?.title ?? mixedDelete?.title)
@@ -3358,7 +3373,9 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
                 }
               : baseGrant;
           const effectiveRequiredChanges =
-            planned?.requiredChanges ?? activeUpdateSpec?.requiredChanges;
+            livePlannedUpdate?.requiredChanges ??
+            planned?.requiredChanges ??
+            activeUpdateSpec?.requiredChanges;
           const grant =
             planned?.operation === "create_task"
               ? {

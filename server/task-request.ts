@@ -612,10 +612,15 @@ function unquotedProhibitedDeletionTargets(clause: string): string[] {
 }
 
 function maskRenameValues(clause: string): string {
-  return clause.replace(
-    /(重命名|改名|更名|(?:改|修改|换)(?:一下|下)?(?:标题|名称|名字)|(?:的(?:标题|名称|名字)|(?:标题|名字))(?:改|换|设))(?:为|成|叫)(?!\s*(?:已|未|待)完成(?:\s|$|[，,；;。！？!?]))\s*[^，,；;。！？!?]+/gu,
-    "$1为「」",
-  );
+  return clause
+    .replace(
+      /(重命名|改名|更名|(?:改|修改|换)(?:一下|下)?(?:标题|名称|名字)|(?:的(?:标题|名称|名字)|(?:标题|名字))(?:改|换|设))(?:为|成|叫)\s*[^，,；;。！？!?]+/gu,
+      "$1为「」",
+    )
+    .replace(
+      /((?:把|将)[^，,；;。！？!?]+?(?<!优先级|工作量)(?:改|换)(?:为|成))(?!\s*(?:(?:已|未|待)完成(?:状态)?|[低中高]\s*优先级|[小中大]\s*工作量|[低中高小大])\s*(?:$|[，,；;。！？!?]))\s*[^，,；;。！？!?]+/gu,
+      "$1「」",
+    );
 }
 
 export function analyzeClauses(input: string): ClauseAnalysis {
