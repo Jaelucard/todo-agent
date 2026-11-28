@@ -27,6 +27,7 @@ import {
   explicitCreationList,
   explicitMutation,
   extractTrailingListRequest,
+  isPureListClause,
   isPureListRequest,
   isUnboundTarget,
   isUnsupportedDueDateQuery,
@@ -37,6 +38,7 @@ import {
   quotedCreateTitle,
   singleCreateGrant,
   singleMetadataRequest,
+  stripLeadingActionPrefixes,
 } from "./task-request.ts";
 import type { TaskStore } from "./task-store.ts";
 import {
@@ -544,16 +546,10 @@ const actionFirstTarget = new RegExp(
   `^(${deleteActions}|完成|标(?:记)?(?:为|成)?(?:已)?完成)(.+)$`,
   "u",
 );
-const actionFirstBareDelete = /^(删)(?![除掉了一节减改])([\p{Script=Han}「“"].+)$/u;
+const actionFirstBareDelete = /^(删)(?![除掉了一节减改])\s*([\p{Script=Han}「“"].+)$/u;
 
-function taskCommand(content: string) {
-  const text = content
-    .trim()
-    .replace(
-      /^(?:请(?:[你您])?\s*(?:帮我|给我)?|帮我|给我|麻烦(?:[你您])?\s*(?:帮我|给我)?)\s*/u,
-      "",
-    )
-    .replace(/^(?:再|只|先)\s*(?=把|将|给|删除|删掉|移除|完成|标记|删)/u, "")
+function taskCommand(content: string, includeConnectors = false) {
+  const text = stripLeadingActionPrefixes(content, { includeConnectors })
     .replace(clarifiedTitle, "把$1")
     .replace(/吧?[。！？.!?]?$/u, "");
   if (
@@ -1423,12 +1419,9 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
           ? (deleteGrant ??
             (command?.explicit && deleteAction.test(command.action) ? target : undefined))
           : undefined;
-      const explicitDelete =
-        /^(?:(?:请(?:[你您])?\s*(?:帮我|给我)?|帮我|给我|麻烦(?:[你您])?\s*(?:帮我|给我)?)\s*)?(?:先|再|只)?\s*(?:把|将)/u.test(
-          commandInput,
-        )
-          ? parsedDelete
-          : undefined;
+      const explicitDelete = /^(?:把|将)/u.test(stripLeadingActionPrefixes(commandInput))
+        ? parsedDelete
+        : undefined;
       if (
         parsedDelete &&
         !parsedDelete.literal &&
@@ -1455,16 +1448,8 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
               literal: boolean;
               suffixedTitle?: string;
             }>((clause, clauseIndex) => {
-              const stripped =
-                clauseIndex > 0
-                  ? clause
-                      .replace(
-                        /^(?:(?:然后|接着|随后|另外|此外|同时|顺便|顺手|并且|而且|还有|以及)\s*)+/u,
-                        "",
-                      )
-                      .replace(/^(?:(?:也|再|并|先)(?=[把将请帮麻删移清去])\s*)+/u, "")
-                  : clause;
-              const action = taskCommand(stripped);
+              if (isPureListClause(clause)) return [];
+              const action = taskCommand(clause, clauseIndex > 0);
               if (!action?.explicit || !deleteAction.test(action.action)) return [];
               const name = namedTarget(action.target);
               if (name) {
@@ -1485,7 +1470,7 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
         mixedDeletions.map((entry) => [entry.clauseIndex, entry]),
       );
       const deleteClauseCount = clauseAnalysis.positiveClauses.filter(
-        (clause) => analyzeClauses(clause).hasDeleteVerb,
+        (clause) => !isPureListClause(clause) && analyzeClauses(clause).hasDeleteVerb,
       ).length;
       const hasUnparsedMultiDelete =
         !parsedDelete &&
@@ -1495,6 +1480,50 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
       const mixedDeletionAllowedTitles =
         mixedDeletions.length > 0 && mixedDeletions.length === deleteClauseCount
           ? new Set(mixedDeletions.map((entry) => entry.title))
+          : undefined;
+      const mixedCompletions =
+        !activeBoundReference && clauseAnalysis.hasCompleteVerb && clauseAnalysis.clauseCount > 1
+          ? clauseAnalysis.positiveClauses.flatMap<{
+              clauseIndex: number;
+              title: string;
+              literal: boolean;
+            }>((clause, clauseIndex) => {
+              if (isPureListClause(clause)) return [];
+              const action = taskCommand(clause, clauseIndex > 0);
+              if (
+                !action?.explicit ||
+                deleteAction.test(action.action) ||
+                action.action === "update_task"
+              ) {
+                return [];
+              }
+              const name = namedTarget(action.target);
+              if (name) {
+                return isUnboundTarget(name.title) && !name.literal
+                  ? []
+                  : [{ ...name, clauseIndex }];
+              }
+              const raw = action.target.trim();
+              const shortTitle = raw.replace(/(?:这|那)(?:一)?[条项个件](?:任务|待办|事)?$/u, "");
+              const shortened = raw !== shortTitle && namedTarget(shortTitle);
+              return shortened && !isUnboundTarget(shortened.title)
+                ? [{ ...shortened, clauseIndex }]
+                : [];
+            })
+          : [];
+      const completeClauseCount = clauseAnalysis.positiveClauses.filter(
+        (clause) => !isPureListClause(clause) && analyzeClauses(clause).hasCompleteVerb,
+      ).length;
+      const mixedComplete =
+        mixedCompletions.length === 1 && completeClauseCount === 1
+          ? mixedCompletions[0]
+          : undefined;
+      const mixedCompleteByClauseIndex = new Map(
+        mixedCompletions.map((entry) => [entry.clauseIndex, entry]),
+      );
+      const mixedCompletionAllowedTitles =
+        mixedCompletions.length > 0 && mixedCompletions.length === completeClauseCount
+          ? new Set(mixedCompletions.map((entry) => entry.title))
           : undefined;
       const singleNamedDeletion =
         parsedDelete ??
@@ -1694,7 +1723,20 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
           }
           if (exactComplete) {
             const matches = view.tasks.filter((task) => task.title === exactComplete.title);
-            if (matches.length) exactCompleteTitle = exactComplete.title;
+            const hasPartialOrAbbrev =
+              !matches.length &&
+              !exactComplete.literal &&
+              view.tasks.some(
+                (task) =>
+                  !clauseAnalysis.forbiddenTitles.has(task.title) &&
+                  (task.title.includes(exactComplete.title) ||
+                    exactComplete.title.includes(task.title) ||
+                    isTitleAbbreviation(exactComplete.title, task.title) ||
+                    hasGroundedSemanticMatch(exactComplete.title, task.title)),
+              );
+            if (matches.length || exactComplete.literal || !hasPartialOrAbbrev) {
+              exactCompleteTitle = exactComplete.title;
+            }
             if (
               matches.length === 1 &&
               view.tasks.filter((task) => task.id === matches[0].id).length === 1
@@ -1858,7 +1900,8 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
             pendingOp === "complete_task" &&
             !parsedTarget.literal &&
             Boolean(
-              modelStopText && /(?:没有找到|找不到|未找到|不存在|清单里没有)/u.test(modelStopText),
+              modelStopText &&
+              /(?:没有找到|没找到|找不到|未找到|不存在|清单里没有)/u.test(modelStopText),
             );
           return finishLookupFailure(
             resolved.error,
@@ -2682,12 +2725,13 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
         const batchCallRanks = new Map<string, number>();
         if (!orderedOperations && writes.length > 0 && clauseAnalysis.positiveClauses.length >= 2) {
           const clauseIntents = clauseAnalysis.positiveClauses.map((clause) =>
-            analyzeClauses(clause),
+            isPureListClause(clause) ? undefined : analyzeClauses(clause),
           );
           const clauseMatchesTool = (
-            intent: ReturnType<typeof analyzeClauses>,
+            intent: ReturnType<typeof analyzeClauses> | undefined,
             toolName: string,
           ): boolean => {
+            if (!intent) return false;
             if (toolName === "create_task") return intent.hasPositiveCreateCommand;
             if (toolName === "complete_task") return intent.hasCompleteVerb;
             if (toolName === "delete_task") return intent.hasDeleteVerb;
@@ -2704,12 +2748,13 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
             .map((intent, idx) => ({ intent, idx }))
             .filter(
               ({ intent }) =>
-                intent.hasPositiveCreateCommand ||
-                intent.hasCompleteVerb ||
-                intent.hasDeleteVerb ||
-                intent.allowRename ||
-                intent.allowReopen ||
-                intent.hasMetadataMention,
+                Boolean(intent) &&
+                (intent!.hasPositiveCreateCommand ||
+                  intent!.hasCompleteVerb ||
+                  intent!.hasDeleteVerb ||
+                  intent!.allowRename ||
+                  intent!.allowReopen ||
+                  intent!.hasMetadataMention),
             )
             .map(({ idx }) => idx);
           const matchingIndicesForTool = (toolName: string): number[] =>
@@ -2845,12 +2890,16 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
             name === "delete_task" && callRank !== undefined
               ? mixedDeleteByClauseIndex.get(callRank)
               : undefined;
+          const rankedComplete =
+            name === "complete_task" && callRank !== undefined
+              ? mixedCompleteByClauseIndex.get(callRank)
+              : undefined;
           const title =
             planned?.title ??
             (name === "delete_task"
               ? (exactDeleteTitle ?? rankedDelete?.title ?? mixedDelete?.title)
               : name === "complete_task"
-                ? exactCompleteTitle
+                ? (exactCompleteTitle ?? rankedComplete?.title ?? mixedComplete?.title)
                 : undefined);
           const activeMixedDelete = rankedDelete ?? mixedDelete;
           const suffixedTitle = activeMixedDelete?.suffixedTitle;
@@ -2868,17 +2917,21 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
             }
           }
           const baseGrant = grantForTool(name);
+          const mixedAllowedTitles =
+            name === "delete_task"
+              ? mixedDeletionAllowedTitles
+              : name === "complete_task"
+                ? mixedCompletionAllowedTitles
+                : undefined;
           const grantWithMixedDeletes =
-            name === "delete_task" && !title && mixedDeletionAllowedTitles
+            !title && mixedAllowedTitles
               ? {
                   ...baseGrant,
                   allowedTitles: baseGrant?.allowedTitles
                     ? new Set(
-                        [...baseGrant.allowedTitles].filter((item) =>
-                          mixedDeletionAllowedTitles.has(item),
-                        ),
+                        [...baseGrant.allowedTitles].filter((item) => mixedAllowedTitles.has(item)),
                       )
-                    : mixedDeletionAllowedTitles,
+                    : mixedAllowedTitles,
                 }
               : baseGrant;
           const grant =

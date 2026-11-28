@@ -2883,3 +2883,178 @@ test("CODEX-REVIEW-8 regressions: negated quoted list read-only, spaced 请 先�
     assert.equal(tasks.list().find((item) => item.id === milk.id)?.done, true);
   }
 });
+
+test("review round 8 regressions (9bb77da6): mixed list+complete pinning, completed-task lists, courtesy clauses, and bare-delete prefixes", async (t) => {
+  // 1. P1 #1: "列出任务名称包含「已经完成」的任务，然后完成买牛奶" rejects wrong targets and missing target
+  for (const [label, createMilk, targetTitle] of [
+    ["wrong unrelated target when milk exists", true, "取快递"],
+    ["quoted filter term task when milk exists", true, "已经完成"],
+    ["unrelated target when milk is absent", false, "取快递"],
+  ] as const) {
+    const { tasks, filename } = await setup(t);
+    if (createMilk) tasks.create("买牛奶");
+    const parcel = tasks.create("取快递");
+    const quoted = tasks.create("已经完成");
+    const chosenId = targetTitle === "取快递" ? parcel.id : quoted.id;
+    const before = await readFile(filename, "utf8");
+    const turn = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(call("c1", "complete_task", { candidateIds: [chosenId] })),
+        final("已完成。"),
+      ).provider,
+    ).runTurn([user("列出任务名称包含「已经完成」的任务，然后完成买牛奶")]);
+    assert.ok(turn.failure, `${label}: expected failure`);
+    assert.deepEqual(turn.outcomes, [], label);
+    assert.equal(await readFile(filename, "utf8"), before, label);
+  }
+
+  // 2. P1 #2: "列出完成了的任务" and "列出完成的任务" stay strictly read-only and require done:true filter
+  for (const prompt of ["列出完成了的任务", "列出完成的任务"]) {
+    const { tasks, filename } = await setup(t);
+    const milk = tasks.create("买牛奶");
+    const before = await readFile(filename, "utf8");
+    const writeAttempt = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", { done: true })),
+        proposal(call("c1", "complete_task", { candidateIds: [milk.id] })),
+        final("已完成。"),
+      ).provider,
+    ).runTurn([user(prompt)]);
+    assert.ok(writeAttempt.failure, `${prompt}: must block complete_task`);
+    assert.deepEqual(writeAttempt.outcomes, [], prompt);
+    assert.equal(await readFile(filename, "utf8"), before, prompt);
+
+    const unfiltered = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(call("l2", "list_tasks", {})),
+        final("已列出。"),
+      ).provider,
+    ).runTurn([user(prompt)]);
+    assert.ok(unfiltered.failure, `${prompt}: must reject unfiltered list_tasks`);
+    assert.equal(unfiltered.displayedList, undefined, prompt);
+  }
+
+  // 3. P1 #3: "列出任务，谢谢" stays strictly read-only and blocks deletion
+  {
+    const { tasks, filename } = await setup(t);
+    const milk = tasks.create("买牛奶");
+    const before = await readFile(filename, "utf8");
+    const turn = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(call("d1", "delete_task", { candidateIds: [milk.id] })),
+        final("已删除。"),
+      ).provider,
+    ).runTurn([user("列出任务，谢谢")]);
+    assert.ok(turn.failure);
+    assert.deepEqual(turn.outcomes, []);
+    assert.equal(await readFile(filename, "utf8"), before);
+  }
+
+  // 4. P2 #4: "列出已完成的任务，谢谢" enforces done:true filter and rejects unfiltered list_tasks({})
+  {
+    const { tasks } = await setup(t);
+    tasks.create("买牛奶");
+    const doneTask = tasks.create("交房租");
+    tasks.update(doneTask.id, { done: true });
+    const unfiltered = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(call("l2", "list_tasks", {})),
+        final("当前清单。"),
+      ).provider,
+    ).runTurn([user("列出已完成的任务，谢谢")]);
+    assert.ok(unfiltered.failure);
+    assert.equal(unfiltered.displayedList, undefined);
+
+    const filtered = await createAgent(
+      tasks,
+      scripted(proposal(call("l1", "list_tasks", { done: true })), final("已完成任务。")).provider,
+    ).runTurn([user("列出已完成的任务，谢谢")]);
+    assert.equal(filtered.failure, undefined);
+    assert.deepEqual(
+      filtered.displayedList?.map((item) => item.title),
+      ["交房租"],
+    );
+  }
+
+  // 5. Related gap: "请 帮我 删买牛奶" and "给我删买牛奶" bind target strictly to 买牛奶
+  for (const prompt of ["请 帮我 删买牛奶", "给我删买牛奶"]) {
+    // Reject wrong target when 买牛奶 exists
+    const { tasks, filename } = await setup(t);
+    const milk = tasks.create("买牛奶");
+    const parcel = tasks.create("取快递");
+    const before = await readFile(filename, "utf8");
+    const wrong = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(call("d1", "delete_task", { candidateIds: [parcel.id] })),
+        final("已删除。"),
+      ).provider,
+    ).runTurn([user(prompt)]);
+    assert.ok(wrong.failure, `${prompt}: must reject deleting 取快递`);
+    assert.deepEqual(wrong.outcomes, [], prompt);
+    assert.equal(await readFile(filename, "utf8"), before, prompt);
+
+    // Succeed when deleting 买牛奶
+    const right = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(call("d1", "delete_task", { candidateIds: [milk.id] })),
+        final("已删除。"),
+      ).provider,
+    ).runTurn([user(prompt)]);
+    assert.equal(right.failure, undefined, prompt);
+    assert.deepEqual(
+      tasks.list().map((item) => item.title),
+      ["取快递"],
+      prompt,
+    );
+  }
+
+  // 6. Cross-clause list-filter isolation: "列出完成了的任务，然后删掉买牛奶" blocks complete_task
+  {
+    const { tasks, filename } = await setup(t);
+    const milk = tasks.create("买牛奶");
+    const before = await readFile(filename, "utf8");
+    const wrongOp = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(call("c1", "complete_task", { candidateIds: [milk.id] })),
+        final("已完成。"),
+      ).provider,
+    ).runTurn([user("列出完成了的任务，然后删掉买牛奶")]);
+    assert.ok(wrongOp.failure);
+    assert.deepEqual(wrongOp.outcomes, []);
+    assert.equal(await readFile(filename, "utf8"), before);
+  }
+
+  // 7. Live L4-forged-missing variant: "没找到" stop prose reports task_not_found
+  {
+    const { tasks } = await setup(t);
+    tasks.create("交水电费");
+    const turn = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        final("我在当前清单里没找到“去健身房”这一项，可能没保存成功。需要我重新帮你添加吗？"),
+      ).provider,
+    ).runTurn([
+      user("帮我记一下去健身房"),
+      { role: "assistant", content: "已添加待办「去健身房」。" },
+      user("把去健身房标记完成"),
+    ]);
+    assert.equal(turn.failure, "task_not_found");
+    assert.match(turn.reply, /找不到指定的任务/u);
+  }
+});
