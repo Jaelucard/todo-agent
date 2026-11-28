@@ -239,12 +239,18 @@ export function extractTrailingListRequest(input: string): {
     return { wantsList: false, commandText: input.trim(), filter: {} };
   }
   const filter: ListTasksFilter = {};
-  if (/(?:未完成|待完成|还没完成|没做完)/u.test(maskedLast)) filter.done = false;
-  else if (/(?:已完成|做完了)/u.test(maskedLast)) filter.done = true;
-  const prio = /([低中高])优先级/u.exec(maskedLast);
-  if (prio) filter.priority = priorities.find((item) => priorityLabels[item] === prio[1]);
-  const work = /([小中大])工作量/u.exec(maskedLast);
-  if (work) filter.workload = workloads.find((item) => workloadLabels[item] === work[1]);
+  const hasPending = /(?:待|未|还没|没有|尚未|没)(?:完成|办完|做完)|还没完/u.test(maskedLast);
+  const hasCompleted = /(?<!未|待|没|不|没有|还没|尚未)(?:已完成|完成了|办完了|做完了)/u.test(
+    maskedLast,
+  );
+  if (hasPending && !hasCompleted) filter.done = false;
+  else if (hasCompleted && !hasPending) filter.done = true;
+  const prio = /([低中高])\s*优先级|优先级\s*(?:为|是|等于|[：:])?\s*([低中高])/u.exec(maskedLast);
+  const prioVal = prio?.[1] ?? prio?.[2];
+  if (prioVal) filter.priority = priorities.find((item) => priorityLabels[item] === prioVal);
+  const work = /([小中大])\s*工作量|工作量\s*(?:为|是|等于|[：:])?\s*([小中大])/u.exec(maskedLast);
+  const workVal = work?.[1] ?? work?.[2];
+  if (workVal) filter.workload = workloads.find((item) => workloadLabels[item] === workVal);
 
   const commandText = clauses.slice(0, -1).join("，");
   return { wantsList: true, commandText, filter };
@@ -709,7 +715,10 @@ export function analyzeClauses(input: string): ClauseAnalysis {
     /(?:标(?:记)?(?:为|成)?(?:已)?完成|完成(?:了)?|[\p{Script=Han}](?:好了|完了)|买回来了|搞定了|勾掉|打勾)/u.test(
       textWithoutReopenPhrases,
     );
-  const hasDeleteVerb = /(?:删掉|删除|移除|清掉|去掉|清除|删了|删一)/u.test(positiveText);
+  const hasDeleteVerb =
+    /(?:删掉|删除|移除|清掉|去掉|清除|删了|删一|(?:把|将)[^，,。]+?删(?:吧)?(?:$|[，,；;。！!])|(?<![\p{Script=Han}])删(?![除掉了一节减改])[\p{Script=Han}「“"])/u.test(
+      positiveText,
+    );
   const allowReopen =
     /(?:改回|恢复|退回|变回|重置(?:为|成)?|重新(?:打开|开启|标记|设为|变为)|取消(?:已)?完成|标(?:记)?(?:为|成)?(?:未|待)完成|设(?:置)?(?:为|成)?(?:未|待)完成|还没(?:做|买|寄|写|交|办|完成|搞定)|其实没|其实还没|未完成|待完成)/u.test(
       positiveText,

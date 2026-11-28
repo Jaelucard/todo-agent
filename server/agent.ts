@@ -263,7 +263,8 @@ const cancelsTaskAction = /取消|撤销|停止|终止|放弃|退订|退掉/u;
 const preparatoryTaskCue =
   /(?:准备|计划|打算|考虑|研究|了解|确认是否|查询|查一下|查看|检查|核对|核实|营业时间|咨询)/u;
 const nonBookingEndingCue =
-  /(?:结果|时间|地址|电话|费用|价格|报告|记录|清单|回执|确认单|进度|状态)$/u;
+  /(?:结果|时间|地址|电话|费用|价格|报告|记录|清单|回执|确认单|进度|状态|定金|押金|订金)$/u;
+const bookingDisqualifierCue = /(?:定金|押金|订金|缴费|付款|支付|结账|付钱|退款|退还|退费)/u;
 const semanticConceptGroups: ReadonlyArray<readonly [string, readonly string[]]> = [
   ["dental_clinic", ["牙医", "牙科", "口腔", "看牙"]],
   ["dental_cleaning", ["洗牙", "洁牙"]],
@@ -319,8 +320,11 @@ type SemanticActionClass =
 function semanticActionClass(text: string): SemanticActionClass | undefined {
   const trimmed = text.trim();
   if (cancelsTaskAction.test(trimmed) || preparatoryTaskCue.test(trimmed)) return undefined;
+  if (/^(?:退|退还|退款|退费)/u.test(trimmed)) return "refund";
+  if (/^(?:交|缴|付|支付|缴纳|结清)/u.test(trimmed)) return "pay";
   if (
     !nonBookingEndingCue.test(trimmed) &&
+    !bookingDisqualifierCue.test(trimmed) &&
     /(?:预约|约诊|挂号|看牙|复诊|门诊)/u.test(trimmed) &&
     /^(?:打电话|发微信|发消息|联系|去|到|找)?[^，,。]{0,12}?(?:预约|约诊|挂号|看牙|复诊|门诊)[^，,。]{0,8}$/u.test(
       trimmed,
@@ -328,8 +332,6 @@ function semanticActionClass(text: string): SemanticActionClass | undefined {
   ) {
     return "book_visit";
   }
-  if (/^(?:退|退还|退款|退费)/u.test(trimmed)) return "refund";
-  if (/^(?:交|缴|付|支付|缴纳|结清)/u.test(trimmed)) return "pay";
   if (/^(?:取|拿|领)/u.test(trimmed)) return "pickup";
   if (/^(?:寄|发(?:快递|包裹|件|货|邮件|信)|送)/u.test(trimmed)) return "send";
   if (/^(?:报销|提交报销|申请报销|报税|申报)/u.test(trimmed)) return "file_claim";
@@ -1443,6 +1445,7 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
         clauseAnalysis.hasDeleteVerb &&
         clauseAnalysis.clauseCount > 1
           ? clauseAnalysis.positiveClauses.flatMap<{
+              clauseIndex: number;
               title: string;
               literal: boolean;
               suffixedTitle?: string;
@@ -1459,16 +1462,23 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
               const action = taskCommand(stripped);
               if (!action?.explicit || !deleteAction.test(action.action)) return [];
               const name = namedTarget(action.target);
-              if (name) return isUnboundTarget(name.title) && !name.literal ? [] : [name];
+              if (name) {
+                return isUnboundTarget(name.title) && !name.literal
+                  ? []
+                  : [{ ...name, clauseIndex }];
+              }
               const raw = action.target.trim();
               const shortTitle = raw.replace(/(?:这|那)(?:一)?[条项](?:任务|待办)?$/u, "");
               const shortened = raw !== shortTitle && namedTarget(shortTitle);
               return shortened && !isUnboundTarget(shortened.title)
-                ? [{ ...shortened, suffixedTitle: raw }]
+                ? [{ ...shortened, suffixedTitle: raw, clauseIndex }]
                 : [];
             })
           : [];
       const mixedDelete = mixedDeletions.length === 1 ? mixedDeletions[0] : undefined;
+      const mixedDeleteByClauseIndex = new Map(
+        mixedDeletions.map((entry) => [entry.clauseIndex, entry]),
+      );
       const deleteClauseCount = clauseAnalysis.positiveClauses.filter(
         (clause) => analyzeClauses(clause).hasDeleteVerb,
       ).length;
@@ -1835,16 +1845,36 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
               : deleteAction.test(command.action)
                 ? "delete_task"
                 : "complete_task";
+          let effectiveView = view;
+          let fullStoreMissing = true;
+          if (
+            !clarification &&
+            pendingOp === "complete_task" &&
+            !parsedTarget.literal &&
+            Object.keys(displayedListFilter).length > 0
+          ) {
+            const fullView = createTaskTools(tasks).execute("list_tasks", "{}");
+            if (!fullView.ok) return finish(fullView.error);
+            if (fullView.tool === "list_tasks") {
+              effectiveView = fullView.tasks;
+              fullStoreMissing = !fullView.tasks.some((task) => task.title === parsedTarget.title);
+            }
+          }
+          if (!fullStoreMissing) {
+            displayedList = undefined;
+            return finish("action_not_executed");
+          }
           const modelReportedMissing =
             !clarification &&
             pendingOp === "complete_task" &&
             !parsedTarget.literal &&
+            fullStoreMissing &&
             Boolean(
               modelStopText && /(?:没有找到|找不到|未找到|不存在|清单里没有)/u.test(modelStopText),
             );
           return finishLookupFailure(
             resolved.error,
-            view,
+            effectiveView,
             parsedTarget,
             modelReportedMissing ? "task_not_found" : clarification,
             pendingOp,
@@ -2794,22 +2824,31 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
               return finish("stale_view");
             }
           }
+          const callRank = batchCallRanks.get(call.id);
+          const rankedDelete =
+            name === "delete_task" && callRank !== undefined
+              ? mixedDeleteByClauseIndex.get(callRank)
+              : undefined;
           const title =
             planned?.title ??
             (name === "delete_task"
-              ? (exactDeleteTitle ?? mixedDelete?.title)
+              ? (exactDeleteTitle ?? rankedDelete?.title ?? mixedDelete?.title)
               : name === "complete_task"
                 ? exactCompleteTitle
                 : undefined);
-          const suffixedTitle = mixedDelete?.suffixedTitle;
-          if (name === "delete_task" && !planned?.title && mixedDelete && suffixedTitle) {
+          const activeMixedDelete = rankedDelete ?? mixedDelete;
+          const suffixedTitle = activeMixedDelete?.suffixedTitle;
+          if (name === "delete_task" && !planned?.title && activeMixedDelete && suffixedTitle) {
             const view = createTaskTools(tasks).execute("list_tasks", "{}");
             if (!view.ok) return finish(view.error);
             if (
               view.tool === "list_tasks" &&
               view.tasks.some((task) => task.title === suffixedTitle)
             ) {
-              return finishSuffixCollision(view.tasks, { title: mixedDelete.title, suffixedTitle });
+              return finishSuffixCollision(view.tasks, {
+                title: activeMixedDelete.title,
+                suffixedTitle,
+              });
             }
           }
           const baseGrant = grantForTool(name);
@@ -2867,11 +2906,13 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
                 "标题长度需在 1 至 200 个字符以内。",
               );
             }
-            // Bounded single safe retry when the model inferred unrequested metadata on create_task
+            // Bounded single safe retry when the model inferred unrequested metadata on a standalone create_task
             // (e.g., inferring priority:"high" from a literal "[加急]" tag in a title).
+            // Never advance to later writes in a multi-call batch after a rejected create.
             if (
               name === "create_task" &&
               result.error === "metadata_confirmation_required" &&
+              orderedCalls.length === 1 &&
               !clauseAnalysis.hasMetadataMention &&
               !metadata &&
               !retriedUnrequestedCreateMetadata

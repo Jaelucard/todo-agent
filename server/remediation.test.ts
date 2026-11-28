@@ -2262,3 +2262,139 @@ test("CODEX-REVIEW-3 + L4-forged-missing regressions: clause-0 preservation, cha
     assert.equal(await readFile(filename, "utf8"), before);
   }
 });
+
+test("CODEX-REVIEW-4 regressions: booking vs deposit/refund, per-clause repeated-delete pinning & no multi-call create retry, bare 删 multi-delete guard, filtered lookup full-store check, trailing label-first list filter", async (t) => {
+  // 1. P1 #1: 支付口腔诊所预约定金 and 退还口腔诊所预约押金 must NOT auto-delete for 预约牙医
+  for (const storedTitle of ["支付口腔诊所预约定金", "退还口腔诊所预约押金"] as const) {
+    const { tasks, filename } = await setup(t);
+    const stored = tasks.create(storedTitle);
+    const before = await readFile(filename, "utf8");
+    const turn = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(call("d1", "delete_task", { candidateIds: [stored.id] })),
+        proposal(
+          call("v1", "verify_task_reference", { decision: "match", candidateIds: [stored.id] }),
+        ),
+      ).provider,
+    ).runTurn([user("把预约牙医删掉")]);
+    assert.ok(
+      turn.failure === "reference_required" || turn.failure === "exact_title_not_found",
+      `${storedTitle}: got ${String(turn.failure)}`,
+    );
+    assert.deepEqual(turn.outcomes, []);
+    assert.equal(await readFile(filename, "utf8"), before);
+  }
+
+  // 2a. P1 #2: repeated delete clauses pin each call to its exact clause target (cannot delete 交房租 at clause 0)
+  {
+    const { tasks, filename } = await setup(t);
+    const milk = tasks.create("买牛奶");
+    const rent = tasks.create("交房租");
+    const before = await readFile(filename, "utf8");
+    const swapped = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(
+          call("d1", "delete_task", { candidateIds: [rent.id] }),
+          call("c1", "create_task", { title: "预约牙医" }),
+          call("d2", "delete_task", { candidateIds: [milk.id] }),
+        ),
+        final("已处理。"),
+      ).provider,
+    ).runTurn([user("把买牛奶删掉，再记一条预约牙医，另外把交房租删掉")]);
+    assert.equal(swapped.failure, "reference_required");
+    assert.deepEqual(swapped.outcomes, []);
+    assert.equal(await readFile(filename, "utf8"), before);
+  }
+
+  // 2b. P1 #2: rejected create_task in a multi-call batch stops immediately instead of advancing to later delete
+  {
+    const { tasks } = await setup(t);
+    const milk = tasks.create("买牛奶");
+    const rent = tasks.create("交房租");
+    const turn = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(
+          call("d1", "delete_task", { candidateIds: [milk.id] }),
+          call("c1", "create_task", { title: "预约牙医", priority: "high" }),
+          call("d2", "delete_task", { candidateIds: [rent.id] }),
+        ),
+        proposal(call("c2", "create_task", { title: "预约牙医" })),
+        final("已处理。"),
+      ).provider,
+    ).runTurn([user("把买牛奶删掉，再记一条预约牙医，另外把交房租删掉")]);
+    assert.equal(turn.failure, "metadata_confirmation_required");
+    assert.deepEqual(
+      turn.outcomes.map((o) => o.operation),
+      ["delete_task"],
+    );
+    assert.ok(tasks.list().some((item) => item.id === rent.id));
+  }
+
+  // 3. P1 #3: bare 删 multi-delete ("把买牛奶删，把取快递删。") fails closed and never deletes 交水费
+  {
+    const { tasks, filename } = await setup(t);
+    tasks.create("买牛奶");
+    tasks.create("取快递");
+    const water = tasks.create("交水费");
+    const before = await readFile(filename, "utf8");
+    const turn = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(call("d-wrong", "delete_task", { candidateIds: [water.id] })),
+      ).provider,
+    ).runTurn([user("把买牛奶删，把取快递删。")]);
+    assert.equal(turn.failure, "reference_required");
+    assert.deepEqual(turn.outcomes, []);
+    assert.equal(await readFile(filename, "utf8"), before);
+  }
+
+  // 4. P2 #4: filtered lookup hiding an existing low-priority task never falsely reports task_not_found
+  {
+    const { tasks, filename } = await setup(t);
+    tasks.create("去健身房", { priority: "low" });
+    tasks.create("交水电费", { priority: "high" });
+    const before = await readFile(filename, "utf8");
+    const turn = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", { priority: "high" })),
+        final("高优先级清单里没有找到「去健身房」。"),
+      ).provider,
+    ).runTurn([user("把去健身房标记完成")]);
+    assert.equal(turn.failure, "action_not_executed");
+    assert.doesNotMatch(turn.reply, /找不到指定的任务/);
+    assert.deepEqual(turn.outcomes, []);
+    assert.equal(await readFile(filename, "utf8"), before);
+  }
+
+  // 5. P2 #5: trailing scoped list parses label-first "优先级为高" and displays only matching tasks
+  {
+    const { tasks } = await setup(t);
+    const milk = tasks.create("买牛奶", { priority: "high" });
+    tasks.create("写周报", { priority: "high" });
+    tasks.create("取快递", { priority: "low" });
+    const turn = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(call("c1", "complete_task", { candidateIds: [milk.id] })),
+        proposal(call("l2", "list_tasks", { done: false, priority: "high" })),
+        final("已完成并列出。"),
+      ).provider,
+    ).runTurn([user("把买牛奶标为完成，最后列出优先级为高的待完成任务")]);
+    assert.equal(turn.failure, undefined);
+    assert.deepEqual(
+      turn.displayedList?.map((item) => item.title),
+      ["写周报"],
+    );
+    assert.match(turn.reply, /待完成 · 高优先级清单：\n- 写周报/);
+    assert.doesNotMatch(turn.reply, /取快递/);
+  }
+});
