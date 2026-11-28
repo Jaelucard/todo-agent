@@ -13,7 +13,7 @@ type Workload = NonNullable<TaskMetadata["workload"]>;
 
 const quotedName = String.raw`(?:「[^「」]+」|“[^“”]+”|"[^"]+"|'[^']+'|‘[^‘’]+’|『[^『』]+』)`;
 const quotedGlobal = new RegExp(quotedName, "gu");
-const namedTask = new RegExp(`^(${quotedName})(?:这(?:一)?[项条个](?:任务|待办)?)?$`, "u");
+const namedTask = new RegExp(`^(${quotedName})(?:[这那](?:一)?[项条个件](?:任务|待办|事)?)?$`, "u");
 const literalCreate = new RegExp(
   String.raw`^(?:请(?:帮我)?|帮我|麻烦(?:帮我)?)?(?:新增|新建|创建|添加|再?记(?:一下|一条|下))(?:一(?:项|条|个)(?:任务|待办)?)?\s*(${quotedName})([，,、].*)?[。！.!]?$`,
   "u",
@@ -386,7 +386,7 @@ export function singleMetadataRequest(content: string): SingleMetadataRequest | 
   const text = content
     .trim()
     .replace(/^(?:请(?:帮我)?|帮我|麻烦(?:帮我)?)/u, "")
-    .replace(/吧?[。！.!]?$/u, "");
+    .replace(/[吧呢啊呀哦嘛]?[。！.!]?$/u, "");
   const instruction = maskQuotedTitles(text);
   if (!/(?:优先级|工作量)/u.test(instruction)) return undefined;
 

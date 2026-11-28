@@ -4556,3 +4556,235 @@ test("review round 16 regressions (b2b22000): modal-particle status/metadata ren
     assert.equal(tasks2Setup.tasks.list().find((item) => item.id === contract2.id)?.done, true);
   }
 });
+
+test("review round 17 regressions (c7050b05): 改为已完成 pinning, verb-first reopen guard, pronoun-titled task guard, 顺便/然后『…』这件任务, metadata-like completion title, 啊 particle, and standalone 机器和设备 metadata update", async (t) => {
+  // 1. P1 #1: "把寄合同改为已完成吧" rejects complete_task(买牛奶) and update_task(买牛奶, {done:true}), accepts 寄合同
+  for (const wrongTool of [
+    (id: string) => call("c1", "complete_task", { candidateIds: [id] }),
+    (id: string) => call("u1", "update_task", { candidateIds: [id], changes: { done: true } }),
+  ]) {
+    const { tasks, filename } = await setup(t);
+    tasks.create("寄合同");
+    const milk = tasks.create("买牛奶");
+    const before = await readFile(filename, "utf8");
+    const turn = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(wrongTool(milk.id)),
+        final("收到。"),
+      ).provider,
+    ).runTurn([user("把寄合同改为已完成吧")]);
+    assert.ok(turn.failure);
+    assert.equal(await readFile(filename, "utf8"), before);
+  }
+  {
+    const { tasks } = await setup(t);
+    const contract = tasks.create("寄合同");
+    tasks.create("买牛奶");
+    const turn = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(
+          call("u1", "update_task", { candidateIds: [contract.id], changes: { done: true } }),
+        ),
+        final("收到。"),
+      ).provider,
+    ).runTurn([user("把寄合同改为已完成吧")]);
+    assert.equal(turn.failure, undefined);
+    assert.equal(tasks.list().find((item) => item.id === contract.id)?.done, true);
+  }
+
+  // 2. P1 #2: "把寄合同改回未完成，再恢复机器和设备到待完成" rejects reopening 买牛奶 and accepts 机器和设备
+  {
+    const { tasks } = await setup(t);
+    const contract = tasks.update(tasks.create("寄合同").id, { done: true })!;
+    tasks.update(tasks.create("机器和设备").id, { done: true });
+    const milk = tasks.update(tasks.create("买牛奶").id, { done: true })!;
+    const wrong = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(
+          call("u1", "update_task", { candidateIds: [contract.id], changes: { done: false } }),
+          call("u2", "update_task", { candidateIds: [milk.id], changes: { done: false } }),
+        ),
+        final("收到。"),
+      ).provider,
+    ).runTurn([user("把寄合同改回未完成，再恢复机器和设备到待完成")]);
+    assert.ok(wrong.failure);
+    assert.equal(tasks.list().find((item) => item.id === milk.id)?.done, true);
+
+    const setup2 = await setup(t);
+    const c2 = setup2.tasks.update(setup2.tasks.create("寄合同").id, { done: true })!;
+    const dev2 = setup2.tasks.update(setup2.tasks.create("机器和设备").id, { done: true })!;
+    setup2.tasks.update(setup2.tasks.create("买牛奶").id, { done: true });
+    const right = await createAgent(
+      setup2.tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(
+          call("u1", "update_task", { candidateIds: [c2.id], changes: { done: false } }),
+          call("u2", "update_task", { candidateIds: [dev2.id], changes: { done: false } }),
+        ),
+        final("收到。"),
+      ).provider,
+    ).runTurn([user("把寄合同改回未完成，再恢复机器和设备到待完成")]);
+    assert.equal(right.failure, undefined);
+    assert.equal(setup2.tasks.list().find((item) => item.id === dev2.id)?.done, false);
+  }
+
+  // 3. P1 #3: "把寄合同改回未完成，再把它的标题改为寄新合同" rejects renaming task literally titled "它"
+  {
+    const { tasks } = await setup(t);
+    const contract = tasks.update(tasks.create("寄合同").id, { done: true })!;
+    const pronounTask = tasks.create("它");
+    const turn = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(
+          call("u1", "update_task", { candidateIds: [contract.id], changes: { done: false } }),
+          call("u2", "update_task", {
+            candidateIds: [pronounTask.id],
+            changes: { title: "寄新合同" },
+          }),
+        ),
+        final("收到。"),
+      ).provider,
+    ).runTurn([user("把寄合同改回未完成，再把它的标题改为寄新合同")]);
+    assert.ok(turn.failure);
+    assert.equal(tasks.list().find((item) => item.id === pronounTask.id)?.title, "它");
+  }
+
+  // 4. P1 #4: "删掉买牛奶，顺便『寄合同』这件任务完成了" rejects literal "顺便『寄合同』这件任务" and accepts "寄合同"
+  {
+    const { tasks } = await setup(t);
+    const milk = tasks.create("买牛奶");
+    const contract = tasks.create("寄合同");
+    const literal = tasks.create("顺便『寄合同』这件任务");
+    const wrong = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(
+          call("d1", "delete_task", { candidateIds: [milk.id] }),
+          call("c1", "complete_task", { candidateIds: [literal.id] }),
+        ),
+        final("收到。"),
+      ).provider,
+    ).runTurn([user("删掉买牛奶，顺便『寄合同』这件任务完成了")]);
+    assert.ok(wrong.failure);
+    assert.equal(tasks.list().find((item) => item.id === literal.id)?.done, false);
+    assert.equal(tasks.list().find((item) => item.id === contract.id)?.done, false);
+
+    const setup2 = await setup(t);
+    const m2 = setup2.tasks.create("买牛奶");
+    const c2 = setup2.tasks.create("寄合同");
+    setup2.tasks.create("顺便『寄合同』这件任务");
+    const right = await createAgent(
+      setup2.tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(
+          call("d1", "delete_task", { candidateIds: [m2.id] }),
+          call("c1", "complete_task", { candidateIds: [c2.id] }),
+        ),
+        final("收到。"),
+      ).provider,
+    ).runTurn([user("删掉买牛奶，顺便『寄合同』这件任务完成了")]);
+    assert.equal(right.failure, undefined);
+    assert.equal(setup2.tasks.list().find((item) => item.id === c2.id)?.done, true);
+  }
+
+  // 5. P1 #5: "优先级改为高影响评估完成了" pins 优先级改为高影响评估 and rejects completing 买牛奶
+  {
+    const { tasks, filename } = await setup(t);
+    const evalTask = tasks.create("优先级改为高影响评估");
+    const milk = tasks.create("买牛奶");
+    const before = await readFile(filename, "utf8");
+    const wrong = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(call("c1", "complete_task", { candidateIds: [milk.id] })),
+        final("收到。"),
+      ).provider,
+    ).runTurn([user("优先级改为高影响评估完成了")]);
+    assert.ok(wrong.failure);
+    assert.equal(await readFile(filename, "utf8"), before);
+
+    const right = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(call("c1", "complete_task", { candidateIds: [evalTask.id] })),
+        final("收到。"),
+      ).provider,
+    ).runTurn([user("优先级改为高影响评估完成了")]);
+    assert.equal(right.failure, undefined);
+    assert.equal(tasks.list().find((item) => item.id === evalTask.id)?.done, true);
+  }
+
+  // 6. P2 #1: "把寄合同改成高优先级，再把交房租改为大工作量啊" accepts both updates
+  {
+    const { tasks } = await setup(t);
+    const contract = tasks.create("寄合同");
+    const rent = tasks.create("交房租");
+    const turn = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(
+          call("u1", "update_task", { candidateIds: [contract.id], changes: { priority: "high" } }),
+          call("u2", "update_task", { candidateIds: [rent.id], changes: { workload: "large" } }),
+        ),
+        final("收到。"),
+      ).provider,
+    ).runTurn([user("把寄合同改成高优先级，再把交房租改为大工作量啊")]);
+    assert.equal(turn.failure, undefined);
+    assert.equal(tasks.list().find((item) => item.id === contract.id)?.priority, "high");
+    assert.equal(tasks.list().find((item) => item.id === rent.id)?.workload, "large");
+  }
+
+  // 7. P2 #2: standalone "把机器和设备改为高优先级" updates stored "机器和设备"
+  {
+    const { tasks } = await setup(t);
+    const dev = tasks.create("机器和设备");
+    const turn = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(
+          call("u1", "update_task", { candidateIds: [dev.id], changes: { priority: "high" } }),
+        ),
+        final("收到。"),
+      ).provider,
+    ).runTurn([user("把机器和设备改为高优先级")]);
+    assert.equal(turn.failure, undefined);
+    assert.equal(tasks.list().find((item) => item.id === dev.id)?.priority, "high");
+  }
+
+  // 8. P2 #3: ordered "删掉买牛奶，然后『寄合同』这件任务完成了" succeeds on 买牛奶 + 寄合同
+  {
+    const { tasks } = await setup(t);
+    const milk = tasks.create("买牛奶");
+    const contract = tasks.create("寄合同");
+    const turn = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(
+          call("d1", "delete_task", { candidateIds: [milk.id] }),
+          call("c1", "complete_task", { candidateIds: [contract.id] }),
+        ),
+        final("收到。"),
+      ).provider,
+    ).runTurn([user("删掉买牛奶，然后『寄合同』这件任务完成了")]);
+    assert.equal(turn.failure, undefined);
+    assert.equal(tasks.list().length, 1);
+    assert.equal(tasks.list()[0]?.id, contract.id);
+    assert.equal(tasks.list()[0]?.done, true);
+  }
+});
