@@ -5006,3 +5006,197 @@ test("review round 18 regressions (73979a42): unbound reopen, compound quoted co
     assert.equal(tasks.list().find((item) => item.id === review.id)?.done, false);
   }
 });
+
+test("review round 19 regressions (905ba6c0): unresolved single delete, prefixed/compound unbound reopen, ordered unbound completion alias, compound metadata-titled completion, day-level bill conflict, embedded reopen title, ordered conjunction completion, and connector-free reopen", async (t) => {
+  // 1. P1 #1: "删掉机器和设备" when only 交房租 exists rejects deleting 交房租
+  {
+    const { tasks, filename } = await setup(t);
+    const rent = tasks.create("交房租");
+    const before = await readFile(filename, "utf8");
+    const turn = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(call("d1", "delete_task", { candidateIds: [rent.id] })),
+        final("收到。"),
+      ).provider,
+    ).runTurn([user("删掉机器和设备")]);
+    assert.ok(turn.failure);
+    assert.equal(await readFile(filename, "utf8"), before);
+  }
+
+  // 2. P1 #2: "先恢复它到待完成", "给我恢复它到待完成", and "完成交房租，再恢复它" reject reopening unrelated tasks
+  for (const prompt of ["先恢复它到待完成", "给我恢复它到待完成"]) {
+    const { tasks, filename } = await setup(t);
+    const rent = tasks.update(tasks.create("交房租").id, { done: true })!;
+    const before = await readFile(filename, "utf8");
+    const turn = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(call("u1", "update_task", { candidateIds: [rent.id], changes: { done: false } })),
+        final("收到。"),
+      ).provider,
+    ).runTurn([user(prompt)]);
+    assert.ok(turn.failure, prompt);
+    assert.equal(await readFile(filename, "utf8"), before, prompt);
+  }
+  {
+    const { tasks } = await setup(t);
+    const rent = tasks.create("交房租");
+    const meter = tasks.update(tasks.create("检查电表").id, { done: true })!;
+    const turn = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(
+          call("c1", "complete_task", { candidateIds: [rent.id] }),
+          call("u1", "update_task", { candidateIds: [meter.id], changes: { done: false } }),
+        ),
+        final("收到。"),
+      ).provider,
+    ).runTurn([user("完成交房租，再恢复它")]);
+    assert.ok(turn.failure);
+    assert.equal(tasks.list().find((item) => item.id === meter.id)?.done, true);
+  }
+
+  // 3. P1 #3: "把买牛奶改为高优先级，然后完成它" rejects update_task({done:true}) on unrelated 机器和设备
+  {
+    const { tasks, filename } = await setup(t);
+    const milk = tasks.create("买牛奶");
+    const dev = tasks.create("机器和设备");
+    const before = await readFile(filename, "utf8");
+    const turn = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(
+          call("u1", "update_task", { candidateIds: [milk.id], changes: { priority: "high" } }),
+          call("u2", "update_task", { candidateIds: [dev.id], changes: { done: true } }),
+        ),
+        final("收到。"),
+      ).provider,
+    ).runTurn([user("把买牛奶改为高优先级，然后完成它")]);
+    assert.ok(turn.failure);
+    assert.equal(await readFile(filename, "utf8"), before);
+  }
+
+  // 4. P1 #4: "删掉买牛奶，优先级改为高影响评估完成了" blocks priority update on 交房租 and blocks extra priority on 优先级改为高影响评估
+  {
+    const { tasks } = await setup(t);
+    const milk = tasks.create("买牛奶");
+    const evalTask = tasks.create("优先级改为高影响评估");
+    const rent = tasks.create("交房租");
+    const wrongRent = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(
+          call("d1", "delete_task", { candidateIds: [milk.id] }),
+          call("u1", "update_task", { candidateIds: [rent.id], changes: { priority: "high" } }),
+        ),
+        final("收到。"),
+      ).provider,
+    ).runTurn([user("删掉买牛奶，优先级改为高影响评估完成了")]);
+    assert.ok(wrongRent.failure);
+    assert.equal(tasks.list().find((item) => item.id === rent.id)?.priority, undefined);
+
+    const setup2 = await setup(t);
+    const m2 = setup2.tasks.create("买牛奶");
+    const e2 = setup2.tasks.create("优先级改为高影响评估");
+    const wrongExtra = await createAgent(
+      setup2.tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(
+          call("d1", "delete_task", { candidateIds: [m2.id] }),
+          call("u1", "update_task", {
+            candidateIds: [e2.id],
+            changes: { done: true, priority: "high" },
+          }),
+        ),
+        final("收到。"),
+      ).provider,
+    ).runTurn([user("删掉买牛奶，优先级改为高影响评估完成了")]);
+    assert.ok(wrongExtra.failure);
+    assert.equal(setup2.tasks.list().find((item) => item.id === e2.id)?.priority, undefined);
+    assert.equal(setup2.tasks.list().find((item) => item.id === e2.id)?.done, false);
+    assert.ok(evalTask.id);
+  }
+
+  // 5. P1 #5: "把交10月12日水费删掉" does not delete "缴纳10月13日水费"
+  {
+    const { tasks, filename } = await setup(t);
+    const otherDay = tasks.create("缴纳10月13日水费");
+    const before = await readFile(filename, "utf8");
+    const turn = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(call("d1", "delete_task", { candidateIds: [otherDay.id] })),
+        proposal(
+          call("v1", "verify_task_reference", { decision: "match", candidateIds: [otherDay.id] }),
+        ),
+        final("收到。"),
+      ).provider,
+    ).runTurn([user("把交10月12日水费删掉")]);
+    assert.ok(turn.failure);
+    assert.equal(await readFile(filename, "utf8"), before);
+  }
+
+  // 6. P2 #1: "这项恢复测试完成了" with "这项恢复测试" stored succeeds
+  {
+    const { tasks } = await setup(t);
+    const item = tasks.create("这项恢复测试");
+    const turn = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(call("c1", "complete_task", { candidateIds: [item.id] })),
+        final("收到。"),
+      ).provider,
+    ).runTurn([user("这项恢复测试完成了")]);
+    assert.equal(turn.failure, undefined);
+    assert.equal(tasks.list().find((task) => task.id === item.id)?.done, true);
+  }
+
+  // 7. P2 #2: "删掉买牛奶，然后把机器和设备改为已完成吧" succeeds with exact IDs
+  {
+    const { tasks } = await setup(t);
+    const milk = tasks.create("买牛奶");
+    const dev = tasks.create("机器和设备");
+    const turn = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(
+          call("d1", "delete_task", { candidateIds: [milk.id] }),
+          call("c1", "complete_task", { candidateIds: [dev.id] }),
+        ),
+        final("收到。"),
+      ).provider,
+    ).runTurn([user("删掉买牛奶，然后把机器和设备改为已完成吧")]);
+    assert.equal(turn.failure, undefined);
+    assert.equal(tasks.list().length, 1);
+    assert.equal(tasks.list()[0]?.id, dev.id);
+    assert.equal(tasks.list()[0]?.done, true);
+  }
+
+  // 8. P2 #3: "恢复寄合同待完成" with completed "寄合同" stored succeeds
+  {
+    const { tasks } = await setup(t);
+    const contract = tasks.update(tasks.create("寄合同").id, { done: true })!;
+    const turn = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(
+          call("u1", "update_task", { candidateIds: [contract.id], changes: { done: false } }),
+        ),
+        final("收到。"),
+      ).provider,
+    ).runTurn([user("恢复寄合同待完成")]);
+    assert.equal(turn.failure, undefined);
+    assert.equal(tasks.list().find((task) => task.id === contract.id)?.done, false);
+  }
+});

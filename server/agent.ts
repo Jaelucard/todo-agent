@@ -382,6 +382,22 @@ function extractTemporalQualifiers(text: string): Set<string> {
     const n = chineseMonths[m[1]];
     if (n) qualifiers.add(`month:${n}`);
   }
+  for (const m of text.matchAll(/(3[01]|[12]\d|0?[1-9])\s*[日号]/gu)) {
+    qualifiers.add(`day:${Number(m[1])}`);
+  }
+  for (const m of text.matchAll(/(?<!\d)(1[0-2]|0?[1-9])[/.-](3[01]|[12]\d|0?[1-9])(?!\d)/gu)) {
+    qualifiers.add(`month:${Number(m[1])}`);
+    qualifiers.add(`day:${Number(m[2])}`);
+  }
+  for (const m of text.matchAll(/第([一二三四五六七八九十\d]+)(?:周|期|次|批|轮|版|阶段)/gu)) {
+    qualifiers.add(`period:${m[1]}`);
+  }
+  for (const m of text.matchAll(/(上|中|下)旬/gu)) {
+    qualifiers.add(`ten_day:${m[1]}`);
+  }
+  for (const m of text.matchAll(/(上半|下半)(?:年|月)/gu)) {
+    qualifiers.add(`half:${m[1]}`);
+  }
   const chineseQuarters: Record<string, number> = { 一: 1, 二: 2, 三: 3, 四: 4 };
   for (const m of text.matchAll(/(?:[Qq]([1-4])|第([一二三四1-4])季度)/gu)) {
     const q = m[1] ? Number(m[1]) : (chineseQuarters[m[2]] ?? Number(m[2]));
@@ -1715,7 +1731,7 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
                 if (!isUnboundTarget(rest) && seenTaskTitles.has(rest)) {
                   return rest;
                 }
-                return rest.replace(/\s*(?:为|成|到|至)\s*(?:未|待)完成(?:状态)?$/u, "").trim();
+                return rest.replace(/\s*(?:为|成|到|至)?\s*(?:未|待)完成(?:状态)?$/u, "").trim();
               })()
             : undefined;
         if (rawReopenTarget) {
@@ -1870,11 +1886,37 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
         (trailingList.wantsList && Object.keys(trailingList.filter).length > 0
           ? trailingList.filter
           : undefined) ?? leadingListFilter;
+      function isExactStoredTitleCompletionClause(clause: string, clauseIndex: number): boolean {
+        if (isPureListClause(clause)) return false;
+        const trimmedClause = stripLeadingActionPrefixes(clause, {
+          includeConnectors: clauseIndex > 0,
+        }).trim();
+        if (/^(?:把|将)/u.test(trimmedClause)) return false;
+        const m =
+          /^([^\r\n，,；;。？！!?]{1,200}?)(?:(?:这|那)(?:一)?[条项个件](?:任务|待办|事)?)?(?:已经|已)?(?:完成了|做完了|搞定了)[吧呢啊呀哦嘛]?[。！!]?$/u.exec(
+            trimmedClause,
+          );
+        const rawCandidate = m?.[1]?.trim();
+        if (!rawCandidate || isUnboundTarget(rawCandidate)) return false;
+        return seenTaskTitles.has(rawCandidate);
+      }
       const rawTurnClauseIntents =
         clauseAnalysis.positiveClauses.length >= 2
-          ? clauseAnalysis.positiveClauses.map((clause) =>
-              isPureListClause(clause) ? undefined : analyzeClauses(clause),
-            )
+          ? clauseAnalysis.positiveClauses.map((clause, idx) => {
+              if (isPureListClause(clause)) return undefined;
+              const intent = analyzeClauses(clause);
+              if (isExactStoredTitleCompletionClause(clause, idx)) {
+                return {
+                  ...intent,
+                  hasMetadataMention: false,
+                  allowRename: false,
+                  allowReopen: false,
+                  allowedPriorities: new Set<NonNullable<TaskMetadata["priority"]>>(),
+                  allowedWorkloads: new Set<NonNullable<TaskMetadata["workload"]>>(),
+                };
+              }
+              return intent;
+            })
           : [];
       const turnClauseIntents = rawTurnClauseIntents.map((intent, idx) => {
         if (
@@ -2410,10 +2452,16 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
           const explicitUpdate =
             operation === "update_task" ? extractExplicitUpdateSpec(text, true) : undefined;
           const named = taskCommand(text);
-          const namedTitle = named?.explicit && namedTarget(named.target);
+          const namedTitle = named?.explicit ? resolveExplicitTargetName(named.target) : undefined;
+          const hasUnboundNamedTarget =
+            Boolean(named?.target) &&
+            isUnboundTarget(named!.target.trim()) &&
+            !namedTarget(named!.target)?.literal;
           const metadata = singleMetadataRequest(text);
           const metadataEdit = metadata?.operation === "update_task" ? metadata : undefined;
-          const metadataTarget = metadataEdit?.target && namedTarget(metadataEdit.target);
+          const metadataTarget = metadataEdit?.target
+            ? resolveExplicitTargetName(metadataEdit.target)
+            : undefined;
           const metadataCreate =
             metadata?.operation === "create_task"
               ? singleCreateGrant(metadata.target, metadata.changes)
@@ -2438,13 +2486,21 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
               operation === "create_task" &&
               analyzeClauses(text).hasMetadataMention &&
               !metadataCreate,
+            unresolvedUnboundTarget: operation !== "create_task" && hasUnboundNamedTarget,
           };
         },
       );
       if (
         orderedOperations?.some(
-          ({ operation, title, requiredChanges, unresolvedCreateMetadata }) =>
+          ({
+            operation,
+            title,
+            requiredChanges,
+            unresolvedCreateMetadata,
+            unresolvedUnboundTarget,
+          }) =>
             unresolvedCreateMetadata ||
+            unresolvedUnboundTarget ||
             (operation === "update_task" && (!title || !requiredChanges)) ||
             (!title &&
               orderedOperations.filter((entry) => entry.operation === operation).length > 1),
@@ -3155,9 +3211,16 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
         if (
           orderedOperations &&
           writes.some((call, index) => {
-            const expectedOp = orderedOperations[appliedOrderedOperations + index]?.operation;
+            const plannedStep = orderedOperations[appliedOrderedOperations + index];
+            const expectedOp = plannedStep?.operation;
             if (call.function.name === expectedOp) return false;
-            if (expectedOp === "complete_task" && isCompletionOnlyUpdate(call)) return false;
+            if (
+              expectedOp === "complete_task" &&
+              Boolean(plannedStep?.title) &&
+              isCompletionOnlyUpdate(call)
+            ) {
+              return false;
+            }
             return true;
           })
         ) {
@@ -3489,10 +3552,65 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
             callRank !== undefined &&
             !activeUpdateSpec &&
             !rankedComplete &&
-            (updateClauseCount >= 2 ||
+            (turnMutationClauseIndices.length >= 2 ||
+              updateClauseCount >= 2 ||
               /(?:把|将)/u.test(maskQuotedTitles(clauseAnalysis.positiveClauses[callRank] ?? "")))
           ) {
             return finish("reference_required");
+          }
+          const explicitConjunctionAllowedTitles = (() => {
+            if (
+              !(name === "delete_task" || name === "complete_task" || isCompletionUpdateCall) ||
+              planned?.title ||
+              singleGrant ||
+              activeBoundReference ||
+              clauseAnalysis.clauseCount !== 1 ||
+              !command?.explicit ||
+              target
+            ) {
+              return undefined;
+            }
+            const strippedTarget = command.target
+              .trim()
+              .replace(/(?:都|全|全部|(?:这|那)?(?:两|三|四|几)?[条项个件](?:任务|待办)?)+$/u, "")
+              .trim();
+            const parts = strippedTarget
+              .split(/\s*(?:和|跟|与|以及|、)\s*/u)
+              .map((part) => part.trim())
+              .filter(Boolean);
+            if (parts.length < 2) return undefined;
+            const resolved = parts.map((part) => resolveExplicitTargetName(part));
+            if (resolved.every((entry) => entry && seenTaskTitles.has(entry.title))) {
+              return new Set(resolved.map((entry) => entry!.title));
+            }
+            return undefined;
+          })();
+          if (
+            (name === "delete_task" || name === "complete_task" || isCompletionUpdateCall) &&
+            !planned?.title &&
+            !singleGrant &&
+            !activeBoundReference &&
+            !semanticDeleteName &&
+            !explicitConjunctionAllowedTitles &&
+            clauseAnalysis.clauseCount === 1 &&
+            command?.explicit &&
+            !target
+          ) {
+            const hasNonEmptyCandidates = (() => {
+              try {
+                const parsed: unknown = JSON.parse(args);
+                const cands =
+                  typeof parsed === "object" && parsed !== null
+                    ? Reflect.get(parsed, "candidateIds")
+                    : undefined;
+                return Array.isArray(cands) && cands.length > 0;
+              } catch {
+                return true;
+              }
+            })();
+            if (hasNonEmptyCandidates) {
+              return finish("reference_required");
+            }
           }
           const rankedUpdateIntent =
             name === "update_task" && callRank !== undefined && !activeBoundReference
@@ -3574,11 +3692,12 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
             ? { ...rawBaseGrant, ...clauseUpdatePolicy }
             : rawBaseGrant;
           const mixedAllowedTitles =
-            name === "delete_task"
+            explicitConjunctionAllowedTitles ??
+            (name === "delete_task"
               ? mixedDeletionAllowedTitles
               : name === "complete_task"
                 ? liveMixedCompletionAllowedTitles
-                : undefined;
+                : undefined);
           const grantWithMixedDeletes =
             !title && mixedAllowedTitles
               ? {

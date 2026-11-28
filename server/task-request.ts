@@ -1091,10 +1091,9 @@ export function detectUnboundCommand(input: string): "anaphoric" | "positional" 
     if (firstHasSubject && !restIsOnlyMetadata) return undefined;
   }
 
-  const normalized = masked
-    .replace(/^(?:请(?:帮我)?|帮我|麻烦(?:帮我)?)?/u, "")
+  const normalized = stripLeadingActionPrefixes(masked, { includeConnectors: false })
     .replace(
-      /^(?:再|只)(?=把|将|给|删除|删掉|移除|完成|标记|改|设|调|提高|降低|重命名|改名|恢复|退回|重置|重新|取消|撤销)/u,
+      /^(?:(?:请|帮我|给我|麻烦|先|再|只)\s*)+(?=把|将|给|删除|删掉|移除|完成|标记|改|设|调|提高|降低|重命名|改名|恢复|退回|重置|重新|取消|撤销)/u,
       "",
     )
     .replace(/[吧呢啊呀哦嘛]?[。！？.!?]?$/u, "")
@@ -1112,7 +1111,7 @@ export function detectUnboundCommand(input: string): "anaphoric" | "positional" 
   if (baPattern) candidates.push(baPattern[1].trim());
 
   const actionFirst =
-    /^(?:删掉|删除|移除|完成|标(?:记)?(?:为|成)?(?:已|未|待)?完成|提高|降低|调高|调低|重新(?:打开|开启)|恢复|退回|重置|取消|撤销|重命名|改名)\s*(.+?)(?:的\s*(?:优先级|工作量|标题|名称|名字|(?:已)?完成(?:状态)?)|\s*(?:为|成|到|至)\s*(?:未|待)完成(?:状态)?|[吧呢啊呀哦嘛]?)$/u.exec(
+    /^(?:删掉|删除|移除|完成|标(?:记)?(?:为|成)?(?:已|未|待)?完成|提高|降低|调高|调低|重新(?:打开|开启)|恢复|退回|重置|取消|撤销|重命名|改名)\s*(.+?)(?:的\s*(?:优先级|工作量|标题|名称|名字|(?:已)?完成(?:状态)?)|\s*(?:为|成|到|至)?\s*(?:未|待)完成(?:状态)?|[吧呢啊呀哦嘛]?)$/u.exec(
       normalized,
     );
   if (actionFirst) candidates.push(actionFirst[1].trim());
@@ -1124,7 +1123,7 @@ export function detectUnboundCommand(input: string): "anaphoric" | "positional" 
   if (targetFirstMetadata) candidates.push(targetFirstMetadata[1].trim());
 
   const subjectFirst =
-    /^(.+?)(?:已经|都|也|快)?(?:请)?(?:帮我|给我)?(?:标(?:记)?(?:为|成)?(?:已|未|待)?完成|完成(?:了)?|做完了|做好了|买好了|搞定了|删掉|删除|移除|改回|恢复|退回|重置|重新(?:打开|开启)|重命名|改名|更名|改(?:为|成|到)|设(?:置)?(?:为|成|到)|调(?:整)?(?:为|成|到))/u.exec(
+    /^(.+?)(?:已经|都|也|快)?(?:请)?(?:帮我|给我)?(?:(?:标(?:记)?(?:为|成)?(?:已|未|待)?完成|完成(?:了)?|做完了|做好了|买好了|搞定了|删掉|删除|移除)$|(?:改回|恢复|退回|重置|重新(?:打开|开启))(?:(?:为|成|到|至)?\s*(?:未|待)完成(?:状态)?|一下|下)?$|(?:重命名|改名|更名|改(?:为|成|到)|设(?:置)?(?:为|成|到)|调(?:整)?(?:为|成|到)))/u.exec(
       normalized,
     );
   if (subjectFirst) candidates.push(subjectFirst[1].trim());
