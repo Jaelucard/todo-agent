@@ -382,21 +382,51 @@ function extractTemporalQualifiers(text: string): Set<string> {
     const n = chineseMonths[m[1]];
     if (n) qualifiers.add(`month:${n}`);
   }
+  const chineseDigits: Record<string, number> = {
+    一: 1,
+    二: 2,
+    三: 3,
+    四: 4,
+    五: 5,
+    六: 6,
+    七: 7,
+    八: 8,
+    九: 9,
+  };
+  const parseChineseNumber = (raw: string): number | undefined => {
+    if (/^\d+$/u.test(raw)) return Number(raw);
+    const cleaned = raw.replace(/^初/u, "");
+    if (cleaned === "十") return 10;
+    if (cleaned.startsWith("三十")) return 30 + (chineseDigits[cleaned.slice(2)] ?? 0);
+    if (cleaned.startsWith("二十")) return 20 + (chineseDigits[cleaned.slice(2)] ?? 0);
+    if (cleaned.startsWith("廿")) return 20 + (chineseDigits[cleaned.slice(1)] ?? 0);
+    if (cleaned.startsWith("十")) return 10 + (chineseDigits[cleaned.slice(1)] ?? 0);
+    return chineseDigits[cleaned];
+  };
   for (const m of text.matchAll(/(3[01]|[12]\d|0?[1-9])\s*[日号]/gu)) {
     qualifiers.add(`day:${Number(m[1])}`);
+  }
+  for (const m of text.matchAll(
+    /(三十一|三十|二十[一二三四五六七八九]?|廿[一二三四五六七八九]?|十[一二三四五六七八九]?|初[一二三四五六七八九十]|[一二三四五六七八九])\s*[日号]/gu,
+  )) {
+    const day = parseChineseNumber(m[1]);
+    if (day && day >= 1 && day <= 31) qualifiers.add(`day:${day}`);
   }
   for (const m of text.matchAll(/(?<!\d)(1[0-2]|0?[1-9])[/.-](3[01]|[12]\d|0?[1-9])(?!\d)/gu)) {
     qualifiers.add(`month:${Number(m[1])}`);
     qualifiers.add(`day:${Number(m[2])}`);
   }
-  for (const m of text.matchAll(/第([一二三四五六七八九十\d]+)(?:周|期|次|批|轮|版|阶段)/gu)) {
-    qualifiers.add(`period:${m[1]}`);
+  for (const m of text.matchAll(
+    /第(三十一|三十|二十[一二三四五六七八九]?|十[一二三四五六七八九]?|[一二三四五六七八九]|\d+)(周|期|次|批|轮|版|阶段)/gu,
+  )) {
+    const num = parseChineseNumber(m[1]) ?? m[1];
+    qualifiers.add(`period:${m[2]}:${num}`);
   }
   for (const m of text.matchAll(/(上|中|下)旬/gu)) {
     qualifiers.add(`ten_day:${m[1]}`);
   }
-  for (const m of text.matchAll(/(上半|下半)(?:年|月)/gu)) {
-    qualifiers.add(`half:${m[1]}`);
+  for (const m of text.matchAll(/(上半|下半)(年|月)/gu)) {
+    qualifiers.add(`half:${m[2]}:${m[1]}`);
   }
   const chineseQuarters: Record<string, number> = { 一: 1, 二: 2, 三: 3, 四: 4 };
   for (const m of text.matchAll(/(?:[Qq]([1-4])|第([一二三四1-4])季度)/gu)) {
@@ -2176,6 +2206,7 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
           ? target
           : undefined;
       let exactCompleteTitle: string | undefined;
+      let exactCompleteAllowedTitles: Set<string> | undefined;
       if (exactComplete || explicitDelete?.literal) {
         const view = createTaskTools(tasks).execute("list_tasks", "{}");
         if (!view.ok) return finish(view.error);
@@ -2188,19 +2219,21 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
           }
           if (exactComplete) {
             const matches = view.tasks.filter((task) => task.title === exactComplete.title);
-            const hasPartialOrAbbrev =
-              !matches.length &&
-              !exactComplete.literal &&
-              view.tasks.some(
-                (task) =>
-                  !clauseAnalysis.forbiddenTitles.has(task.title) &&
-                  (task.title.includes(exactComplete.title) ||
-                    exactComplete.title.includes(task.title) ||
-                    isTitleAbbreviation(exactComplete.title, task.title) ||
-                    hasGroundedSemanticMatch(exactComplete.title, task.title)),
-              );
-            if (matches.length || exactComplete.literal || !hasPartialOrAbbrev) {
+            const partialMatches =
+              !matches.length && !exactComplete.literal
+                ? view.tasks.filter(
+                    (task) =>
+                      !clauseAnalysis.forbiddenTitles.has(task.title) &&
+                      (task.title.includes(exactComplete.title) ||
+                        exactComplete.title.includes(task.title) ||
+                        isTitleAbbreviation(exactComplete.title, task.title) ||
+                        hasGroundedSemanticMatch(exactComplete.title, task.title)),
+                  )
+                : [];
+            if (matches.length || exactComplete.literal || partialMatches.length === 0) {
               exactCompleteTitle = exactComplete.title;
+            } else {
+              exactCompleteAllowedTitles = new Set(partialMatches.map((task) => task.title));
             }
             if (
               matches.length === 1 &&
@@ -2446,6 +2479,71 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
       const transcript: ChatCompletionMessageParam[] = [latest];
       const executedCallIds = new Set<string>();
       let expectedMutationView: Task[] | undefined;
+      function splitConjunctionOutsideQuotes(inputText: string): string[] {
+        const openToClose = new Map<string, string>([
+          ["「", "」"],
+          ["“", "”"],
+          ["『", "』"],
+          ["‘", "’"],
+          ['"', '"'],
+          ["'", "'"],
+        ]);
+        const parts: string[] = [];
+        let current = "";
+        let closing: string | undefined;
+        let i = 0;
+        while (i < inputText.length) {
+          const ch = inputText[i];
+          if (closing) {
+            current += ch;
+            if (ch === closing) closing = undefined;
+            i++;
+            continue;
+          }
+          const maybeClose = openToClose.get(ch);
+          if (maybeClose) {
+            closing = maybeClose;
+            current += ch;
+            i++;
+            continue;
+          }
+          const sep = /^\s*(?:以及|和|跟|与|、)\s*/u.exec(inputText.slice(i));
+          if (sep) {
+            if (current.trim()) parts.push(current.trim());
+            current = "";
+            i += sep[0].length;
+            continue;
+          }
+          current += ch;
+          i++;
+        }
+        if (current.trim()) parts.push(current.trim());
+        return parts;
+      }
+      const turnConjunctionTargets = (() => {
+        if (
+          activeBoundReference ||
+          singleGrant ||
+          clauseAnalysis.clauseCount !== 1 ||
+          !command?.explicit ||
+          target
+        ) {
+          return undefined;
+        }
+        const strippedTarget = command.target
+          .trim()
+          .replace(/(?:都|全|全部|(?:这|那)?(?:两|三|四|几)?[条项个件](?:任务|待办)?)+$/u, "")
+          .trim();
+        const parts = splitConjunctionOutsideQuotes(strippedTarget);
+        if (parts.length < 2) return undefined;
+        const resolved = parts.map((part) => resolveExplicitTargetName(part));
+        if (resolved.every((entry) => entry && seenTaskTitles.has(entry.title))) {
+          return new Set(resolved.map((entry) => entry!.title));
+        }
+        return undefined;
+      })();
+      const completedConjunctionTitles = new Set<string>();
+
       const orderedOperations = orderedMutationOperations(commandInput)?.map(
         ({ operation, text }) => {
           const exact = explicitMutation(text);
@@ -2453,10 +2551,32 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
             operation === "update_task" ? extractExplicitUpdateSpec(text, true) : undefined;
           const named = taskCommand(text);
           const namedTitle = named?.explicit ? resolveExplicitTargetName(named.target) : undefined;
+          const suffixCompleteTitle =
+            operation === "complete_task" && !namedTitle
+              ? (() => {
+                  const raw = text.trim().replace(/[吧呢啊呀哦嘛]?[。！？.!?]?$/u, "");
+                  const suffix = targetFirstAction.exec(raw);
+                  if (suffix && !deleteAction.test(suffix[2])) {
+                    const candidate = suffix[1].trim().replace(/(?:已经|已)$/u, "");
+                    const resolved = resolveExplicitTargetName(candidate);
+                    if (resolved && seenTaskTitles.has(resolved.title)) return resolved.title;
+                  }
+                  const rawComp =
+                    /^([^\r\n，,；;。？！!?]{1,200}?)(?:(?:这|那)(?:一)?[条项个件](?:任务|待办|事)?)?(?:已经|已)?(?:完成了|做完了|搞定了)$/u.exec(
+                      raw,
+                    )?.[1];
+                  if (rawComp) {
+                    const resolved = resolveExplicitTargetName(rawComp);
+                    if (resolved && seenTaskTitles.has(resolved.title)) return resolved.title;
+                  }
+                  return undefined;
+                })()
+              : undefined;
           const hasUnboundNamedTarget =
-            Boolean(named?.target) &&
-            isUnboundTarget(named!.target.trim()) &&
-            !namedTarget(named!.target)?.literal;
+            (Boolean(named?.target) &&
+              isUnboundTarget(named!.target.trim()) &&
+              !namedTarget(named!.target)?.literal) ||
+            Boolean(detectUnboundCommand(text));
           const metadata = singleMetadataRequest(text);
           const metadataEdit = metadata?.operation === "update_task" ? metadata : undefined;
           const metadataTarget = metadataEdit?.target
@@ -2466,6 +2586,10 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
             metadata?.operation === "create_task"
               ? singleCreateGrant(metadata.target, metadata.changes)
               : undefined;
+          const quotedCreate =
+            operation === "create_task"
+              ? quotedCreateTitle(text, Boolean(metadataCreate))
+              : undefined;
           return {
             operation,
             text,
@@ -2473,10 +2597,12 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
               exact?.title ??
               explicitUpdate?.title ??
               metadataCreate?.title ??
+              quotedCreate ??
               (metadataTarget ? metadataTarget.title : undefined) ??
               (namedTitle && (namedTitle.literal || !isUnboundTarget(namedTitle.title))
                 ? namedTitle.title
-                : undefined),
+                : undefined) ??
+              suffixCompleteTitle,
             requiredChanges:
               exact?.operation === "update_task"
                 ? exact.changes
@@ -3053,6 +3179,21 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
                 : undefined;
             return finish("action_not_executed", partialNote);
           }
+          if (
+            turnConjunctionTargets &&
+            completedConjunctionTitles.size > 0 &&
+            completedConjunctionTitles.size < turnConjunctionTargets.size
+          ) {
+            ensurePostMutationListIfRequested();
+            const partialNote =
+              outcomes.length &&
+              displayedList !== undefined &&
+              !trailingList.wantsList &&
+              !leadingList.wantsList
+                ? "本轮只执行了上面确认的更改。"
+                : undefined;
+            return finish("action_not_executed", partialNote);
+          }
           const stoppedAfterUnfilteredList =
             round === 2 &&
             executedCallIds.size === 1 &&
@@ -3345,6 +3486,9 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
               .sort((a, b) => a.rank - b.rank || a.index - b.index);
             const simulatedDone = new Set(completedClauseRanks);
             for (const entry of sorted) {
+              if (simulatedDone.has(entry.rank)) {
+                return finish("action_not_executed");
+              }
               const skippedEarlier = mutationClauseIndices.some(
                 (prevIdx) => prevIdx < entry.rank && !simulatedDone.has(prevIdx),
               );
@@ -3558,33 +3702,10 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
           ) {
             return finish("reference_required");
           }
-          const explicitConjunctionAllowedTitles = (() => {
-            if (
-              !(name === "delete_task" || name === "complete_task" || isCompletionUpdateCall) ||
-              planned?.title ||
-              singleGrant ||
-              activeBoundReference ||
-              clauseAnalysis.clauseCount !== 1 ||
-              !command?.explicit ||
-              target
-            ) {
-              return undefined;
-            }
-            const strippedTarget = command.target
-              .trim()
-              .replace(/(?:都|全|全部|(?:这|那)?(?:两|三|四|几)?[条项个件](?:任务|待办)?)+$/u, "")
-              .trim();
-            const parts = strippedTarget
-              .split(/\s*(?:和|跟|与|以及|、)\s*/u)
-              .map((part) => part.trim())
-              .filter(Boolean);
-            if (parts.length < 2) return undefined;
-            const resolved = parts.map((part) => resolveExplicitTargetName(part));
-            if (resolved.every((entry) => entry && seenTaskTitles.has(entry.title))) {
-              return new Set(resolved.map((entry) => entry!.title));
-            }
-            return undefined;
-          })();
+          const explicitConjunctionAllowedTitles =
+            name === "delete_task" || name === "complete_task" || isCompletionUpdateCall
+              ? turnConjunctionTargets
+              : undefined;
           if (
             (name === "delete_task" || name === "complete_task" || isCompletionUpdateCall) &&
             !planned?.title &&
@@ -3695,8 +3816,8 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
             explicitConjunctionAllowedTitles ??
             (name === "delete_task"
               ? mixedDeletionAllowedTitles
-              : name === "complete_task"
-                ? liveMixedCompletionAllowedTitles
+              : name === "complete_task" || isCompletionUpdateCall
+                ? (exactCompleteAllowedTitles ?? liveMixedCompletionAllowedTitles)
                 : undefined);
           const grantWithMixedDeletes =
             !title && mixedAllowedTitles
@@ -3882,6 +4003,9 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
           }
 
           recordMutation(result, args);
+          if (turnConjunctionTargets && turnConjunctionTargets.has(result.task.title)) {
+            completedConjunctionTitles.add(result.task.title);
+          }
           const committedRank = batchCallRanks.get(call.id);
           if (committedRank !== undefined) completedClauseRanks.add(committedRank);
           if (expectedMutationView) {

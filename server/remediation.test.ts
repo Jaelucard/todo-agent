@@ -5200,3 +5200,214 @@ test("review round 19 regressions (905ba6c0): unresolved single delete, prefixed
     assert.equal(tasks.list().find((task) => task.id === contract.id)?.done, false);
   }
 });
+
+test("review round 20 regressions (424c822e): pronoun-only 一下 commands, partial completion restriction, 跟 conjunction, Chinese numeral dates/units, ordered quoted create + multi-round create reuse, quoted/partial conjunctions, ordered suffix completion alias, and 把 embedded reopen title", async (t) => {
+  // 1. P1 #1: "它删除一下" and "把买牛奶改为高优先级，然后它完成一下" reject mutating 交房租
+  {
+    const { tasks, filename } = await setup(t);
+    const rent = tasks.create("交房租");
+    const before = await readFile(filename, "utf8");
+    const turn = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(call("d1", "delete_task", { candidateIds: [rent.id] })),
+        final("收到。"),
+      ).provider,
+    ).runTurn([user("它删除一下")]);
+    assert.ok(turn.failure);
+    assert.equal(await readFile(filename, "utf8"), before);
+  }
+  {
+    const { tasks, filename } = await setup(t);
+    const milk = tasks.create("买牛奶");
+    const rent = tasks.create("交房租");
+    const before = await readFile(filename, "utf8");
+    const turn = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(
+          call("u1", "update_task", { candidateIds: [milk.id], changes: { priority: "high" } }),
+          call("c1", "complete_task", { candidateIds: [rent.id] }),
+        ),
+        final("收到。"),
+      ).provider,
+    ).runTurn([user("把买牛奶改为高优先级，然后它完成一下")]);
+    assert.ok(turn.failure);
+    assert.equal(await readFile(filename, "utf8"), before);
+  }
+
+  // 2. P1 #2: "完成买牛奶" with 今晚买牛奶 & 交房租 rejects completing 交房租; "把买牛奶跟取快递都标记完成" rejects 交房租
+  {
+    const { tasks, filename } = await setup(t);
+    tasks.create("今晚买牛奶");
+    const rent = tasks.create("交房租");
+    const before = await readFile(filename, "utf8");
+    const turn = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(call("c1", "complete_task", { candidateIds: [rent.id] })),
+        final("收到。"),
+      ).provider,
+    ).runTurn([user("完成买牛奶")]);
+    assert.ok(turn.failure);
+    assert.equal(await readFile(filename, "utf8"), before);
+  }
+  {
+    const { tasks, filename } = await setup(t);
+    tasks.create("买牛奶");
+    tasks.create("取快递");
+    const rent = tasks.create("交房租");
+    const before = await readFile(filename, "utf8");
+    const turn = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(call("c1", "complete_task", { candidateIds: [rent.id] })),
+        final("收到。"),
+      ).provider,
+    ).runTurn([user("把买牛奶跟取快递都标记完成")]);
+    assert.ok(turn.failure);
+    assert.equal(await readFile(filename, "utf8"), before);
+  }
+
+  // 3. P1 #3: Chinese numeral date / unit mismatches reject semantic deletion
+  for (const [stored, prompt] of [
+    ["缴纳十月十三日水费", "把交十月十二日水费删掉"],
+    ["缴纳上半月水费", "把交上半年水费删掉"],
+    ["缴纳第1批水费", "把交第1期水费删掉"],
+  ] as const) {
+    const { tasks, filename } = await setup(t);
+    const item = tasks.create(stored);
+    const before = await readFile(filename, "utf8");
+    const turn = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(call("d1", "delete_task", { candidateIds: [item.id] })),
+        proposal(
+          call("v1", "verify_task_reference", { decision: "match", candidateIds: [item.id] }),
+        ),
+        final("收到。"),
+      ).provider,
+    ).runTurn([user(prompt)]);
+    assert.ok(turn.failure, `${prompt} vs ${stored}`);
+    assert.equal(await readFile(filename, "utf8"), before, `${prompt} vs ${stored}`);
+  }
+
+  // 4. P1 #4: ordered quoted create rejects wrong title; multi-round compound create rejects duplicate create clause reuse
+  {
+    const { tasks } = await setup(t);
+    const parcel = tasks.create("取快递");
+    const turn = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(
+          call("d1", "delete_task", { candidateIds: [parcel.id] }),
+          call("c1", "create_task", { title: "交房租" }),
+        ),
+        final("收到。"),
+      ).provider,
+    ).runTurn([user("删掉取快递，然后新增「买牛奶」")]);
+    assert.ok(turn.failure);
+    assert.equal(
+      tasks.list().some((task) => task.title === "交房租"),
+      false,
+    );
+  }
+  {
+    const { tasks } = await setup(t);
+    const parcel = tasks.create("取快递");
+    const turn = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("c1", "create_task", { title: "买牛奶" })),
+        proposal(call("l1", "list_tasks", {})),
+        proposal(call("c2", "create_task", { title: "交房租" })),
+        proposal(call("d1", "delete_task", { candidateIds: [parcel.id] })),
+        final("收到。"),
+      ).provider,
+    ).runTurn([user("新增买牛奶，删掉取快递")]);
+    assert.ok(turn.failure);
+    assert.equal(
+      tasks.list().some((task) => task.title === "交房租"),
+      false,
+    );
+  }
+
+  // 5. P2 #1: quoted conjunction succeeds; partial conjunction completion reports action_not_executed
+  {
+    const { tasks } = await setup(t);
+    const dev = tasks.create("机器和设备");
+    const parcel = tasks.create("取快递");
+    const turn = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(
+          call("c1", "complete_task", { candidateIds: [dev.id] }),
+          call("c2", "complete_task", { candidateIds: [parcel.id] }),
+        ),
+        final("收到。"),
+      ).provider,
+    ).runTurn([user("把「机器和设备」和「取快递」都标记完成")]);
+    assert.equal(turn.failure, undefined);
+    assert.equal(tasks.list().find((task) => task.id === dev.id)?.done, true);
+    assert.equal(tasks.list().find((task) => task.id === parcel.id)?.done, true);
+  }
+  {
+    const { tasks } = await setup(t);
+    const milk = tasks.create("买牛奶");
+    const parcel = tasks.create("取快递");
+    const turn = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(call("c1", "complete_task", { candidateIds: [milk.id] })),
+        final("已完成。"),
+      ).provider,
+    ).runTurn([user("把买牛奶和取快递都标记完成")]);
+    assert.equal(turn.failure, "action_not_executed");
+    assert.equal(tasks.list().find((task) => task.id === parcel.id)?.done, false);
+  }
+
+  // 6. P2 #2: "把买牛奶改为高优先级，然后交房租完成了" accepts update_task({done:true}) on 交房租
+  {
+    const { tasks } = await setup(t);
+    const milk = tasks.create("买牛奶");
+    const rent = tasks.create("交房租");
+    const turn = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(
+          call("u1", "update_task", { candidateIds: [milk.id], changes: { priority: "high" } }),
+          call("u2", "update_task", { candidateIds: [rent.id], changes: { done: true } }),
+        ),
+        final("收到。"),
+      ).provider,
+    ).runTurn([user("把买牛奶改为高优先级，然后交房租完成了")]);
+    assert.equal(turn.failure, undefined);
+    assert.equal(tasks.list().find((task) => task.id === milk.id)?.priority, "high");
+    assert.equal(tasks.list().find((task) => task.id === rent.id)?.done, true);
+  }
+
+  // 7. P2 #3: "把这项恢复测试标记完成" with "这项恢复测试" stored succeeds
+  {
+    const { tasks } = await setup(t);
+    const item = tasks.create("这项恢复测试");
+    const turn = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(call("c1", "complete_task", { candidateIds: [item.id] })),
+        final("收到。"),
+      ).provider,
+    ).runTurn([user("把这项恢复测试标记完成")]);
+    assert.equal(turn.failure, undefined);
+    assert.equal(tasks.list().find((task) => task.id === item.id)?.done, true);
+  }
+});
