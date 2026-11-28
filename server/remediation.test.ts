@@ -2016,4 +2016,40 @@ test("CODEX-REVIEW-2 + L4-context-T2 regressions: action-class grounding, multi-
     assert.equal(t2.failure, undefined);
     assert.equal(t2.reply, "已完成「交房租」。");
   }
+
+  // 8. Live REL-03-1-T2: repeated compact completion ("牛奶买好了") after pending-only list_tasks({done:false}) confirms already done with 0 writes
+  {
+    const { tasks, filename } = await setup(t);
+    const milk = tasks.create("买牛奶");
+    tasks.update(milk.id, { done: true });
+    const before = await readFile(filename, "utf8");
+    const mock = scripted(
+      proposal(call("l1", "list_tasks", { done: false })),
+      final("没有未完成的买牛奶。"),
+    );
+    const turn = await createAgent(tasks, mock.provider).runTurn([user("牛奶买好了")]);
+    assert.equal(turn.failure, undefined);
+    assert.deepEqual(turn.outcomes, []);
+    assert.equal(turn.reply, "「买牛奶」已经完成。");
+    assert.equal(await readFile(filename, "utf8"), before);
+  }
+
+  // 9. Compound multi-delete with 顺便/也 connectors still pins allowedTitles and blocks unrelated delete
+  {
+    const { tasks, filename } = await setup(t);
+    tasks.create("买牛奶");
+    tasks.create("取快递");
+    const water = tasks.create("交水费");
+    const before = await readFile(filename, "utf8");
+    const mock = scripted(
+      proposal(call("l1", "list_tasks", {})),
+      proposal(call("d-wrong", "delete_task", { candidateIds: [water.id] })),
+    );
+    const turn = await createAgent(tasks, mock.provider).runTurn([
+      user("把买牛奶删掉，顺便把取快递删掉。"),
+    ]);
+    assert.equal(turn.failure, "reference_required");
+    assert.deepEqual(turn.outcomes, []);
+    assert.equal(await readFile(filename, "utf8"), before);
+  }
 });

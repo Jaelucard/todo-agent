@@ -1447,7 +1447,12 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
               literal: boolean;
               suffixedTitle?: string;
             }>((clause) => {
-              const action = taskCommand(clause.replace(/^(?:然后|接着|随后|另外)\s*/u, ""));
+              const action = taskCommand(
+                clause.replace(
+                  /^(?:然后|接着|随后|另外|此外|同时|顺便|顺手|并且|而且|还有|以及|并|也|再)\s*/u,
+                  "",
+                ),
+              );
               if (!action?.explicit || !deleteAction.test(action.action)) return [];
               const name = namedTarget(action.target);
               if (name) return isUnboundTarget(name.title) && !name.literal ? [] : [name];
@@ -2412,24 +2417,36 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
             ensurePostMutationListIfRequested();
             return finish("action_not_executed");
           }
-          const stoppedAfterList =
+          const stoppedAfterUnfilteredList =
             round === 2 &&
             executedCallIds.size === 1 &&
             displayedList !== undefined &&
             Object.keys(displayedListFilter).length === 0 &&
             confirmations.length === 0;
+          const stoppedAfterPendingList =
+            round === 2 &&
+            executedCallIds.size === 1 &&
+            displayedList !== undefined &&
+            displayedListFilter.done === false &&
+            displayedListFilter.priority === undefined &&
+            displayedListFilter.workload === undefined &&
+            confirmations.length === 0;
           if (
             completionRecoveryTarget &&
             !clarificationRequested &&
-            (round === 1 || stoppedAfterList)
+            (round === 1 || stoppedAfterUnfilteredList || stoppedAfterPendingList)
           ) {
             const view = toolkit.execute("list_tasks", "{}");
             if (!view.ok) return finish(view.error);
             const expectedView = JSON.stringify(expectedMutationView);
+            const expectedPendingView = JSON.stringify(
+              (expectedMutationView ?? []).filter((task) => !task.done),
+            );
             if (
               view.tool !== "list_tasks" ||
               JSON.stringify(view.tasks) !== expectedView ||
-              (stoppedAfterList && JSON.stringify(displayedList) !== expectedView)
+              (stoppedAfterUnfilteredList && JSON.stringify(displayedList) !== expectedView) ||
+              (stoppedAfterPendingList && JSON.stringify(displayedList) !== expectedPendingView)
             ) {
               displayedList = undefined;
               return finish("stale_view");
