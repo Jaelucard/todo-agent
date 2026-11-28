@@ -1848,3 +1848,172 @@ test("CODEX-REVIEW + C5-T7 regressions: semantic action/bill isolation, courtesy
     assert.match(turn.reply, /待完成清单：\n- 取快递（待完成）/);
   }
 });
+
+test("CODEX-REVIEW-2 + L4-context-T2 regressions: action-class grounding, multi-delete target pinning, single/partial-batch ordering, read-only scoped list + filter check, courtesy/备忘/记两条, bound list-then-complete", async (t) => {
+  // 1. P1 #1: 查看口腔诊所预约结果 and 退水费 must NOT auto-delete for 预约牙医 / 交水费
+  for (const [prompt, storedTitle] of [
+    ["把预约牙医删掉", "查看口腔诊所预约结果"],
+    ["把交水费删掉", "退水费"],
+  ] as const) {
+    const { tasks, filename } = await setup(t);
+    const stored = tasks.create(storedTitle);
+    const before = await readFile(filename, "utf8");
+    const mock = scripted(
+      proposal(call("l1", "list_tasks", {})),
+      proposal(call("d1", "delete_task", { candidateIds: [stored.id] })),
+      proposal(
+        call("v1", "verify_task_reference", { decision: "match", candidateIds: [stored.id] }),
+      ),
+    );
+    const turn = await createAgent(tasks, mock.provider).runTurn([user(prompt)]);
+    assert.ok(
+      turn.failure === "reference_required" || turn.failure === "exact_title_not_found",
+      `${prompt} -> ${storedTitle}: got ${String(turn.failure)}`,
+    );
+    assert.deepEqual(turn.outcomes, [], `${prompt} -> ${storedTitle}`);
+    assert.equal(await readFile(filename, "utf8"), before, `${prompt} -> ${storedTitle}`);
+  }
+
+  // 2a. P1 #2: multi-delete compound turn pins allowedTitles and rejects unrelated task deletion
+  {
+    const { tasks, filename } = await setup(t);
+    tasks.create("买牛奶");
+    tasks.create("取快递");
+    const water = tasks.create("交水费");
+    const before = await readFile(filename, "utf8");
+    const mock = scripted(
+      proposal(call("l1", "list_tasks", {})),
+      proposal(call("d-wrong", "delete_task", { candidateIds: [water.id] })),
+    );
+    const turn = await createAgent(tasks, mock.provider).runTurn([
+      user("把买牛奶删掉，另外把取快递删掉。"),
+    ]);
+    assert.equal(turn.failure, "reference_required");
+    assert.deepEqual(turn.outcomes, []);
+    assert.equal(await readFile(filename, "utf8"), before);
+  }
+
+  // 2b. P1 #2: 3-clause complete -> rename -> create rejects create-only AND complete+create skipping rename
+  for (const badCalls of [
+    [call("a1", "create_task", { title: "交房租", priority: "high" })],
+    [
+      call("c1", "complete_task", { candidateIds: ["MILK_ID"] }),
+      call("a1", "create_task", { title: "交房租", priority: "high" }),
+    ],
+  ]) {
+    const { tasks, filename } = await setup(t);
+    const milk = tasks.create("买牛奶");
+    tasks.create("写周报");
+    const before = await readFile(filename, "utf8");
+    const resolvedCalls = badCalls.map((c) => ({
+      ...c,
+      function: {
+        ...c.function,
+        arguments: c.function.arguments.replace("MILK_ID", milk.id),
+      },
+    }));
+    const mock = scripted(
+      proposal(call("l1", "list_tasks", {})),
+      proposal(...resolvedCalls),
+      final("已完成。"),
+    );
+    const turn = await createAgent(tasks, mock.provider).runTurn([
+      user("买牛奶已经完成了，把写周报改名为提交周报，再新增高优先级任务：交房租"),
+    ]);
+    assert.equal(turn.failure, "action_not_executed");
+    assert.deepEqual(turn.outcomes, []);
+    assert.equal(await readFile(filename, "utf8"), before);
+  }
+
+  // 3. P1 #3: scoped list command ("列出待完成的任务") stays read-only across ALL rounds and blocks reopen
+  {
+    const { tasks, filename } = await setup(t);
+    const report = tasks.create("交报告");
+    tasks.update(report.id, { done: true });
+    tasks.create("取快递");
+    const before = await readFile(filename, "utf8");
+    const mock = scripted(
+      proposal(call("l1", "list_tasks", { done: false })),
+      proposal(
+        call("u-bad", "update_task", { candidateIds: [report.id], changes: { done: false } }),
+      ),
+    );
+    const turn = await createAgent(tasks, mock.provider).runTurn([user("列出待完成的任务")]);
+    assert.deepEqual(
+      mock.requests[1]?.tools?.map((tool) => tool.type === "function" && tool.function.name),
+      ["list_tasks"],
+    );
+    assert.ok(turn.failure !== undefined);
+    assert.deepEqual(turn.outcomes, []);
+    assert.equal(await readFile(filename, "utf8"), before);
+  }
+
+  // 4. P2 #4: "别删买牛奶，谢谢您。" and "把年度备忘删掉，另外把取快递删掉。" never authorize create_task
+  for (const prompt of ["别删买牛奶，谢谢您。", "把年度备忘删掉，另外把取快递删掉。"] as const) {
+    const { tasks, filename } = await setup(t);
+    tasks.create("买牛奶");
+    tasks.create("年度备忘");
+    tasks.create("取快递");
+    const before = await readFile(filename, "utf8");
+    const mock = scripted(
+      proposal(call("l1", "list_tasks", {})),
+      proposal(call("c-bad", "create_task", { title: "未请求任务" })),
+    );
+    const turn = await createAgent(tasks, mock.provider).runTurn([user(prompt)]);
+    assert.equal(turn.failure, "reference_required", prompt);
+    assert.deepEqual(turn.outcomes, [], prompt);
+    assert.equal(await readFile(filename, "utf8"), before, prompt);
+  }
+
+  // 5. P2 #5: explicit multi-create "记两条：洗碗和倒垃圾" executes locally with 0 model calls
+  {
+    const { tasks } = await setup(t);
+    const turn = await createAgent(tasks, async () => {
+      throw new Error("explicit multi-create must not invoke provider");
+    }).runTurn([user("记两条：洗碗和倒垃圾")]);
+    assert.equal(turn.failure, undefined);
+    assert.deepEqual(
+      tasks.list().map((item) => item.title),
+      ["洗碗", "倒垃圾"],
+    );
+  }
+
+  // 6. P2 #6: scoped list rejects wrong or missing filter args (done:true or {}) with zero false success
+  for (const wrongArgs of [{ done: true }, {}]) {
+    const { tasks } = await setup(t);
+    const doneTask = tasks.create("交报告");
+    tasks.update(doneTask.id, { done: true });
+    tasks.create("取快递");
+    const mock = scripted(proposal(call("l1", "list_tasks", wrongArgs)), final("列出完成。"));
+    const turn = await createAgent(tasks, mock.provider).runTurn([user("有哪些待完成的任务？")]);
+    assert.equal(turn.failure, "invalid_arguments", JSON.stringify(wrongArgs));
+    assert.equal(turn.displayedList, undefined, JSON.stringify(wrongArgs));
+  }
+
+  // 7. Live L4-context-T2: bound reference advertises [list_tasks, complete_task] so list-then-complete works cleanly
+  {
+    const { tasks } = await setup(t);
+    tasks.create("交水电费");
+    const t1 = await createAgent(
+      tasks,
+      scripted(proposal(call("c1", "create_task", { title: "交房租" })), final("已添加。"))
+        .provider,
+    ).runTurn([user("帮我记一下交房租")]);
+    const mock = scripted(
+      proposal(call("l1", "list_tasks", {})),
+      proposal(call("m1", "complete_task", { useBoundReference: true })),
+      final("已完成。"),
+    );
+    const t2 = await createAgent(tasks, mock.provider).runTurn([
+      user("帮我记一下交房租"),
+      { role: "assistant", content: t1.reply },
+      user("把刚才那个标记完成吧"),
+    ]);
+    assert.deepEqual(
+      mock.requests[0]?.tools?.map((tool) => tool.type === "function" && tool.function.name),
+      ["list_tasks", "complete_task"],
+    );
+    assert.equal(t2.failure, undefined);
+    assert.equal(t2.reply, "已完成「交房租」。");
+  }
+});

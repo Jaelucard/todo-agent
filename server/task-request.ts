@@ -442,8 +442,49 @@ const wholeTurnRetractionClausePattern =
 const keepNoOpClausePattern =
   /^(?:(?:先|还是|就)?(?:留着|保留|保持原样|不动|别动|放着|搁着)(?:吧|好了|就行)?)$/u;
 const courtesyFillerClausePattern =
-  /^(?:(?:非常)?感谢|多谢|谢谢(?:你|啦|啊|了)?|辛苦(?:你)?(?:了|啦)?|麻烦(?:你)?了|好的?|行(?:吧)?|知道了?|明白了?|收到|拜托(?:了)?|没事(?:了)?|不用谢|嗯+|哦+|噢+)[。！!~～]*$/u;
+  /^(?:(?:非常)?感谢(?:[你您])?|多谢(?:[你您])?(?:了|啦)?|谢谢(?:[你您])?(?:啦|啊|了)?|辛苦(?:[你您])?(?:了|啦)?|麻烦(?:[你您])?了?|好的?|行(?:吧)?|知道了?|明白了?|收到|拜托(?:[你您])?(?:了)?|没事(?:了)?|不用谢|嗯+|哦+|噢+)[。！!~～]*$/u;
 const tentativeIntentPattern = /^(?:我)?(?:本来|原本|刚才|刚刚)想/u;
+
+export function expectedScopedListFilter(
+  content: string,
+): { done?: boolean; priority?: Priority; workload?: Workload } | undefined {
+  const trimmed = content.trim();
+  const masked = maskQuotedTitles(trimmed);
+  if (
+    clauseNegationPattern.test(masked) ||
+    isUnsupportedDueDateQuery(trimmed) ||
+    /(?:把|将|删掉|删除|移除|清掉|去掉|清除|删了|新增|新建|创建|添加|加入|加上|改回|改名|重命名|更名|标(?:记)?(?:为|成)|设(?:置)?(?:为|成)|调(?:整)?(?:为|成|到)|(?:做好|买好|办好|交好|搞定)了)/u.test(
+      masked,
+    )
+  ) {
+    return undefined;
+  }
+  const text = trimmed.replace(/^(?:请问|麻烦|请)/u, "").replace(/[吧呢]?[。！？.!?]?$/u, "");
+  const prefix =
+    /^(?:再?(?:给我|帮我)?(?:看看|看一看|列出|(?:查看|显示|展示|看|列)(?:一下|下)?)|我?(?:现在|目前|手头)?都?(?:还)?有(?:哪些|什么))/u.exec(
+      text,
+    );
+  if (!prefix) return undefined;
+  const rest = text.slice(prefix[0].length);
+  if (!/(?:任务|待办|事项|清单|列表|事)/u.test(rest)) return undefined;
+  const filter: { done?: boolean; priority?: Priority; workload?: Workload } = {};
+  const hasPending = /(?:待完成|未完成|没完成|没办完|还没完|未办完)/u.test(rest);
+  const hasCompleted = /(?<!未|待|没|不)(?:已完成|完成了|办完了)/u.test(rest);
+  if (hasPending && hasCompleted) return undefined;
+  if (hasPending) filter.done = false;
+  if (hasCompleted) filter.done = true;
+  const prioMatch = /([低中高])优先级/u.exec(rest);
+  if (prioMatch) {
+    const p = priorities.find((item) => priorityLabels[item] === prioMatch[1]);
+    if (p) filter.priority = p;
+  }
+  const workMatch = /([小中大])工作量/u.exec(rest);
+  if (workMatch) {
+    const w = workloads.find((item) => workloadLabels[item] === workMatch[1]);
+    if (w) filter.workload = w;
+  }
+  return Object.keys(filter).length > 0 ? filter : undefined;
+}
 const retractionCuePattern =
   /(?:算了|(?:不用|不要|(?<!分|特|级|类|区|告|差|识|判|个|性)别(?!人|的|处|扭)|不必)(?:记|加|新增|创建|添加|删|改|做|办|完成|动|管)了?)/u;
 
@@ -590,7 +631,9 @@ export function analyzeClauses(input: string): ClauseAnalysis {
 
   const positiveText = positiveMaskedClauses.join("，");
   const hasAnyPositiveClause = positiveMaskedClauses.length > 0;
-  const mutationsAllowed = hasAnyPositiveClause && !isQuestion && !isHypothetical;
+  const isPureScopedList = expectedScopedListFilter(trimmed) !== undefined;
+  const mutationsAllowed =
+    hasAnyPositiveClause && !isQuestion && !isHypothetical && !isPureScopedList;
 
   // Extract explicit priority and workload values from positive clauses.
   const allowedPriorities = new Set<Priority>();
@@ -650,7 +693,7 @@ export function analyzeClauses(input: string): ClauseAnalysis {
 
   // Detect action intents in positive clauses.
   const hasCreateVerb =
-    /(?:新增|新建|创建|添加|加入|加上|加一|加个|加条|(?:帮我|给我|请|麻烦|再|另外|顺便)\s*记录?(?:一下|一?[条项个]|下)?|(?<!标|登|忘|笔|日|书|游|传|杂|手|随|会|议)(?:再)?记(?:一下|一?[条项个]|下|住|入|上|到|进|：|:)|(?<![\p{Script=Han}])记录(?:一下|一?[条项个]|下|：|:)|备忘|提醒我)/u.test(
+    /(?:新增|新建|创建|添加|加入|加上|加一|加个|加条|(?:帮我|给我|请|麻烦|再|另外|顺便)\s*记录?(?:一下|[一二两三四五六1-6]?[条项个]|下)?|(?<!标|登|忘|笔|日|书|游|传|杂|手|随|会|议)(?:再)?记(?:一下|[一二两三四五六1-6]?[条项个]|下|住|入|上|到|进|：|:)|(?<![\p{Script=Han}])记录(?:一下|[一二两三四五六1-6]?[条项个]|下|：|:)|(?:加(?:[一二两三四五六1-6]?[条项个])?|记(?:一下|[一二两三四五六1-6]?[条项个]|下)?|添加|新增|写(?:[一二两三四五六1-6]?[条项个])?)备忘|(?<![\p{Script=Han}])备忘(?:一下|[一二两三四五六1-6]?[条项个]|：|:)|提醒我)/u.test(
       positiveText,
     );
   const textWithoutReopenPhrases = positiveText
@@ -735,7 +778,8 @@ export function analyzeClauses(input: string): ClauseAnalysis {
     !isPureDelete &&
     !isPureReopen &&
     !isPureRename &&
-    (hasCreateVerb || (!hasCompleteVerb && !hasDeleteVerb && !allowReopen && !allowRename));
+    (hasCreateVerb ||
+      (!sawAnyProhibition && !hasCompleteVerb && !hasDeleteVerb && !allowReopen && !allowRename));
   const allowComplete =
     mutationsAllowed &&
     !isPureMetadataRequest &&

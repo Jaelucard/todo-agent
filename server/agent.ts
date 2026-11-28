@@ -23,6 +23,7 @@ import {
   analyzeClauses,
   clarifiedTitle,
   detectUnboundCommand,
+  expectedScopedListFilter,
   explicitCreationList,
   explicitMutation,
   extractTrailingListRequest,
@@ -260,8 +261,9 @@ function referenceWords(title: string) {
 
 const cancelsTaskAction = /取消|撤销|停止|终止|放弃|退订|退掉/u;
 const preparatoryTaskCue =
-  /(?:准备|计划|打算|考虑|研究|了解|确认是否|查询|查一下|营业时间|核实一下)/u;
-const appointmentTaskCue = /(?:预约|约诊|挂号|看牙|复诊|门诊)/u;
+  /(?:准备|计划|打算|考虑|研究|了解|确认是否|查询|查一下|查看|检查|核对|核实|营业时间|咨询)/u;
+const nonBookingEndingCue =
+  /(?:结果|时间|地址|电话|费用|价格|报告|记录|清单|回执|确认单|进度|状态)$/u;
 const semanticConceptGroups: ReadonlyArray<readonly [string, readonly string[]]> = [
   ["dental_clinic", ["牙医", "牙科", "口腔", "看牙"]],
   ["dental_cleaning", ["洗牙", "洁牙"]],
@@ -305,11 +307,43 @@ function semanticConcepts(text: string): Set<string> {
   return concepts;
 }
 
+type SemanticActionClass =
+  | "book_visit"
+  | "pay"
+  | "refund"
+  | "pickup"
+  | "send"
+  | "file_claim"
+  | "apply_replace";
+
+function semanticActionClass(text: string): SemanticActionClass | undefined {
+  const trimmed = text.trim();
+  if (cancelsTaskAction.test(trimmed) || preparatoryTaskCue.test(trimmed)) return undefined;
+  if (/^(?:退|退还|退款|退费)/u.test(trimmed)) return "refund";
+  if (/^(?:交|缴|付|支付|缴纳|结清)/u.test(trimmed)) return "pay";
+  if (/^(?:取|拿|领)/u.test(trimmed)) return "pickup";
+  if (/^(?:寄|发|送)/u.test(trimmed)) return "send";
+  if (/^(?:报销|提交报销|申请报销|报税|申报)/u.test(trimmed)) return "file_claim";
+  if (/^(?:申请|补领|补办|办理|换领)/u.test(trimmed)) return "apply_replace";
+  if (
+    !nonBookingEndingCue.test(trimmed) &&
+    /(?:预约|约诊|挂号|看牙|复诊|门诊)/u.test(trimmed) &&
+    /^(?:(?:打电话|发微信|发消息|联系|去|到|找)?[^，,。]{0,12}?(?:预约|约诊|挂号|看牙|复诊|门诊)|(?:预约|约诊|挂号|看牙|复诊|门诊)[^，,。]{0,8})$/u.test(
+      trimmed,
+    )
+  ) {
+    return "book_visit";
+  }
+  return undefined;
+}
+
 function hasGroundedSemanticMatch(title: string, storedTitle: string): boolean {
   if (cancelsTaskAction.test(title) !== cancelsTaskAction.test(storedTitle)) return false;
   if (preparatoryTaskCue.test(title) !== preparatoryTaskCue.test(storedTitle)) return false;
   if (namesSemanticTarget(title, storedTitle)) return true;
-  if (appointmentTaskCue.test(title) !== appointmentTaskCue.test(storedTitle)) return false;
+  const requestedAction = semanticActionClass(title);
+  const storedAction = semanticActionClass(storedTitle);
+  if (!requestedAction || requestedAction !== storedAction) return false;
   const requestedConcepts = semanticConcepts(title);
   if (!requestedConcepts.size) return false;
   const storedConcepts = semanticConcepts(storedTitle);
@@ -484,24 +518,6 @@ function explicitListScope(content: string): "all" | TaskMetadata["priority"] {
     if (allTasks.test(object)) return "all";
   }
   if (/^我的(?:任务|待办(?:事项)?)都?有哪些$/u.test(text)) return "all";
-}
-
-function isScopedListQuery(content: string): boolean {
-  const text = content
-    .trim()
-    .replace(/^(?:请问|麻烦|请)/u, "")
-    .replace(/[吧呢]?[。！？.!?]?$/u, "");
-  const prefix =
-    /^(?:再?(?:给我|帮我)?(?:看看|看一看|列出|(?:查看|显示|展示|看|列)(?:一下|下)?)|我?(?:现在|目前|手头)?都?(?:还)?有(?:哪些|什么))/u.exec(
-      text,
-    );
-  if (!prefix) return false;
-  const rest = text.slice(prefix[0].length);
-  return (
-    /(?:待完成|未完成|没完成|没办完|还没完|已完成|完成了|高优先级|中优先级|低优先级|大工作量|中工作量|小工作量)/u.test(
-      rest,
-    ) && /(?:任务|待办|事项|清单|列表|事)/u.test(rest)
-  );
 }
 
 function answersTargetQuestion(previous: ChatMessage | undefined, text: string, tasks: Task[]) {
@@ -1444,6 +1460,13 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
             })
           : [];
       const mixedDelete = mixedDeletions.length === 1 ? mixedDeletions[0] : undefined;
+      const deleteClauseCount = clauseAnalysis.positiveClauses.filter(
+        (clause) => analyzeClauses(clause).hasDeleteVerb,
+      ).length;
+      const mixedDeletionAllowedTitles =
+        mixedDeletions.length > 0 && mixedDeletions.length === deleteClauseCount
+          ? new Set(mixedDeletions.map((entry) => entry.title))
+          : undefined;
       const singleNamedDeletion =
         parsedDelete ??
         (!clauseAnalysis.hasCompleteVerb &&
@@ -2140,6 +2163,12 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
 
       let retriedUnrequestedCreateMetadata = false;
       let retriedCreateMetadataRound: number | undefined;
+      let retriedScopedListFilter = false;
+      const scopedListFilter =
+        !activeBoundReference && !trailingList.wantsList
+          ? expectedScopedListFilter(input)
+          : undefined;
+      const completedClauseRanks = new Set<number>();
 
       for (let round = 1; round <= maxModelRequests; round++) {
         if (signal.aborted) return finish("deadline");
@@ -2207,28 +2236,31 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
             ) {
               hintTool = "list_tasks";
             }
-          } else if (
-            !activeBoundReference &&
-            !displayedList &&
-            !clauseAnalysis.hasProhibition &&
-            !trailingList.wantsList &&
-            !clauseAnalysis.hasPositiveCreateCommand &&
-            !clauseAnalysis.hasDeleteVerb &&
-            !clauseAnalysis.allowRename &&
-            isScopedListQuery(input)
-          ) {
+          } else if (scopedListFilter) {
             hintTool = "list_tasks";
           }
         }
         const requestToolChoice = forcedTool ?? hintTool;
-        const narrowedToolName =
-          forcedTool ??
-          (hintTool === "list_tasks" || (activeBoundReference && hintTool) ? hintTool : undefined);
-        const requestTools = narrowedToolName
+        const requestTools = scopedListFilter
           ? activeTools.filter(
-              (tool) => tool.type === "function" && tool.function.name === narrowedToolName,
+              (tool) => tool.type === "function" && tool.function.name === "list_tasks",
             )
-          : activeTools;
+          : forcedTool
+            ? activeTools.filter(
+                (tool) => tool.type === "function" && tool.function.name === forcedTool,
+              )
+            : hintTool === "list_tasks"
+              ? activeTools.filter(
+                  (tool) => tool.type === "function" && tool.function.name === "list_tasks",
+                )
+              : activeBoundReference && hintTool
+                ? activeTools.filter(
+                    (tool) =>
+                      tool.type === "function" &&
+                      (tool.function.name === "list_tasks" || tool.function.name === hintTool),
+                  )
+                : activeTools;
+        const allowedRequestToolNames = new Set(requestTools.map((tool) => tool.function.name));
         const semanticTool = semanticLookup?.candidates ? referenceVerificationTool : referenceTool;
         const request = () =>
           semanticLookup
@@ -2470,24 +2502,6 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
         if (round === maxModelRequests || executedCallIds.size + calls.length > maxToolCalls) {
           return finish("execution_limit");
         }
-        if (forcedTool && (calls.length !== 1 || calls[0].function.name !== forcedTool)) {
-          const prematureMutation =
-            forcedTool === "list_tasks" &&
-            calls.some((call) => call.function.name === namedMutation);
-          return finish(prematureMutation ? "list_required" : "invalid_model_response");
-        }
-        if (narrowedToolName && calls.some((call) => call.function.name !== narrowedToolName)) {
-          const prematureMutation =
-            narrowedToolName === "list_tasks" &&
-            calls.some(
-              (call) =>
-                call.function.name === "complete_task" ||
-                call.function.name === "delete_task" ||
-                call.function.name === "update_task",
-            );
-          return finish(prematureMutation ? "list_required" : "invalid_model_response");
-        }
-
         // Batch-level validation BEFORE executing any write tool in this batch.
         for (const call of calls) {
           const toolName = call.function.name;
@@ -2500,6 +2514,25 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
           ) {
             return finish("unknown_tool");
           }
+        }
+        if (forcedTool && (calls.length !== 1 || calls[0].function.name !== forcedTool)) {
+          const prematureMutation =
+            forcedTool === "list_tasks" &&
+            calls.some((call) => call.function.name === namedMutation);
+          return finish(prematureMutation ? "list_required" : "invalid_model_response");
+        }
+        if (calls.some((call) => !allowedRequestToolNames.has(call.function.name))) {
+          const listOnlySchema =
+            allowedRequestToolNames.size === 1 && allowedRequestToolNames.has("list_tasks");
+          const prematureMutation =
+            listOnlySchema &&
+            calls.some(
+              (call) =>
+                call.function.name === "complete_task" ||
+                call.function.name === "delete_task" ||
+                call.function.name === "update_task",
+            );
+          return finish(prematureMutation ? "list_required" : "invalid_model_response");
         }
         const writes = calls.filter((call) => call.function.name !== "list_tasks");
         if (
@@ -2568,12 +2601,8 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
         // When the model emits multiple independent writes in a single batch without a strict
         // orderedOperations plan, execute them in the order their operations appear in the user's clauses.
         let orderedCalls = calls;
-        if (
-          !orderedOperations &&
-          calls.length > 1 &&
-          writes.length === calls.length &&
-          clauseAnalysis.positiveClauses.length >= 2
-        ) {
+        const batchCallRanks = new Map<string, number>();
+        if (!orderedOperations && writes.length > 0 && clauseAnalysis.positiveClauses.length >= 2) {
           const clauseIntents = clauseAnalysis.positiveClauses.map((clause) =>
             analyzeClauses(clause),
           );
@@ -2593,37 +2622,49 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
             }
             return false;
           };
-          const rankForTool = (toolName: string): number => {
-            const matchingIndices = clauseIntents
-              .map((intent, idx) => ({ intent, idx }))
-              .filter(({ intent }) => clauseMatchesTool(intent, toolName));
-            return matchingIndices.length === 1 ? matchingIndices[0].idx : -1;
-          };
-          const ranked = calls.map((call, index) => ({
-            call,
-            index,
-            rank: rankForTool(call.function.name),
-          }));
-          const uniqueRanks = new Set(ranked.map((entry) => entry.rank));
-          if (ranked.every((entry) => entry.rank >= 0) && uniqueRanks.size === ranked.length) {
-            const sorted = ranked.sort((a, b) => a.rank - b.rank || a.index - b.index);
-            const firstMutationClauseIndex = clauseIntents.findIndex(
-              (intent) =>
+          const mutationClauseIndices = clauseIntents
+            .map((intent, idx) => ({ intent, idx }))
+            .filter(
+              ({ intent }) =>
                 intent.hasPositiveCreateCommand ||
                 intent.hasCompleteVerb ||
                 intent.hasDeleteVerb ||
                 intent.allowRename ||
                 intent.allowReopen ||
                 intent.hasMetadataMention,
-            );
-            if (
-              outcomes.length === 0 &&
-              firstMutationClauseIndex >= 0 &&
-              sorted[0].rank > firstMutationClauseIndex
-            ) {
-              return finish("action_not_executed");
+            )
+            .map(({ idx }) => idx);
+          const rankForTool = (toolName: string): number => {
+            const matchingIndices = clauseIntents
+              .map((intent, idx) => ({ intent, idx }))
+              .filter(({ intent }) => clauseMatchesTool(intent, toolName));
+            return matchingIndices.length === 1 ? matchingIndices[0].idx : -1;
+          };
+          const rankedWrites = writes.map((call, index) => ({
+            call,
+            index,
+            rank: rankForTool(call.function.name),
+          }));
+          const uniqueRanks = new Set(rankedWrites.map((entry) => entry.rank));
+          if (
+            rankedWrites.every((entry) => entry.rank >= 0) &&
+            uniqueRanks.size === rankedWrites.length
+          ) {
+            const sorted = rankedWrites.sort((a, b) => a.rank - b.rank || a.index - b.index);
+            const simulatedDone = new Set(completedClauseRanks);
+            for (const entry of sorted) {
+              const skippedEarlier = mutationClauseIndices.some(
+                (prevIdx) => prevIdx < entry.rank && !simulatedDone.has(prevIdx),
+              );
+              if (skippedEarlier) {
+                return finish("action_not_executed");
+              }
+              simulatedDone.add(entry.rank);
+              batchCallRanks.set(entry.call.id, entry.rank);
             }
-            orderedCalls = sorted.map((entry) => entry.call);
+            if (writes.length === calls.length && calls.length > 1) {
+              orderedCalls = sorted.map((entry) => entry.call);
+            }
           }
         }
 
@@ -2717,17 +2758,30 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
             }
           }
           const baseGrant = grantForTool(name);
+          const grantWithMixedDeletes =
+            name === "delete_task" && !title && mixedDeletionAllowedTitles
+              ? {
+                  ...baseGrant,
+                  allowedTitles: baseGrant?.allowedTitles
+                    ? new Set(
+                        [...baseGrant.allowedTitles].filter((item) =>
+                          mixedDeletionAllowedTitles.has(item),
+                        ),
+                      )
+                    : mixedDeletionAllowedTitles,
+                }
+              : baseGrant;
           const grant =
             planned?.operation === "create_task"
               ? {
-                  ...baseGrant,
+                  ...grantWithMixedDeletes,
                   title,
                   requireExactMetadata: true,
                   changes: planned.creationMetadata,
                 }
               : title
-                ? { ...baseGrant, title, requiredChanges: planned?.requiredChanges }
-                : baseGrant;
+                ? { ...grantWithMixedDeletes, title, requiredChanges: planned?.requiredChanges }
+                : grantWithMixedDeletes;
           const result = toolkit.execute(name, args, grant);
           executedCallIds.add(call.id);
 
@@ -2819,6 +2873,35 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
             } catch {
               // Already validated by toolkit.
             }
+            if (scopedListFilter) {
+              const filterMatches =
+                parsedFilter.done === scopedListFilter.done &&
+                parsedFilter.priority === scopedListFilter.priority &&
+                parsedFilter.workload === scopedListFilter.workload;
+              if (!filterMatches) {
+                displayedList = undefined;
+                displayedListFilter = {};
+                if (!retriedScopedListFilter && round < maxModelRequests) {
+                  retriedScopedListFilter = true;
+                  deferredFailure = "invalid_arguments";
+                  transcript.pop();
+                  transcript.push({
+                    role: "tool",
+                    tool_call_id: call.id,
+                    content: JSON.stringify({
+                      ok: false,
+                      error: "invalid_arguments",
+                      hint: `请使用与用户请求一致的筛选条件重新调用 list_tasks：${JSON.stringify(scopedListFilter)}`,
+                    }),
+                  });
+                  continue;
+                }
+                return finish("invalid_arguments");
+              }
+              if (deferredFailure === "invalid_arguments" && retriedScopedListFilter) {
+                deferredFailure = undefined;
+              }
+            }
             displayedList = result.tasks;
             displayedListFilter = parsedFilter;
             if (
@@ -2857,6 +2940,8 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
           }
 
           recordMutation(result, args);
+          const committedRank = batchCallRanks.get(call.id);
+          if (committedRank !== undefined) completedClauseRanks.add(committedRank);
           if (expectedMutationView) {
             expectedMutationView =
               result.tool === "delete_task"
