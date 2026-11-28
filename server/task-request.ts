@@ -254,8 +254,8 @@ export function stripLeadingActionPrefixes(
   let text = clause.trim();
   const connectorPattern = /^(?:然后|接着|随后|另外|此外|同时|顺便|顺手|并且|而且|还有|以及)\s*/u;
   const starterChars = options.includeCreateVerbs
-    ? "把将请帮给替为麻删移清去完标新创添记加备提写改重"
-    : "把将请帮给替为麻删移清去完标";
+    ? "把将请帮给替为麻删移清去完标新创添记加备提写改重「『“\"‘'"
+    : "把将请帮给替为麻删移清去完标「『“\"‘'";
   const shortConnectorPattern = options.includeConnectors
     ? new RegExp(String.raw`^(?:也|再|并|先|只)\s*(?=[${starterChars}])`, "u")
     : new RegExp(String.raw`^(?:再|只|先)\s*(?=[${starterChars}])`, "u");
@@ -618,7 +618,7 @@ function maskRenameValues(clause: string): string {
       "$1为「」",
     )
     .replace(
-      /((?:把|将)[^，,；;。！？!?]+?(?<!优先级|工作量)(?:改|换)(?:为|成))(?!\s*(?:(?:已|未|待)完成(?:状态)?|[低中高]\s*优先级|[小中大]\s*工作量|[低中高小大])\s*(?:$|[，,；;。！？!?]))\s*[^，,；;。！？!?]+/gu,
+      /((?:把|将)[^，,；;。！？!?]+?(?<!优先级|工作量)(?:改|换)(?:为|成))(?!\s*(?:(?:已|未|待)完成(?:状态)?|[低中高]\s*优先级|[小中大]\s*工作量|[低中高小大])\s*[吧呢啊呀哦嘛]?\s*(?:$|[，,；;。！？!?]))\s*[^，,；;。！？!?]+/gu,
       "$1「」",
     );
 }

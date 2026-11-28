@@ -1543,8 +1543,14 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
           "",
         );
         if (shortTitle !== trimmed && !seenTaskTitles.has(trimmed)) {
+          if (seenTaskTitles.has(shortTitle)) {
+            return { title: shortTitle, literal: false };
+          }
           const shortened = namedTarget(shortTitle);
           if (shortened && !isUnboundTarget(shortened.title)) return shortened;
+        }
+        if (seenTaskTitles.has(trimmed)) {
+          return { title: trimmed, literal: false };
         }
         if (quotedOrPlain) {
           return isUnboundTarget(quotedOrPlain.title) ? undefined : quotedOrPlain;
@@ -1594,7 +1600,7 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
           }
         }
         const renameMatch =
-          /^(?:把|将)\s*(.+?)\s*(?:的?(?:标题|名称|名字)\s*(?:改|修改|换|设)|重命名|改名|更名|改(?:一下|下)?(?:标题|名称|名字)|换(?:一下|下)?(?:标题|名称|名字)|(?<!优先级|工作量)(?:改|换))(?:为|成|叫)\s*(.+)$/u.exec(
+          /^(?:把|将)\s*(.+?)\s*(?:的?(?:标题|名称|名字)\s*(?:改|修改|换|设)|重命名|改名|更名|改(?:一下|下)?(?:标题|名称|名字)|换(?:一下|下)?(?:标题|名称|名字)|(?<!优先级|工作量)(?:改|换))(?:为|成|叫)(?!\s*(?:已|未|待)完成(?:状态)?$)\s*(.+)$/u.exec(
             stripped,
           );
         if (renameMatch) {
@@ -1633,7 +1639,7 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
           const rawSuffix = targetFirstAction.exec(rawTrimmed);
           if (rawSuffix && !deleteAction.test(rawSuffix[2])) {
             const rawTargetTrimmed = rawSuffix[1].trim();
-            if (!/^[「『“"‘']/u.test(rawTargetTrimmed)) {
+            if (!/^(?:(?:也|再|并|先|只)\s*)?[「『“"‘']/u.test(rawTargetTrimmed)) {
               const fullTitle = rawTargetTrimmed.replace(/(?:已经|已)$/u, "");
               if (knownTitles.has(fullTitle)) {
                 return { title: fullTitle, literal: false, clauseIndex };
@@ -2055,7 +2061,7 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
         !clauseAnalysis.hasPositiveCreateCommand &&
         !clauseAnalysis.allowReopen &&
         !clauseAnalysis.allowRename &&
-        !/(?:优先级|工作量)\s*(?:改|设|调|降|升)|(?:提高|降低|调高|调低)/u.test(
+        !/(?:优先级|工作量)\s*(?:改为|改成|改到|设为|设成|设置为|设置成|调整为|调整成|调为|调成|调到|降到|降至|降为|升到|升至|升为)\s*[低中高小大]|(?:提高|降低|调高|调低)[^，,。]*?优先级/u.test(
           maskQuotedTitles(commandInput),
         ) &&
         !/^(?:把|将)/u.test(commandInput)
@@ -3301,6 +3307,17 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
             name === "update_task"
               ? (singleUpdateSpec ?? (callRank !== undefined ? rankedUpdate : liveMixedUpdate))
               : undefined;
+          if (
+            name === "update_task" &&
+            !planned?.title &&
+            !singleGrant &&
+            !activeBoundReference &&
+            callRank !== undefined &&
+            !activeUpdateSpec &&
+            /(?:把|将)/u.test(maskQuotedTitles(clauseAnalysis.positiveClauses[callRank] ?? ""))
+          ) {
+            return finish("reference_required");
+          }
           const rankedUpdateIntent =
             name === "update_task" && callRank !== undefined && !activeBoundReference
               ? turnClauseIntents[callRank]
