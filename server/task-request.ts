@@ -441,6 +441,8 @@ const wholeTurnRetractionClausePattern =
   /^(?:(?:还是)?算了(?:吧)?|罢了|没事了|不麻烦了|(?:(?:还是)?算了(?:吧)?\s*)?(?:还是|先)?(?:不用|不要|(?<!分|特|级|类|区|告|差|识|判|个|性)别(?!人|的|处|扭)|不必)(?:记|加|新增|创建|添加|删|改|做|办|完成|动|管)了)$/u;
 const keepNoOpClausePattern =
   /^(?:(?:先|还是|就)?(?:留着|保留|保持原样|不动|别动|放着|搁着)(?:吧|好了|就行)?)$/u;
+const courtesyFillerClausePattern =
+  /^(?:(?:非常)?感谢|多谢|谢谢(?:你|啦|啊|了)?|辛苦(?:你)?(?:了|啦)?|麻烦(?:你)?了|好的?|行(?:吧)?|知道了?|明白了?|收到|拜托(?:了)?|没事(?:了)?|不用谢|嗯+|哦+|噢+)[。！!~～]*$/u;
 const tentativeIntentPattern = /^(?:我)?(?:本来|原本|刚才|刚刚)想/u;
 const retractionCuePattern =
   /(?:算了|(?:不用|不要|(?<!分|特|级|类|区|告|差|识|判|个|性)别(?!人|的|处|扭)|不必)(?:记|加|新增|创建|添加|删|改|做|办|完成|动|管)了?)/u;
@@ -544,6 +546,7 @@ export function analyzeClauses(input: string): ClauseAnalysis {
     }
 
     previousWasProhibition = false;
+    if (courtesyFillerClausePattern.test(maskedClause)) continue;
     positiveEntries.push({
       text: clause,
       masked: maskedClause,
@@ -647,7 +650,7 @@ export function analyzeClauses(input: string): ClauseAnalysis {
 
   // Detect action intents in positive clauses.
   const hasCreateVerb =
-    /(?:新增|新建|创建|添加|加入|加上|加一|加个|加条|(?<!标)(?:再)?记(?:一下|一条|下|个|条|住|录)?|备忘|提醒我)/u.test(
+    /(?:新增|新建|创建|添加|加入|加上|加一|加个|加条|(?:帮我|给我|请|麻烦|再|另外|顺便)\s*记录?(?:一下|一?[条项个]|下)?|(?<!标|登|忘|笔|日|书|游|传|杂|手|随|会|议)(?:再)?记(?:一下|一?[条项个]|下|住|入|上|到|进|：|:)|(?<![\p{Script=Han}])记录(?:一下|一?[条项个]|下|：|:)|备忘|提醒我)/u.test(
       positiveText,
     );
   const textWithoutReopenPhrases = positiveText

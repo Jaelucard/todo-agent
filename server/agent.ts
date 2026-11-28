@@ -126,7 +126,11 @@ function buildTools(allowBoundReference: boolean): ChatCompletionFunctionTool[] 
         description: "读取当前待办清单，可按完成状态、优先级或工作量筛选。",
         parameters: strictObject(
           {
-            done: { type: "boolean", description: "可选：仅查看已完成(true)或待完成(false)任务。" },
+            done: {
+              type: "boolean",
+              description:
+                "可选：仅查看已完成(true)或待完成/未完成(false)任务。用户询问待完成/未完成任务时必须传 false，询问已完成任务时必须传 true。",
+            },
             ...metadataProperties,
           },
           [],
@@ -255,24 +259,35 @@ function referenceWords(title: string) {
 }
 
 const cancelsTaskAction = /取消|撤销|停止|终止|放弃|退订|退掉/u;
-const preparatoryTaskPrefix = /^(?:准备|计划|打算|考虑|研究|先了解|确认是否)/u;
+const preparatoryTaskCue =
+  /(?:准备|计划|打算|考虑|研究|了解|确认是否|查询|查一下|营业时间|核实一下)/u;
+const appointmentTaskCue = /(?:预约|约诊|挂号|看牙|复诊|门诊)/u;
 const semanticConceptGroups: ReadonlyArray<readonly [string, readonly string[]]> = [
   ["dental_clinic", ["牙医", "牙科", "口腔", "看牙"]],
   ["dental_cleaning", ["洗牙", "洁牙"]],
   ["dental_extraction", ["拔牙"]],
   ["dental_filling", ["补牙"]],
-  ["dental_ortho", ["正畸", "矫正牙齿", "种牙", "种植牙"]],
+  ["dental_ortho", ["正畸", "矫正牙齿"]],
+  ["dental_implant", ["种牙", "种植牙"]],
   ["physical_exam", ["体检", "体格检查", "健康检查"]],
   ["orthopedics", ["骨科"]],
   ["ophthalmology", ["眼科"]],
   ["dermatology", ["皮肤科"]],
-  ["vet_pet", ["宠物", "兽医"]],
-  ["medication", ["开药", "取药", "买药", "配药"]],
-  ["payment", ["缴费", "付款", "结账", "付钱", "退款"]],
-  ["tax", ["税务", "报税", "纳税", "个税"]],
-  ["legal", ["法律", "律师", "法务"]],
+  ["pet", ["宠物"]],
+  ["vet", ["兽医"]],
+  ["buy_medicine", ["买药"]],
+  ["prescribe_medicine", ["开药"]],
+  ["pickup_medicine", ["取药", "配药"]],
+  ["payment", ["缴费", "付款", "结账", "付钱"]],
+  ["refund", ["退款"]],
+  ["tax_filing", ["报税", "纳税"]],
+  ["tax_general", ["税务", "个税"]],
+  ["lawyer", ["律师"]],
+  ["legal_affairs", ["法律", "法务"]],
   ["property_fee", ["物业费"]],
-  ["utility_bill", ["水电费", "水费", "电费"]],
+  ["utility_bill", ["水电费"]],
+  ["water_bill", ["水费"]],
+  ["electric_bill", ["电费"]],
   ["gas_bill", ["燃气费"]],
   ["heating_bill", ["暖气费"]],
   ["rent", ["房租", "租金"]],
@@ -292,8 +307,9 @@ function semanticConcepts(text: string): Set<string> {
 
 function hasGroundedSemanticMatch(title: string, storedTitle: string): boolean {
   if (cancelsTaskAction.test(title) !== cancelsTaskAction.test(storedTitle)) return false;
-  if (preparatoryTaskPrefix.test(title) !== preparatoryTaskPrefix.test(storedTitle)) return false;
+  if (preparatoryTaskCue.test(title) !== preparatoryTaskCue.test(storedTitle)) return false;
   if (namesSemanticTarget(title, storedTitle)) return true;
+  if (appointmentTaskCue.test(title) !== appointmentTaskCue.test(storedTitle)) return false;
   const requestedConcepts = semanticConcepts(title);
   if (!requestedConcepts.size) return false;
   const storedConcepts = semanticConcepts(storedTitle);
@@ -468,6 +484,24 @@ function explicitListScope(content: string): "all" | TaskMetadata["priority"] {
     if (allTasks.test(object)) return "all";
   }
   if (/^我的(?:任务|待办(?:事项)?)都?有哪些$/u.test(text)) return "all";
+}
+
+function isScopedListQuery(content: string): boolean {
+  const text = content
+    .trim()
+    .replace(/^(?:请问|麻烦|请)/u, "")
+    .replace(/[吧呢]?[。！？.!?]?$/u, "");
+  const prefix =
+    /^(?:再?(?:给我|帮我)?(?:看看|看一看|列出|(?:查看|显示|展示|看|列)(?:一下|下)?)|我?(?:现在|目前|手头)?都?(?:还)?有(?:哪些|什么))/u.exec(
+      text,
+    );
+  if (!prefix) return false;
+  const rest = text.slice(prefix[0].length);
+  return (
+    /(?:待完成|未完成|没完成|没办完|还没完|已完成|完成了|高优先级|中优先级|低优先级|大工作量|中工作量|小工作量)/u.test(
+      rest,
+    ) && /(?:任务|待办|事项|清单|列表|事)/u.test(rest)
+  );
 }
 
 function answersTargetQuestion(previous: ChatMessage | undefined, text: string, tasks: Task[]) {
@@ -2062,7 +2096,7 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
           ![...requestedConcepts].some((concept) => storedConcepts.has(concept));
         if (
           cancelsTaskAction.test(title) !== cancelsTaskAction.test(selected.title) ||
-          preparatoryTaskPrefix.test(title) !== preparatoryTaskPrefix.test(selected.title) ||
+          preparatoryTaskCue.test(title) !== preparatoryTaskCue.test(selected.title) ||
           domainConflict ||
           (requested &&
             selected.title.includes(requested.action) &&
@@ -2173,6 +2207,17 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
             ) {
               hintTool = "list_tasks";
             }
+          } else if (
+            !activeBoundReference &&
+            !displayedList &&
+            !clauseAnalysis.hasProhibition &&
+            !trailingList.wantsList &&
+            !clauseAnalysis.hasPositiveCreateCommand &&
+            !clauseAnalysis.hasDeleteVerb &&
+            !clauseAnalysis.allowRename &&
+            isScopedListQuery(input)
+          ) {
+            hintTool = "list_tasks";
           }
         }
         const requestToolChoice = forcedTool ?? hintTool;
@@ -2431,6 +2476,17 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
             calls.some((call) => call.function.name === namedMutation);
           return finish(prematureMutation ? "list_required" : "invalid_model_response");
         }
+        if (narrowedToolName && calls.some((call) => call.function.name !== narrowedToolName)) {
+          const prematureMutation =
+            narrowedToolName === "list_tasks" &&
+            calls.some(
+              (call) =>
+                call.function.name === "complete_task" ||
+                call.function.name === "delete_task" ||
+                call.function.name === "update_task",
+            );
+          return finish(prematureMutation ? "list_required" : "invalid_model_response");
+        }
 
         // Batch-level validation BEFORE executing any write tool in this batch.
         for (const call of calls) {
@@ -2521,18 +2577,26 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
           const clauseIntents = clauseAnalysis.positiveClauses.map((clause) =>
             analyzeClauses(clause),
           );
+          const clauseMatchesTool = (
+            intent: ReturnType<typeof analyzeClauses>,
+            toolName: string,
+          ): boolean => {
+            if (toolName === "create_task") return intent.hasPositiveCreateCommand;
+            if (toolName === "complete_task") return intent.hasCompleteVerb;
+            if (toolName === "delete_task") return intent.hasDeleteVerb;
+            if (toolName === "update_task") {
+              return (
+                intent.allowRename ||
+                intent.allowReopen ||
+                (intent.hasMetadataMention && !intent.hasPositiveCreateCommand)
+              );
+            }
+            return false;
+          };
           const rankForTool = (toolName: string): number => {
             const matchingIndices = clauseIntents
               .map((intent, idx) => ({ intent, idx }))
-              .filter(({ intent }) => {
-                if (toolName === "create_task") return intent.hasPositiveCreateCommand;
-                if (toolName === "complete_task") return intent.hasCompleteVerb;
-                if (toolName === "delete_task") return intent.hasDeleteVerb;
-                if (toolName === "update_task") {
-                  return intent.allowRename || intent.allowReopen || intent.hasMetadataMention;
-                }
-                return false;
-              });
+              .filter(({ intent }) => clauseMatchesTool(intent, toolName));
             return matchingIndices.length === 1 ? matchingIndices[0].idx : -1;
           };
           const ranked = calls.map((call, index) => ({
@@ -2542,9 +2606,24 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
           }));
           const uniqueRanks = new Set(ranked.map((entry) => entry.rank));
           if (ranked.every((entry) => entry.rank >= 0) && uniqueRanks.size === ranked.length) {
-            orderedCalls = ranked
-              .sort((a, b) => a.rank - b.rank || a.index - b.index)
-              .map((entry) => entry.call);
+            const sorted = ranked.sort((a, b) => a.rank - b.rank || a.index - b.index);
+            const firstMutationClauseIndex = clauseIntents.findIndex(
+              (intent) =>
+                intent.hasPositiveCreateCommand ||
+                intent.hasCompleteVerb ||
+                intent.hasDeleteVerb ||
+                intent.allowRename ||
+                intent.allowReopen ||
+                intent.hasMetadataMention,
+            );
+            if (
+              outcomes.length === 0 &&
+              firstMutationClauseIndex >= 0 &&
+              sorted[0].rank > firstMutationClauseIndex
+            ) {
+              return finish("action_not_executed");
+            }
+            orderedCalls = sorted.map((entry) => entry.call);
           }
         }
 

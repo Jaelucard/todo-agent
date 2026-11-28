@@ -1715,3 +1715,136 @@ test("LIVE-SWEEP-2 regressions: forced tool narrowing, same-domain semantic isol
     assert.ok(!tasks.list().some((item) => item.id === rent.id));
   }
 });
+
+test("CODEX-REVIEW + C5-T7 regressions: semantic action/bill isolation, courtesy & noun create guards, compound metadata/prefix ranking, narrowed schema enforcement, scoped list hint", async (t) => {
+  // 1. P1: semantic deletion rejects clinic-hours lookup, 先准备 preparatory prefix, and 水费 vs 电费
+  for (const [prompt, storedTitle] of [
+    ["把预约牙医删掉", "查询口腔诊所营业时间"],
+    ["把预约牙医删掉", "先准备联系口腔诊所约诊"],
+    ["把交水费删掉", "交电费"],
+  ] as const) {
+    const { tasks, filename } = await setup(t);
+    const stored = tasks.create(storedTitle);
+    const before = await readFile(filename, "utf8");
+    const mock = scripted(
+      proposal(call("l1", "list_tasks", {})),
+      proposal(call("d1", "delete_task", { candidateIds: [stored.id] })),
+      proposal(
+        call("v1", "verify_task_reference", { decision: "match", candidateIds: [stored.id] }),
+      ),
+    );
+    const turn = await createAgent(tasks, mock.provider).runTurn([user(prompt)]);
+    assert.ok(
+      turn.failure === "reference_required" || turn.failure === "exact_title_not_found",
+      `${prompt} -> ${storedTitle}: got ${String(turn.failure)}`,
+    );
+    assert.deepEqual(turn.outcomes, [], `${prompt} -> ${storedTitle}`);
+    assert.equal(await readFile(filename, "utf8"), before, `${prompt} -> ${storedTitle}`);
+  }
+
+  // 2. P2: courtesy filler after prohibition and "会议记录" noun never authorize create_task
+  for (const prompt of ["别删买牛奶，谢谢。", "把整理会议记录删掉，另外把取快递删掉。"] as const) {
+    const { tasks, filename } = await setup(t);
+    tasks.create("买牛奶");
+    tasks.create("整理会议记录");
+    tasks.create("取快递");
+    const before = await readFile(filename, "utf8");
+    const mock = scripted(
+      proposal(call("l1", "list_tasks", {})),
+      proposal(call("c-bad", "create_task", { title: "未请求任务" })),
+    );
+    const turn = await createAgent(tasks, mock.provider).runTurn([user(prompt)]);
+    assert.equal(turn.failure, "reference_required", prompt);
+    assert.deepEqual(turn.outcomes, [], prompt);
+    assert.equal(await readFile(filename, "utf8"), before, prompt);
+  }
+
+  // 3a. P2: complete + rename + create-with-metadata reorders reverse batch to exact user clause order
+  {
+    const { tasks } = await setup(t);
+    const milk = tasks.create("买牛奶");
+    const report = tasks.create("写周报");
+    const mock = scripted(
+      proposal(call("l1", "list_tasks", {})),
+      proposal(
+        call("a1", "create_task", { title: "交房租", priority: "high" }),
+        call("u1", "update_task", { candidateIds: [report.id], changes: { title: "提交周报" } }),
+        call("c1", "complete_task", { candidateIds: [milk.id] }),
+      ),
+      final("已完成。"),
+    );
+    const turn = await createAgent(tasks, mock.provider).runTurn([
+      user("买牛奶已经完成了，把写周报改名为提交周报，再新增高优先级任务：交房租"),
+    ]);
+    assert.equal(turn.failure, undefined);
+    assert.deepEqual(
+      turn.outcomes.map((o) => o.operation),
+      ["complete_task", "update_task", "create_task"],
+    );
+  }
+
+  // 3b. P2: skipping the first mutation clause in a multi-write batch fails closed with zero writes
+  {
+    const { tasks, filename } = await setup(t);
+    tasks.create("买牛奶");
+    const report = tasks.create("写周报");
+    const before = await readFile(filename, "utf8");
+    const mock = scripted(
+      proposal(call("l1", "list_tasks", {})),
+      proposal(
+        call("a1", "create_task", { title: "交房租", priority: "high" }),
+        call("u1", "update_task", { candidateIds: [report.id], changes: { title: "提交周报" } }),
+      ),
+      final("已完成。"),
+    );
+    const turn = await createAgent(tasks, mock.provider).runTurn([
+      user("买牛奶已经完成了，把写周报改名为提交周报，再新增高优先级任务：交房租"),
+    ]);
+    assert.equal(turn.failure, "action_not_executed");
+    assert.deepEqual(turn.outcomes, []);
+    assert.equal(await readFile(filename, "utf8"), before);
+  }
+
+  // 4. P2: calls outside a narrowed round-1 tool schema are rejected with zero writes
+  {
+    const { tasks, filename } = await setup(t);
+    tasks.create("买牛奶");
+    tasks.create("取快递");
+    const before = await readFile(filename, "utf8");
+    const mock = scripted(proposal(call("c-rogue", "create_task", { title: "预约牙医" })));
+    const turn = await createAgent(tasks, mock.provider).runTurn([
+      user("牛奶已经买好了，把取快递那条删掉，另外再帮我记一条「预约牙医」。"),
+    ]);
+    assert.deepEqual(
+      mock.requests[0]?.tools?.map((tool) => tool.type === "function" && tool.function.name),
+      ["list_tasks"],
+    );
+    assert.equal(turn.failure, "invalid_model_response");
+    assert.deepEqual(turn.outcomes, []);
+    assert.equal(await readFile(filename, "utf8"), before);
+  }
+
+  // 5. C5-T7: scoped pending list query narrows round-1 to [list_tasks] with list_tasks tool_choice
+  {
+    const { tasks } = await setup(t);
+    const report = tasks.create("交报告", { priority: "high", workload: "small" });
+    tasks.update(report.id, { done: true });
+    const parcel = tasks.create("取快递");
+    const mock = scripted(
+      proposal(call("l1", "list_tasks", { done: false })),
+      final("待完成清单已列出。"),
+    );
+    const turn = await createAgent(tasks, mock.provider).runTurn([user("有哪些待完成的任务？")]);
+    assert.deepEqual(
+      mock.requests[0]?.tools?.map((tool) => tool.type === "function" && tool.function.name),
+      ["list_tasks"],
+    );
+    assert.deepEqual(mock.requests[0]?.tool_choice, {
+      type: "function",
+      function: { name: "list_tasks" },
+    });
+    assert.equal(turn.failure, undefined);
+    assert.deepEqual(turn.displayedList, [parcel]);
+    assert.match(turn.reply, /待完成清单：\n- 取快递（待完成）/);
+  }
+});
