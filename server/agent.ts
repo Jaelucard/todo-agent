@@ -859,6 +859,8 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
         }
       }
 
+      let requiredLeadingListFilter: ListTasksFilter | undefined;
+
       function finish(
         failure?: Failure,
         note?: string,
@@ -868,6 +870,15 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
       ) {
         const lines = [...confirmations];
         const filter = listFilterOverride ?? displayedListFilter;
+        if (
+          displayedList !== undefined &&
+          requiredLeadingListFilter &&
+          (filter.done !== requiredLeadingListFilter.done ||
+            filter.priority !== requiredLeadingListFilter.priority ||
+            filter.workload !== requiredLeadingListFilter.workload)
+        ) {
+          displayedList = undefined;
+        }
         if (displayedList !== undefined && !suppressUnnumberedListInReply) {
           const filterLabel = describeListFilter(filter);
           lines.push(
@@ -1481,93 +1492,130 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
         mixedDeletions.length > 0 && mixedDeletions.length === deleteClauseCount
           ? new Set(mixedDeletions.map((entry) => entry.title))
           : undefined;
-      let initialStoredTitles = new Set<string>();
-      try {
-        initialStoredTitles = new Set(tasks.list().map((task) => task.title));
-      } catch {
-        initialStoredTitles = new Set<string>();
+      function extractExplicitUpdateTarget(
+        clause: string,
+        includeConnectors: boolean,
+      ): { title: string; literal: boolean } | undefined {
+        const stripped = stripLeadingActionPrefixes(clause, { includeConnectors }).replace(
+          /吧?[。！？.!?]?$/u,
+          "",
+        );
+        const reopenMatch =
+          /^(?:把|将)\s*(.+?)\s*(?:改回|恢复(?:为|成)?|退回(?:为|成)?|变回|重置(?:为|成)?|重新(?:打开|开启|标记(?:为|成)?|设为|变为)|标(?:记)?(?:为|成)?|设(?:置)?(?:为|成)?)(?:未|待)完成$/u.exec(
+            stripped,
+          ) ?? /^(?:取消|撤销)\s*(.+?)\s*的?(?:已)?完成(?:状态)?$/u.exec(stripped);
+        const renameMatch =
+          /^(?:把|将)\s*(.+?)\s*(?:重命名|改名|更名|改(?:一下|下)?(?:标题|名称|名字)?|换(?:一下|下)?(?:标题|名称|名字)?)(?:为|成|叫).+$/u.exec(
+            stripped,
+          );
+        const raw = reopenMatch?.[1] ?? renameMatch?.[1];
+        if (!raw) return undefined;
+        const name = namedTarget(raw);
+        if (name) return isUnboundTarget(name.title) && !name.literal ? undefined : name;
+        const shortTitle = raw.trim().replace(/(?:这|那)(?:一)?[条项个件](?:任务|待办|事)?$/u, "");
+        const shortened = raw.trim() !== shortTitle && namedTarget(shortTitle);
+        return shortened && !isUnboundTarget(shortened.title) ? shortened : undefined;
       }
-      const mixedCompletions =
-        !activeBoundReference && clauseAnalysis.hasCompleteVerb && clauseAnalysis.clauseCount > 1
+
+      function resolveMixedCompletionForClause(
+        clauseIndex: number,
+        storedTitles: Set<string>,
+      ): { clauseIndex: number; title: string; literal: boolean } | undefined {
+        if (
+          activeBoundReference ||
+          !clauseAnalysis.hasCompleteVerb ||
+          clauseAnalysis.clauseCount <= 1
+        ) {
+          return undefined;
+        }
+        const clause = clauseAnalysis.positiveClauses[clauseIndex];
+        if (!clause || isPureListClause(clause)) return undefined;
+        const action = taskCommand(clause, clauseIndex > 0);
+        let rawTarget: string | undefined;
+        let isExplicit = false;
+        if (action && !deleteAction.test(action.action) && action.action !== "update_task") {
+          rawTarget = action.target;
+          isExplicit = action.explicit;
+        } else {
+          const baseStripped = stripLeadingActionPrefixes(clause, {
+            includeConnectors: clauseIndex > 0,
+          }).replace(/吧?[。！？.!?]?$/u, "");
+          const hadLeadingConnector =
+            baseStripped !== clause.trim().replace(/吧?[。！？.!?]?$/u, "");
+          const candidateTexts = [baseStripped];
+          if (clauseIndex > 0 && !hadLeadingConnector) {
+            const withoutShortConnector = baseStripped.replace(/^(?:再(?!次)|也)\s*/u, "");
+            if (withoutShortConnector !== baseStripped) {
+              candidateTexts.push(withoutShortConnector);
+            }
+          }
+          for (const candidate of candidateTexts) {
+            if (
+              /(?:改回|未完成|待完成|取消(?:已)?完成|重新打开|重命名|改名|更名)/u.test(
+                maskQuotedTitles(candidate),
+              )
+            ) {
+              continue;
+            }
+            const suffixMatch = targetFirstAction.exec(candidate);
+            if (!suffixMatch || deleteAction.test(suffixMatch[2])) continue;
+            const possibleTitle = suffixMatch[1].trim().replace(/(?:已经|已)$/u, "");
+            if (candidate === baseStripped && candidateTexts.length > 1) {
+              if (storedTitles.has(possibleTitle)) {
+                rawTarget = suffixMatch[1];
+                break;
+              }
+              continue;
+            }
+            rawTarget = suffixMatch[1];
+            break;
+          }
+        }
+        if (!rawTarget) return undefined;
+        const cleanedTarget = isExplicit
+          ? rawTarget
+          : rawTarget.trim().replace(/(?:已经|已)$/u, "");
+        const name = namedTarget(cleanedTarget);
+        if (name) {
+          return isUnboundTarget(name.title) && !name.literal
+            ? undefined
+            : { ...name, clauseIndex };
+        }
+        const raw = cleanedTarget.trim();
+        const shortTitle = raw.replace(/(?:这|那)(?:一)?[条项个件](?:任务|待办|事)?$/u, "");
+        const shortened = raw !== shortTitle && namedTarget(shortTitle);
+        return shortened && !isUnboundTarget(shortened.title)
+          ? { ...shortened, clauseIndex }
+          : undefined;
+      }
+
+      const completeClauseCount = clauseAnalysis.positiveClauses.filter(
+        (clause) => !isPureListClause(clause) && analyzeClauses(clause).hasCompleteVerb,
+      ).length;
+      const singleUpdateTitle =
+        !activeBoundReference &&
+        clauseAnalysis.clauseCount === 1 &&
+        (clauseAnalysis.allowReopen || clauseAnalysis.allowRename)
+          ? extractExplicitUpdateTarget(commandInput, false)?.title
+          : undefined;
+      const mixedUpdates =
+        !activeBoundReference &&
+        (clauseAnalysis.allowReopen || clauseAnalysis.allowRename) &&
+        clauseAnalysis.clauseCount > 1
           ? clauseAnalysis.positiveClauses.flatMap<{
               clauseIndex: number;
               title: string;
               literal: boolean;
             }>((clause, clauseIndex) => {
               if (isPureListClause(clause)) return [];
-              const action = taskCommand(clause, clauseIndex > 0);
-              let rawTarget: string | undefined;
-              let isExplicit = false;
-              if (action && !deleteAction.test(action.action) && action.action !== "update_task") {
-                rawTarget = action.target;
-                isExplicit = action.explicit;
-              } else {
-                const baseStripped = stripLeadingActionPrefixes(clause, {
-                  includeConnectors: clauseIndex > 0,
-                }).replace(/吧?[。！？.!?]?$/u, "");
-                const hadLeadingConnector =
-                  baseStripped !== clause.trim().replace(/吧?[。！？.!?]?$/u, "");
-                const candidateTexts = [baseStripped];
-                if (clauseIndex > 0 && !hadLeadingConnector) {
-                  const withoutShortConnector = baseStripped.replace(/^(?:再(?!次)|也)\s*/u, "");
-                  if (withoutShortConnector !== baseStripped) {
-                    candidateTexts.push(withoutShortConnector);
-                  }
-                }
-                for (const candidate of candidateTexts) {
-                  if (
-                    /(?:改回|未完成|待完成|取消(?:已)?完成|重新打开|重命名|改名|更名)/u.test(
-                      maskQuotedTitles(candidate),
-                    )
-                  ) {
-                    continue;
-                  }
-                  const suffixMatch = targetFirstAction.exec(candidate);
-                  if (!suffixMatch || deleteAction.test(suffixMatch[2])) continue;
-                  const possibleTitle = suffixMatch[1].trim().replace(/(?:已经|已)$/u, "");
-                  if (candidate === baseStripped && candidateTexts.length > 1) {
-                    if (initialStoredTitles.has(possibleTitle)) {
-                      rawTarget = suffixMatch[1];
-                      break;
-                    }
-                    continue;
-                  }
-                  rawTarget = suffixMatch[1];
-                  break;
-                }
-              }
-              if (!rawTarget) return [];
-              const cleanedTarget = isExplicit
-                ? rawTarget
-                : rawTarget.trim().replace(/(?:已经|已)$/u, "");
-              const name = namedTarget(cleanedTarget);
-              if (name) {
-                return isUnboundTarget(name.title) && !name.literal
-                  ? []
-                  : [{ ...name, clauseIndex }];
-              }
-              const raw = cleanedTarget.trim();
-              const shortTitle = raw.replace(/(?:这|那)(?:一)?[条项个件](?:任务|待办|事)?$/u, "");
-              const shortened = raw !== shortTitle && namedTarget(shortTitle);
-              return shortened && !isUnboundTarget(shortened.title)
-                ? [{ ...shortened, clauseIndex }]
-                : [];
+              const parsed = extractExplicitUpdateTarget(clause, clauseIndex > 0);
+              return parsed ? [{ ...parsed, clauseIndex }] : [];
             })
           : [];
-      const completeClauseCount = clauseAnalysis.positiveClauses.filter(
-        (clause) => !isPureListClause(clause) && analyzeClauses(clause).hasCompleteVerb,
-      ).length;
-      const mixedComplete =
-        mixedCompletions.length === 1 && completeClauseCount === 1
-          ? mixedCompletions[0]
-          : undefined;
-      const mixedCompleteByClauseIndex = new Map(
-        mixedCompletions.map((entry) => [entry.clauseIndex, entry]),
+      const mixedUpdateByClauseIndex = new Map(
+        mixedUpdates.map((entry) => [entry.clauseIndex, entry]),
       );
-      const mixedCompletionAllowedTitles =
-        mixedCompletions.length > 0 && mixedCompletions.length === completeClauseCount
-          ? new Set(mixedCompletions.map((entry) => entry.title))
-          : undefined;
+      const mixedUpdate = mixedUpdates.length === 1 ? mixedUpdates[0] : undefined;
       const leadingList =
         !activeBoundReference &&
         !trailingList.wantsList &&
@@ -1578,6 +1626,10 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
               filter: expectedScopedListFilter(clauseAnalysis.positiveClauses[0]) ?? {},
             }
           : { wantsList: false, filter: {} as ListTasksFilter };
+      requiredLeadingListFilter =
+        leadingList.wantsList && Object.keys(leadingList.filter).length > 0
+          ? leadingList.filter
+          : undefined;
       const rawTurnClauseIntents =
         clauseAnalysis.positiveClauses.length >= 2
           ? clauseAnalysis.positiveClauses.map((clause) =>
@@ -1922,6 +1974,7 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
         if (view.tool === "list_tasks") {
           if (view.tasks.some((task) => task.title === clarificationName)) {
             if (clarificationDeleteName) exactDeleteTitle = clarificationDeleteName;
+            else if (completionName && !exactCompleteTitle) exactCompleteTitle = completionName;
           } else {
             const candidates = clarificationDeleteName
               ? possibleMatches(view.tasks, clarificationName)
@@ -1937,6 +1990,19 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
                 clarificationDeleteName ? "delete_task" : "complete_task",
                 candidates,
               );
+            }
+            if (
+              completionName &&
+              !exactCompleteTitle &&
+              candidates.length === 0 &&
+              !view.tasks.some(
+                (task) =>
+                  !clauseAnalysis.forbiddenTitles.has(task.title) &&
+                  (completionName.includes(task.title) ||
+                    hasGroundedSemanticMatch(completionName, task.title)),
+              )
+            ) {
+              exactCompleteTitle = completionName;
             }
           }
         }
@@ -3040,17 +3106,46 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
             name === "delete_task" && callRank !== undefined
               ? mixedDeleteByClauseIndex.get(callRank)
               : undefined;
+          let liveStoredTitles = new Set<string>();
+          if (name === "complete_task" && clauseAnalysis.clauseCount > 1 && !activeBoundReference) {
+            try {
+              liveStoredTitles = new Set(tasks.list().map((task) => task.title));
+            } catch {
+              liveStoredTitles = new Set<string>();
+            }
+          }
+          const liveMixedCompletions =
+            name === "complete_task" && clauseAnalysis.clauseCount > 1 && !activeBoundReference
+              ? clauseAnalysis.positiveClauses.flatMap((_, idx) => {
+                  const resolved = resolveMixedCompletionForClause(idx, liveStoredTitles);
+                  return resolved ? [resolved] : [];
+                })
+              : [];
           const rankedComplete =
             name === "complete_task" && callRank !== undefined
-              ? mixedCompleteByClauseIndex.get(callRank)
+              ? liveMixedCompletions.find((entry) => entry.clauseIndex === callRank)
+              : undefined;
+          const liveMixedComplete =
+            liveMixedCompletions.length === 1 && completeClauseCount === 1
+              ? liveMixedCompletions[0]
+              : undefined;
+          const liveMixedCompletionAllowedTitles =
+            liveMixedCompletions.length > 0 && liveMixedCompletions.length === completeClauseCount
+              ? new Set(liveMixedCompletions.map((entry) => entry.title))
+              : undefined;
+          const rankedUpdate =
+            name === "update_task" && callRank !== undefined
+              ? mixedUpdateByClauseIndex.get(callRank)
               : undefined;
           const title =
             planned?.title ??
             (name === "delete_task"
               ? (exactDeleteTitle ?? rankedDelete?.title ?? mixedDelete?.title)
               : name === "complete_task"
-                ? (exactCompleteTitle ?? rankedComplete?.title ?? mixedComplete?.title)
-                : undefined);
+                ? (exactCompleteTitle ?? rankedComplete?.title ?? liveMixedComplete?.title)
+                : name === "update_task"
+                  ? (singleUpdateTitle ?? rankedUpdate?.title ?? mixedUpdate?.title)
+                  : undefined);
           const activeMixedDelete = rankedDelete ?? mixedDelete;
           const suffixedTitle = activeMixedDelete?.suffixedTitle;
           if (name === "delete_task" && !planned?.title && activeMixedDelete && suffixedTitle) {
@@ -3071,7 +3166,7 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
             name === "delete_task"
               ? mixedDeletionAllowedTitles
               : name === "complete_task"
-                ? mixedCompletionAllowedTitles
+                ? liveMixedCompletionAllowedTitles
                 : undefined;
           const grantWithMixedDeletes =
             !title && mixedAllowedTitles
