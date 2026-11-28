@@ -546,7 +546,7 @@ const actionFirstTarget = new RegExp(
   `^(${deleteActions}|完成|标(?:记)?(?:为|成)?(?:已)?完成)(.+)$`,
   "u",
 );
-const actionFirstBareDelete = /^(删)(?![除掉了一节减改])\s*([\p{Script=Han}「“"].+)$/u;
+const actionFirstBareDelete = /^(删)(?![除掉了一节减改])\s*([\p{Script=Han}「“"].*)$/u;
 
 function taskCommand(content: string, includeConnectors = false) {
   const text = stripLeadingActionPrefixes(content, { includeConnectors })
@@ -1490,20 +1490,40 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
             }>((clause, clauseIndex) => {
               if (isPureListClause(clause)) return [];
               const action = taskCommand(clause, clauseIndex > 0);
-              if (
-                !action?.explicit ||
-                deleteAction.test(action.action) ||
-                action.action === "update_task"
-              ) {
-                return [];
+              let rawTarget: string | undefined;
+              let isExplicit = false;
+              if (action && !deleteAction.test(action.action) && action.action !== "update_task") {
+                rawTarget = action.target;
+                isExplicit = action.explicit;
+              } else {
+                const stripped = stripLeadingActionPrefixes(clause, {
+                  includeConnectors: clauseIndex > 0,
+                })
+                  .replace(clauseIndex > 0 ? /^(?:再(?!次)|也)\s*/u : /^$/u, "")
+                  .replace(/吧?[。！？.!?]?$/u, "");
+                if (
+                  !/(?:改回|未完成|待完成|取消(?:已)?完成|重新打开|重命名|改名|更名)/u.test(
+                    maskQuotedTitles(stripped),
+                  )
+                ) {
+                  const suffixMatch = targetFirstAction.exec(stripped);
+                  if (suffixMatch && !deleteAction.test(suffixMatch[2])) {
+                    rawTarget = suffixMatch[1];
+                  }
+                }
               }
-              const name = namedTarget(action.target);
+              if (!rawTarget) return [];
+              const cleanedTarget = isExplicit
+                ? rawTarget
+                : rawTarget.trim().replace(/(?:已经|已)$/u, "");
+              if (!isExplicit && /完成/u.test(cleanedTarget)) return [];
+              const name = namedTarget(cleanedTarget);
               if (name) {
                 return isUnboundTarget(name.title) && !name.literal
                   ? []
                   : [{ ...name, clauseIndex }];
               }
-              const raw = action.target.trim();
+              const raw = cleanedTarget.trim();
               const shortTitle = raw.replace(/(?:这|那)(?:一)?[条项个件](?:任务|待办|事)?$/u, "");
               const shortened = raw !== shortTitle && namedTarget(shortTitle);
               return shortened && !isUnboundTarget(shortened.title)
@@ -1525,6 +1545,82 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
         mixedCompletions.length > 0 && mixedCompletions.length === completeClauseCount
           ? new Set(mixedCompletions.map((entry) => entry.title))
           : undefined;
+      const leadingList =
+        !activeBoundReference &&
+        !trailingList.wantsList &&
+        clauseAnalysis.positiveClauses.length >= 2 &&
+        isPureListClause(clauseAnalysis.positiveClauses[0])
+          ? {
+              wantsList: true,
+              filter: expectedScopedListFilter(clauseAnalysis.positiveClauses[0]) ?? {},
+            }
+          : { wantsList: false, filter: {} as ListTasksFilter };
+      const turnClauseIntents =
+        clauseAnalysis.positiveClauses.length >= 2
+          ? clauseAnalysis.positiveClauses.map((clause) =>
+              isPureListClause(clause) ? undefined : analyzeClauses(clause),
+            )
+          : [];
+      const turnMutationClauseIndices = turnClauseIntents
+        .map((intent, idx) => ({ intent, idx }))
+        .filter(({ intent, idx }) => {
+          if (
+            !intent ||
+            !(
+              intent.hasPositiveCreateCommand ||
+              intent.hasCompleteVerb ||
+              intent.hasDeleteVerb ||
+              intent.allowRename ||
+              intent.allowReopen ||
+              intent.hasMetadataMention
+            )
+          ) {
+            return false;
+          }
+          // An anaphoric follow-up clause like "帮我把那项标成完成" after "牛奶已经买回来了"
+          // refers to the preceding completion rather than a second independent mutation.
+          if (
+            idx > 0 &&
+            intent.hasCompleteVerb &&
+            !intent.hasDeleteVerb &&
+            !intent.hasPositiveCreateCommand
+          ) {
+            const cmd = taskCommand(clauseAnalysis.positiveClauses[idx], true);
+            const earlierComplete = turnClauseIntents
+              .slice(0, idx)
+              .some((prev) => Boolean(prev?.hasCompleteVerb));
+            if (earlierComplete && cmd && isUnboundTarget(cmd.target)) return false;
+          }
+          // A narrative reason clause like "寄合同其实还没寄" before an explicit reopen command
+          // "帮我改回未完成" describes the same single reopen rather than two separate updates.
+          if (
+            intent.allowReopen &&
+            !intent.hasCompleteVerb &&
+            !intent.hasDeleteVerb &&
+            !intent.hasPositiveCreateCommand &&
+            !intent.allowRename &&
+            !intent.hasMetadataMention
+          ) {
+            const maskedClause = maskQuotedTitles(clauseAnalysis.positiveClauses[idx]);
+            const isExplicitReopenCommand =
+              /(?:改回|恢复|退回|变回|重置|重新|取消(?:已)?完成|标(?:记)?(?:为|成)?(?:未|待)完成|设(?:置)?(?:为|成)?(?:未|待)完成)/u.test(
+                maskedClause,
+              );
+            const hasLaterReopenCommand = turnClauseIntents
+              .slice(idx + 1)
+              .some((later, offset) =>
+                Boolean(
+                  later?.allowReopen &&
+                  /(?:改回|恢复|退回|变回|重置|重新|取消(?:已)?完成|标(?:记)?(?:为|成)?(?:未|待)完成|设(?:置)?(?:为|成)?(?:未|待)完成)/u.test(
+                    maskQuotedTitles(clauseAnalysis.positiveClauses[idx + 1 + offset]),
+                  ),
+                ),
+              );
+            if (!isExplicitReopenCommand && hasLaterReopenCommand) return false;
+          }
+          return true;
+        })
+        .map(({ idx }) => idx);
       const singleNamedDeletion =
         parsedDelete ??
         (!clauseAnalysis.hasCompleteVerb &&
@@ -1568,7 +1664,16 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
               view = fullView.tasks;
             }
           }
-          const candidates = possibleMatches(view, name.title);
+          const candidates =
+            pendingOperation === "complete_task" && !name.literal
+              ? view.filter(
+                  (task) =>
+                    !clauseAnalysis.forbiddenTitles.has(task.title) &&
+                    ((task.title.trim().length >= 2 &&
+                      (task.title.includes(name.title) || name.title.includes(task.title))) ||
+                      isTitleAbbreviation(name.title, task.title)),
+                )
+              : possibleMatches(view, name.title);
           if (
             !name.literal &&
             candidates.length > 1 &&
@@ -1594,14 +1699,16 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
       }
 
       function ensurePostMutationListIfRequested() {
-        if (!trailingList.wantsList || confirmations.length === 0) return;
-        const fresh = createTaskTools(tasks).execute(
-          "list_tasks",
-          JSON.stringify(trailingList.filter),
-        );
+        const listSpec = trailingList.wantsList
+          ? trailingList
+          : leadingList.wantsList
+            ? leadingList
+            : undefined;
+        if (!listSpec || confirmations.length === 0) return;
+        const fresh = createTaskTools(tasks).execute("list_tasks", JSON.stringify(listSpec.filter));
         if (fresh.ok && fresh.tool === "list_tasks") {
           displayedList = fresh.tasks;
-          displayedListFilter = trailingList.filter;
+          displayedListFilter = listSpec.filter;
         }
       }
 
@@ -1823,7 +1930,8 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
             outcomes.length &&
             displayedList !== undefined &&
             !clarification &&
-            !trailingList.wantsList
+            !trailingList.wantsList &&
+            !leadingList.wantsList
               ? "本轮只执行了上面确认的更改。"
               : undefined;
           return finish(clarification, note);
@@ -1876,6 +1984,23 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
         }
         if (!command || /[?？]$/u.test(commandInput)) {
           if (clarification === "task_not_found") return finish("task_not_found");
+          if (
+            !clarification &&
+            !/[?？]$/u.test(commandInput) &&
+            clauseAnalysis.mutationsAllowed &&
+            turnMutationClauseIndices.length > 0
+          ) {
+            if (
+              leadingList.wantsList &&
+              Object.keys(leadingList.filter).length > 0 &&
+              (displayedListFilter.done !== leadingList.filter.done ||
+                displayedListFilter.priority !== leadingList.filter.priority ||
+                displayedListFilter.workload !== leadingList.filter.workload)
+            ) {
+              displayedList = undefined;
+            }
+            return finish("action_not_executed");
+          }
           return finish(
             clarification,
             clarification ? undefined : "如需更改，请说明具体任务和操作。",
@@ -2504,6 +2629,15 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
             ensurePostMutationListIfRequested();
             return finish("action_not_executed");
           }
+          if (
+            !orderedOperations &&
+            completedClauseRanks.size > 0 &&
+            completedClauseRanks.size < turnMutationClauseIndices.length &&
+            displayedList === undefined
+          ) {
+            ensurePostMutationListIfRequested();
+            return finish("action_not_executed");
+          }
           const stoppedAfterUnfilteredList =
             round === 2 &&
             executedCallIds.size === 1 &&
@@ -2724,9 +2858,7 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
             : calls;
         const batchCallRanks = new Map<string, number>();
         if (!orderedOperations && writes.length > 0 && clauseAnalysis.positiveClauses.length >= 2) {
-          const clauseIntents = clauseAnalysis.positiveClauses.map((clause) =>
-            isPureListClause(clause) ? undefined : analyzeClauses(clause),
-          );
+          const clauseIntents = turnClauseIntents;
           const clauseMatchesTool = (
             intent: ReturnType<typeof analyzeClauses> | undefined,
             toolName: string,
@@ -2744,19 +2876,7 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
             }
             return false;
           };
-          const mutationClauseIndices = clauseIntents
-            .map((intent, idx) => ({ intent, idx }))
-            .filter(
-              ({ intent }) =>
-                Boolean(intent) &&
-                (intent!.hasPositiveCreateCommand ||
-                  intent!.hasCompleteVerb ||
-                  intent!.hasDeleteVerb ||
-                  intent!.allowRename ||
-                  intent!.allowReopen ||
-                  intent!.hasMetadataMention),
-            )
-            .map(({ idx }) => idx);
+          const mutationClauseIndices = turnMutationClauseIndices;
           const matchingIndicesForTool = (toolName: string): number[] =>
             clauseIntents
               .map((intent, idx) => ({ intent, idx }))

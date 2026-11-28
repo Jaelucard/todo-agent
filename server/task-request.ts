@@ -249,10 +249,10 @@ export function stripLeadingActionPrefixes(
   let text = clause.trim();
   const connectorPattern = /^(?:然后|接着|随后|另外|此外|同时|顺便|顺手|并且|而且|还有|以及)\s*/u;
   const shortConnectorPattern = options.includeConnectors
-    ? /^(?:也|再|并|先|只)\s*(?=[把将请帮给替为麻删移清去完标新创添记改重])/u
-    : /^(?:再|只|先)\s*(?=[把将请帮给替为麻删移清去完标新创添记改重])/u;
+    ? /^(?:也|再|并|先|只)\s*(?=[把将请帮给替为麻删移清去完标新创添记加备提写改重查看列显展])/u
+    : /^(?:再|只|先)\s*(?=[把将请帮给替为麻删移清去完标新创添记加备提写改重查看列显展])/u;
   const politePattern =
-    /^(?:请问|麻烦(?:\s*[你您])?(?=\s|[把将帮给替为再只先删移清去完标新创添记改重查看列显展])|请(?:\s*[你您])?(?=\s|[把将帮给替为麻再只先删移清去完标新创添记改重查看列显展])|帮我|给我|替我|为我)\s*/u;
+    /^(?:请问|麻烦(?:\s*[你您])?(?=\s|[把将帮给替为再只先删移清去完标新创添记加备提写改重查看列显展])|请(?:\s*[你您])?(?=\s|[把将帮给替为麻再只先删移清去完标新创添记加备提写改重查看列显展])|帮我|给我|替我|为我)\s*/u;
   while (true) {
     let next = text;
     if (options.includeConnectors) {
@@ -496,11 +496,9 @@ export function isPureListClause(clause: string): boolean {
   ) {
     return false;
   }
-  const text = masked
-    .replace(/^(?:请问|麻烦(?:[你您])?|请(?:[你您])?)\s*/u, "")
-    .replace(/[吧呢]?[。！？.!?]?$/u, "");
+  const text = stripLeadingActionPrefixes(masked).replace(/[吧呢]?[。！？.!?]?$/u, "");
   const prefix =
-    /^(?:再?(?:给我|帮我)?(?:看看|看一看|列出|(?:查看|显示|展示|看|列)(?:一下|下)?)|我?(?:现在|目前|手头)?都?(?:还)?有(?:哪些|什么))/u.exec(
+    /^(?:再?\s*(?:看看|看一看|列出|(?:查看|显示|展示|看|列)(?:一下|下)?)|我?(?:现在|目前|手头)?都?(?:还)?有(?:哪些|什么))/u.exec(
       text,
     );
   if (!prefix) return false;
@@ -551,11 +549,9 @@ export function expectedScopedListFilter(
     return undefined;
   }
   const masked = maskQuotedTitles(activeClauses[0]);
-  const text = masked
-    .replace(/^(?:请问|麻烦(?:[你您])?|请(?:[你您])?)\s*/u, "")
-    .replace(/[吧呢]?[。！？.!?]?$/u, "");
+  const text = stripLeadingActionPrefixes(masked).replace(/[吧呢]?[。！？.!?]?$/u, "");
   const prefix =
-    /^(?:再?(?:给我|帮我)?(?:看看|看一看|列出|(?:查看|显示|展示|看|列)(?:一下|下)?)|我?(?:现在|目前|手头)?都?(?:还)?有(?:哪些|什么))/u.exec(
+    /^(?:再?\s*(?:看看|看一看|列出|(?:查看|显示|展示|看|列)(?:一下|下)?)|我?(?:现在|目前|手头)?都?(?:还)?有(?:哪些|什么))/u.exec(
       text,
     );
   if (!prefix) return undefined;

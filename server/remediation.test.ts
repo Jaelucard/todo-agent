@@ -3058,3 +3058,175 @@ test("review round 8 regressions (9bb77da6): mixed list+complete pinning, comple
     assert.match(turn.reply, /找不到指定的任务/u);
   }
 });
+
+test("review round 9 regressions (8101fc38): create prefix lookahead, suffix completion pinning, whitespace list, 1-char bare delete, leading list, partial ranks, and abbreviation absence", async (t) => {
+  // 1. P1 #1: "先加个把过期文件删掉" blocks deleting 过期文件
+  {
+    const { tasks, filename } = await setup(t);
+    const existing = tasks.create("过期文件");
+    const before = await readFile(filename, "utf8");
+    const turn = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(call("d1", "delete_task", { candidateIds: [existing.id] })),
+        final("已删除。"),
+      ).provider,
+    ).runTurn([user("先加个把过期文件删掉")]);
+    assert.ok(turn.failure);
+    assert.deepEqual(turn.outcomes, []);
+    assert.equal(await readFile(filename, "utf8"), before);
+  }
+
+  // 2. P1 #2: "列出任务，然后买牛奶完成了" and "列出任务，然后完成买牛奶，再交房租完成了" pin suffix-style targets
+  {
+    const { tasks, filename } = await setup(t);
+    tasks.create("买牛奶");
+    const parcel = tasks.create("取快递");
+    const before = await readFile(filename, "utf8");
+    const turn = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(call("c1", "complete_task", { candidateIds: [parcel.id] })),
+        final("已完成。"),
+      ).provider,
+    ).runTurn([user("列出任务，然后买牛奶完成了")]);
+    assert.ok(turn.failure);
+    assert.deepEqual(turn.outcomes, []);
+    assert.equal(await readFile(filename, "utf8"), before);
+  }
+  {
+    const { tasks } = await setup(t);
+    const milk = tasks.create("买牛奶");
+    const parcel = tasks.create("取快递");
+    const rent = tasks.create("交房租");
+    const turn = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(
+          call("c1", "complete_task", { candidateIds: [milk.id] }),
+          call("c2", "complete_task", { candidateIds: [parcel.id] }),
+        ),
+        final("已完成。"),
+      ).provider,
+    ).runTurn([user("列出任务，然后完成买牛奶，再交房租完成了")]);
+    assert.ok(turn.failure);
+    assert.equal(tasks.list().find((item) => item.id === parcel.id)?.done, false);
+    assert.equal(tasks.list().find((item) => item.id === rent.id)?.done, false);
+  }
+
+  // 3. P1 #3: "请 帮我 列出完成的任务，谢谢" stays strictly read-only and blocks complete_task
+  {
+    const { tasks, filename } = await setup(t);
+    const milk = tasks.create("买牛奶");
+    const before = await readFile(filename, "utf8");
+    const turn = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(call("c1", "complete_task", { candidateIds: [milk.id] })),
+        final("已完成。"),
+      ).provider,
+    ).runTurn([user("请 帮我 列出完成的任务，谢谢")]);
+    assert.ok(turn.failure);
+    assert.deepEqual(turn.outcomes, []);
+    assert.equal(await readFile(filename, "utf8"), before);
+  }
+
+  // 4. P1 #4: "请 帮我 删税" binds 1-character title 税 and rejects deleting 取快递
+  {
+    const { tasks, filename } = await setup(t);
+    const tax = tasks.create("税");
+    const parcel = tasks.create("取快递");
+    const before = await readFile(filename, "utf8");
+    const wrong = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(call("d1", "delete_task", { candidateIds: [parcel.id] })),
+        final("已删除。"),
+      ).provider,
+    ).runTurn([user("请 帮我 删税")]);
+    assert.ok(wrong.failure);
+    assert.deepEqual(wrong.outcomes, []);
+    assert.equal(await readFile(filename, "utf8"), before);
+
+    const right = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(call("d1", "delete_task", { candidateIds: [tax.id] })),
+        final("已删除。"),
+      ).provider,
+    ).runTurn([user("请 帮我 删税")]);
+    assert.equal(right.failure, undefined);
+    assert.deepEqual(
+      tasks.list().map((item) => item.title),
+      ["取快递"],
+    );
+  }
+
+  // 5. P2 #5: "列出完成了的任务，然后删掉买牛奶" rejects wrong unfiltered stop and includes done list after delete
+  {
+    const { tasks } = await setup(t);
+    const milk = tasks.create("买牛奶");
+    const rent = tasks.create("交房租");
+    tasks.update(rent.id, { done: true });
+
+    const stoppedUnfiltered = await createAgent(
+      tasks,
+      scripted(proposal(call("l1", "list_tasks", {})), final("清单如下。")).provider,
+    ).runTurn([user("列出完成了的任务，然后删掉买牛奶")]);
+    assert.equal(stoppedUnfiltered.failure, "action_not_executed");
+    assert.equal(stoppedUnfiltered.displayedList, undefined);
+
+    const deleted = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", { done: true })),
+        proposal(call("l2", "list_tasks", {})),
+        proposal(call("d1", "delete_task", { candidateIds: [milk.id] })),
+        final("已完成。"),
+      ).provider,
+    ).runTurn([user("列出完成了的任务，然后删掉买牛奶")]);
+    assert.equal(deleted.failure, undefined);
+    assert.deepEqual(
+      deleted.displayedList?.map((item) => item.title),
+      ["交房租"],
+    );
+    assert.match(deleted.reply, /已删除「买牛奶」/u);
+    assert.match(deleted.reply, /交房租（已完成）/u);
+  }
+
+  // 6. P2 #6: "列出任务，然后完成买牛奶，再完成取快递" reports action_not_executed if model stops after 1 of 2 writes
+  {
+    const { tasks } = await setup(t);
+    const milk = tasks.create("买牛奶");
+    const parcel = tasks.create("取快递");
+    const turn = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(call("c1", "complete_task", { candidateIds: [milk.id] })),
+        final("已完成买牛奶。"),
+      ).provider,
+    ).runTurn([user("列出任务，然后完成买牛奶，再完成取快递")]);
+    assert.equal(turn.failure, "action_not_executed");
+    assert.equal(tasks.list().find((item) => item.id === milk.id)?.done, true);
+    assert.equal(tasks.list().find((item) => item.id === parcel.id)?.done, false);
+  }
+
+  // 7. P2 #7: "完成买奶" with store [买牛奶] and stop prose "没找到买奶。" returns reference_required (not task_not_found)
+  {
+    const { tasks } = await setup(t);
+    tasks.create("买牛奶");
+    const turn = await createAgent(
+      tasks,
+      scripted(proposal(call("l1", "list_tasks", {})), final("没找到买奶。")).provider,
+    ).runTurn([user("完成买奶")]);
+    assert.equal(turn.failure, "reference_required");
+    assert.doesNotMatch(turn.reply, /找不到指定的任务/u);
+  }
+});
