@@ -3230,3 +3230,215 @@ test("review round 9 regressions (8101fc38): create prefix lookahead, suffix com
     assert.doesNotMatch(turn.reply, /找不到指定的任务/u);
   }
 });
+
+test("review round 10 regressions (50024adf): title prefix preservation, completion-titled suffix target, spaced list filter, Latin bare delete, narrative reopen rank exclusion, partial stop with list/done, and clarification filter clearing", async (t) => {
+  // 1. P1 #1: "先查看邮件删掉吧" preserves full title 先查看邮件 and rejects 查看邮件;
+  //    "列出任务，然后再看合同完成了" preserves 再看合同 and rejects 看合同
+  {
+    const { tasks, filename } = await setup(t);
+    const full = tasks.create("先查看邮件");
+    const short = tasks.create("查看邮件");
+    const before = await readFile(filename, "utf8");
+    const wrong = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(call("d1", "delete_task", { candidateIds: [short.id] })),
+        final("已删除。"),
+      ).provider,
+    ).runTurn([user("先查看邮件删掉吧")]);
+    assert.ok(wrong.failure);
+    assert.equal(await readFile(filename, "utf8"), before);
+
+    const right = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(call("d1", "delete_task", { candidateIds: [full.id] })),
+        final("已删除。"),
+      ).provider,
+    ).runTurn([user("先查看邮件删掉吧")]);
+    assert.equal(right.failure, undefined);
+    assert.deepEqual(
+      tasks.list().map((item) => item.title),
+      ["查看邮件"],
+    );
+  }
+  {
+    const { tasks, filename } = await setup(t);
+    const full = tasks.create("再看合同");
+    const short = tasks.create("看合同");
+    const before = await readFile(filename, "utf8");
+    const wrong = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(call("c1", "complete_task", { candidateIds: [short.id] })),
+        final("已完成。"),
+      ).provider,
+    ).runTurn([user("列出任务，然后再看合同完成了")]);
+    assert.ok(wrong.failure);
+    assert.equal(await readFile(filename, "utf8"), before);
+
+    const right = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(call("c1", "complete_task", { candidateIds: [full.id] })),
+        final("已完成。"),
+      ).provider,
+    ).runTurn([user("列出任务，然后再看合同完成了")]);
+    assert.equal(right.failure, undefined);
+    assert.equal(tasks.list().find((item) => item.id === full.id)?.done, true);
+    assert.equal(tasks.list().find((item) => item.id === short.id)?.done, false);
+  }
+
+  // 2. P1 #2: "列出任务，然后完成预算完成了" pins 完成预算 and rejects completing 取快递
+  {
+    const { tasks, filename } = await setup(t);
+    const budget = tasks.create("完成预算");
+    const parcel = tasks.create("取快递");
+    const before = await readFile(filename, "utf8");
+    const wrong = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(call("c1", "complete_task", { candidateIds: [parcel.id] })),
+        final("已完成。"),
+      ).provider,
+    ).runTurn([user("列出任务，然后完成预算完成了")]);
+    assert.ok(wrong.failure);
+    assert.equal(await readFile(filename, "utf8"), before);
+
+    const right = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(call("c1", "complete_task", { candidateIds: [budget.id] })),
+        final("已完成。"),
+      ).provider,
+    ).runTurn([user("列出任务，然后完成预算完成了")]);
+    assert.equal(right.failure, undefined);
+    assert.equal(tasks.list().find((item) => item.id === budget.id)?.done, true);
+  }
+
+  // 3. P1 #3: "请 帮我 列出完成 的任务，谢谢" stays read-only and blocks complete_task
+  {
+    const { tasks, filename } = await setup(t);
+    const milk = tasks.create("买牛奶");
+    const before = await readFile(filename, "utf8");
+    const turn = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(call("c1", "complete_task", { candidateIds: [milk.id] })),
+        final("已完成。"),
+      ).provider,
+    ).runTurn([user("请 帮我 列出完成 的任务，谢谢")]);
+    assert.ok(turn.failure);
+    assert.deepEqual(turn.outcomes, []);
+    assert.equal(await readFile(filename, "utf8"), before);
+  }
+
+  // 4. P1 #4: "请 帮我 删VPN" binds VPN and rejects deleting 取快递
+  {
+    const { tasks, filename } = await setup(t);
+    const vpn = tasks.create("VPN");
+    const parcel = tasks.create("取快递");
+    const before = await readFile(filename, "utf8");
+    const wrong = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(call("d1", "delete_task", { candidateIds: [parcel.id] })),
+        final("已删除。"),
+      ).provider,
+    ).runTurn([user("请 帮我 删VPN")]);
+    assert.ok(wrong.failure);
+    assert.equal(await readFile(filename, "utf8"), before);
+
+    const right = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(call("d1", "delete_task", { candidateIds: [vpn.id] })),
+        final("已删除。"),
+      ).provider,
+    ).runTurn([user("请 帮我 删VPN")]);
+    assert.equal(right.failure, undefined);
+    assert.deepEqual(
+      tasks.list().map((item) => item.title),
+      ["取快递"],
+    );
+  }
+
+  // 5. P1 #5: "寄合同其实还没寄，帮我把寄合同改回未完成" rejects extra batch update on 交房租
+  {
+    const { tasks, filename } = await setup(t);
+    const contract = tasks.update(tasks.create("寄合同").id, { done: true })!;
+    const rent = tasks.update(tasks.create("交房租").id, { done: true })!;
+    const before = await readFile(filename, "utf8");
+    const extraBatch = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(
+          call("u1", "update_task", { candidateIds: [contract.id], changes: { done: false } }),
+          call("u2", "update_task", { candidateIds: [rent.id], changes: { done: false } }),
+        ),
+        final("已改回。"),
+      ).provider,
+    ).runTurn([user("寄合同其实还没寄，帮我把寄合同改回未完成")]);
+    assert.ok(extraBatch.failure);
+    assert.deepEqual(extraBatch.outcomes, []);
+    assert.equal(await readFile(filename, "utf8"), before);
+  }
+
+  // 6. P2 #6: "列出任务，然后完成买牛奶，再完成取快递" returns action_not_executed even after extra list_tasks or already-done 买牛奶
+  {
+    const { tasks } = await setup(t);
+    const milk = tasks.create("买牛奶");
+    const parcel = tasks.create("取快递");
+    const afterSecondList = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(call("c1", "complete_task", { candidateIds: [milk.id] })),
+        proposal(call("l2", "list_tasks", {})),
+        final("收到。"),
+      ).provider,
+    ).runTurn([user("列出任务，然后完成买牛奶，再完成取快递")]);
+    assert.equal(afterSecondList.failure, "action_not_executed");
+    assert.equal(tasks.list().find((item) => item.id === parcel.id)?.done, false);
+  }
+  {
+    const { tasks } = await setup(t);
+    const milk = tasks.update(tasks.create("买牛奶").id, { done: true })!;
+    const parcel = tasks.create("取快递");
+    const alreadyDoneFirst = await createAgent(
+      tasks,
+      scripted(
+        proposal(call("l1", "list_tasks", {})),
+        proposal(call("c1", "complete_task", { candidateIds: [milk.id] })),
+        final("收到。"),
+      ).provider,
+    ).runTurn([user("列出任务，然后完成买牛奶，再完成取快递")]);
+    assert.equal(alreadyDoneFirst.failure, "action_not_executed");
+    assert.equal(tasks.list().find((item) => item.id === parcel.id)?.done, false);
+  }
+
+  // 7. P2 #7: "列出完成了的任务，然后删掉买牛奶" clears unfiltered displayedList even on clarification stop
+  {
+    const { tasks } = await setup(t);
+    tasks.create("买牛奶");
+    const rent = tasks.create("交房租");
+    tasks.update(rent.id, { done: true });
+    const turn = await createAgent(
+      tasks,
+      scripted(proposal(call("l1", "list_tasks", {})), final("需要澄清。")).provider,
+    ).runTurn([user("列出完成了的任务，然后删掉买牛奶")]);
+    assert.equal(turn.failure, "ambiguous_reference");
+    assert.equal(turn.displayedList, undefined);
+    assert.doesNotMatch(turn.reply, /买牛奶/u);
+  }
+});

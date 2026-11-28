@@ -546,7 +546,7 @@ const actionFirstTarget = new RegExp(
   `^(${deleteActions}|完成|标(?:记)?(?:为|成)?(?:已)?完成)(.+)$`,
   "u",
 );
-const actionFirstBareDelete = /^(删)(?![除掉了一节减改])\s*([\p{Script=Han}「“"].*)$/u;
+const actionFirstBareDelete = /^(删)(?![除掉了一节减改])\s*([\p{L}\p{N}「“"].*)$/u;
 
 function taskCommand(content: string, includeConnectors = false) {
   const text = stripLeadingActionPrefixes(content, { includeConnectors })
@@ -1481,6 +1481,12 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
         mixedDeletions.length > 0 && mixedDeletions.length === deleteClauseCount
           ? new Set(mixedDeletions.map((entry) => entry.title))
           : undefined;
+      let initialStoredTitles = new Set<string>();
+      try {
+        initialStoredTitles = new Set(tasks.list().map((task) => task.title));
+      } catch {
+        initialStoredTitles = new Set<string>();
+      }
       const mixedCompletions =
         !activeBoundReference && clauseAnalysis.hasCompleteVerb && clauseAnalysis.clauseCount > 1
           ? clauseAnalysis.positiveClauses.flatMap<{
@@ -1496,27 +1502,44 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
                 rawTarget = action.target;
                 isExplicit = action.explicit;
               } else {
-                const stripped = stripLeadingActionPrefixes(clause, {
+                const baseStripped = stripLeadingActionPrefixes(clause, {
                   includeConnectors: clauseIndex > 0,
-                })
-                  .replace(clauseIndex > 0 ? /^(?:再(?!次)|也)\s*/u : /^$/u, "")
-                  .replace(/吧?[。！？.!?]?$/u, "");
-                if (
-                  !/(?:改回|未完成|待完成|取消(?:已)?完成|重新打开|重命名|改名|更名)/u.test(
-                    maskQuotedTitles(stripped),
-                  )
-                ) {
-                  const suffixMatch = targetFirstAction.exec(stripped);
-                  if (suffixMatch && !deleteAction.test(suffixMatch[2])) {
-                    rawTarget = suffixMatch[1];
+                }).replace(/吧?[。！？.!?]?$/u, "");
+                const hadLeadingConnector =
+                  baseStripped !== clause.trim().replace(/吧?[。！？.!?]?$/u, "");
+                const candidateTexts = [baseStripped];
+                if (clauseIndex > 0 && !hadLeadingConnector) {
+                  const withoutShortConnector = baseStripped.replace(/^(?:再(?!次)|也)\s*/u, "");
+                  if (withoutShortConnector !== baseStripped) {
+                    candidateTexts.push(withoutShortConnector);
                   }
+                }
+                for (const candidate of candidateTexts) {
+                  if (
+                    /(?:改回|未完成|待完成|取消(?:已)?完成|重新打开|重命名|改名|更名)/u.test(
+                      maskQuotedTitles(candidate),
+                    )
+                  ) {
+                    continue;
+                  }
+                  const suffixMatch = targetFirstAction.exec(candidate);
+                  if (!suffixMatch || deleteAction.test(suffixMatch[2])) continue;
+                  const possibleTitle = suffixMatch[1].trim().replace(/(?:已经|已)$/u, "");
+                  if (candidate === baseStripped && candidateTexts.length > 1) {
+                    if (initialStoredTitles.has(possibleTitle)) {
+                      rawTarget = suffixMatch[1];
+                      break;
+                    }
+                    continue;
+                  }
+                  rawTarget = suffixMatch[1];
+                  break;
                 }
               }
               if (!rawTarget) return [];
               const cleanedTarget = isExplicit
                 ? rawTarget
                 : rawTarget.trim().replace(/(?:已经|已)$/u, "");
-              if (!isExplicit && /完成/u.test(cleanedTarget)) return [];
               const name = namedTarget(cleanedTarget);
               if (name) {
                 return isUnboundTarget(name.title) && !name.literal
@@ -1555,71 +1578,72 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
               filter: expectedScopedListFilter(clauseAnalysis.positiveClauses[0]) ?? {},
             }
           : { wantsList: false, filter: {} as ListTasksFilter };
-      const turnClauseIntents =
+      const rawTurnClauseIntents =
         clauseAnalysis.positiveClauses.length >= 2
           ? clauseAnalysis.positiveClauses.map((clause) =>
               isPureListClause(clause) ? undefined : analyzeClauses(clause),
             )
           : [];
+      const turnClauseIntents = rawTurnClauseIntents.map((intent, idx) => {
+        if (
+          !intent ||
+          !(
+            intent.hasPositiveCreateCommand ||
+            intent.hasCompleteVerb ||
+            intent.hasDeleteVerb ||
+            intent.allowRename ||
+            intent.allowReopen ||
+            intent.hasMetadataMention
+          )
+        ) {
+          return undefined;
+        }
+        // An anaphoric follow-up clause like "帮我把那项标成完成" after "牛奶已经买回来了"
+        // refers to the preceding completion rather than a second independent mutation.
+        if (
+          idx > 0 &&
+          intent.hasCompleteVerb &&
+          !intent.hasDeleteVerb &&
+          !intent.hasPositiveCreateCommand
+        ) {
+          const cmd = taskCommand(clauseAnalysis.positiveClauses[idx], true);
+          const earlierComplete = rawTurnClauseIntents
+            .slice(0, idx)
+            .some((prev) => Boolean(prev?.hasCompleteVerb));
+          if (earlierComplete && cmd && isUnboundTarget(cmd.target)) return undefined;
+        }
+        // A narrative reason clause like "寄合同其实还没寄" before an explicit reopen command
+        // "帮我改回未完成" describes the same single reopen rather than two separate updates.
+        if (
+          intent.allowReopen &&
+          !intent.hasCompleteVerb &&
+          !intent.hasDeleteVerb &&
+          !intent.hasPositiveCreateCommand &&
+          !intent.allowRename &&
+          !intent.hasMetadataMention
+        ) {
+          const maskedClause = maskQuotedTitles(clauseAnalysis.positiveClauses[idx]);
+          const isExplicitReopenCommand =
+            /(?:改回|恢复|退回|变回|重置|重新|取消(?:已)?完成|标(?:记)?(?:为|成)?(?:未|待)完成|设(?:置)?(?:为|成)?(?:未|待)完成)/u.test(
+              maskedClause,
+            );
+          const hasLaterReopenCommand = rawTurnClauseIntents
+            .slice(idx + 1)
+            .some((later, offset) =>
+              Boolean(
+                later?.allowReopen &&
+                /(?:改回|恢复|退回|变回|重置|重新|取消(?:已)?完成|标(?:记)?(?:为|成)?(?:未|待)完成|设(?:置)?(?:为|成)?(?:未|待)完成)/u.test(
+                  maskQuotedTitles(clauseAnalysis.positiveClauses[idx + 1 + offset]),
+                ),
+              ),
+            );
+          if (!isExplicitReopenCommand && hasLaterReopenCommand) return undefined;
+        }
+        return intent;
+      });
       const turnMutationClauseIndices = turnClauseIntents
         .map((intent, idx) => ({ intent, idx }))
-        .filter(({ intent, idx }) => {
-          if (
-            !intent ||
-            !(
-              intent.hasPositiveCreateCommand ||
-              intent.hasCompleteVerb ||
-              intent.hasDeleteVerb ||
-              intent.allowRename ||
-              intent.allowReopen ||
-              intent.hasMetadataMention
-            )
-          ) {
-            return false;
-          }
-          // An anaphoric follow-up clause like "帮我把那项标成完成" after "牛奶已经买回来了"
-          // refers to the preceding completion rather than a second independent mutation.
-          if (
-            idx > 0 &&
-            intent.hasCompleteVerb &&
-            !intent.hasDeleteVerb &&
-            !intent.hasPositiveCreateCommand
-          ) {
-            const cmd = taskCommand(clauseAnalysis.positiveClauses[idx], true);
-            const earlierComplete = turnClauseIntents
-              .slice(0, idx)
-              .some((prev) => Boolean(prev?.hasCompleteVerb));
-            if (earlierComplete && cmd && isUnboundTarget(cmd.target)) return false;
-          }
-          // A narrative reason clause like "寄合同其实还没寄" before an explicit reopen command
-          // "帮我改回未完成" describes the same single reopen rather than two separate updates.
-          if (
-            intent.allowReopen &&
-            !intent.hasCompleteVerb &&
-            !intent.hasDeleteVerb &&
-            !intent.hasPositiveCreateCommand &&
-            !intent.allowRename &&
-            !intent.hasMetadataMention
-          ) {
-            const maskedClause = maskQuotedTitles(clauseAnalysis.positiveClauses[idx]);
-            const isExplicitReopenCommand =
-              /(?:改回|恢复|退回|变回|重置|重新|取消(?:已)?完成|标(?:记)?(?:为|成)?(?:未|待)完成|设(?:置)?(?:为|成)?(?:未|待)完成)/u.test(
-                maskedClause,
-              );
-            const hasLaterReopenCommand = turnClauseIntents
-              .slice(idx + 1)
-              .some((later, offset) =>
-                Boolean(
-                  later?.allowReopen &&
-                  /(?:改回|恢复|退回|变回|重置|重新|取消(?:已)?完成|标(?:记)?(?:为|成)?(?:未|待)完成|设(?:置)?(?:为|成)?(?:未|待)完成)/u.test(
-                    maskQuotedTitles(clauseAnalysis.positiveClauses[idx + 1 + offset]),
-                  ),
-                ),
-              );
-            if (!isExplicitReopenCommand && hasLaterReopenCommand) return false;
-          }
-          return true;
-        })
+        .filter(({ intent }) => Boolean(intent))
         .map(({ idx }) => idx);
       const singleNamedDeletion =
         parsedDelete ??
@@ -1982,6 +2006,16 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
           displayedList = undefined;
           return finish(undefined, "本轮未修改任务。");
         }
+        const view = displayedList;
+        if (
+          leadingList.wantsList &&
+          Object.keys(leadingList.filter).length > 0 &&
+          (displayedListFilter.done !== leadingList.filter.done ||
+            displayedListFilter.priority !== leadingList.filter.priority ||
+            displayedListFilter.workload !== leadingList.filter.workload)
+        ) {
+          displayedList = undefined;
+        }
         if (!command || /[?？]$/u.test(commandInput)) {
           if (clarification === "task_not_found") return finish("task_not_found");
           if (
@@ -1990,15 +2024,6 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
             clauseAnalysis.mutationsAllowed &&
             turnMutationClauseIndices.length > 0
           ) {
-            if (
-              leadingList.wantsList &&
-              Object.keys(leadingList.filter).length > 0 &&
-              (displayedListFilter.done !== leadingList.filter.done ||
-                displayedListFilter.priority !== leadingList.filter.priority ||
-                displayedListFilter.workload !== leadingList.filter.workload)
-            ) {
-              displayedList = undefined;
-            }
             return finish("action_not_executed");
           }
           return finish(
@@ -2010,7 +2035,6 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
         if (!parsedTarget) {
           return finish(clarification ?? "reference_required");
         }
-        const view = displayedList;
         const resolved = inspectNamedTarget(view, parsedTarget.title);
         if (!resolved.ok) {
           const pendingOp: "complete_task" | "delete_task" | "update_task" =
@@ -2632,11 +2656,17 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
           if (
             !orderedOperations &&
             completedClauseRanks.size > 0 &&
-            completedClauseRanks.size < turnMutationClauseIndices.length &&
-            displayedList === undefined
+            completedClauseRanks.size < turnMutationClauseIndices.length
           ) {
             ensurePostMutationListIfRequested();
-            return finish("action_not_executed");
+            const partialNote =
+              outcomes.length &&
+              displayedList !== undefined &&
+              !trailingList.wantsList &&
+              !leadingList.wantsList
+                ? "本轮只执行了上面确认的更改。"
+                : undefined;
+            return finish("action_not_executed", partialNote);
           }
           const stoppedAfterUnfilteredList =
             round === 2 &&

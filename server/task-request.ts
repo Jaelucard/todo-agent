@@ -226,9 +226,9 @@ const clauseNegationPattern =
 
 function parseListFilterFromText(text: string): ListTasksFilter {
   const filter: ListTasksFilter = {};
-  const hasPending = /(?:待|未|还没|没有|尚未|没)(?:完成|办完|做完)|还没完/u.test(text);
+  const hasPending = /(?:待|未|还没|没有|尚未|没)\s*(?:完成|办完|做完)|还没完/u.test(text);
   const hasCompleted =
-    /(?<!未|待|没|不|没有|还没|尚未)(?:(?:已|已经)(?:完成|办完|做完)|(?:完成|办完|做完)(?:了|的)|(?:做好|办好|搞定)了的)/u.test(
+    /(?<!未|待|没|不|没有|还没|尚未)(?:(?:已|已经)\s*(?:完成|办完|做完)|(?:完成|办完|做完)\s*(?:了|的)|(?:做好|办好|搞定)\s*了\s*的)/u.test(
       text,
     );
   if (hasPending && !hasCompleted) filter.done = false;
@@ -249,8 +249,8 @@ export function stripLeadingActionPrefixes(
   let text = clause.trim();
   const connectorPattern = /^(?:然后|接着|随后|另外|此外|同时|顺便|顺手|并且|而且|还有|以及)\s*/u;
   const shortConnectorPattern = options.includeConnectors
-    ? /^(?:也|再|并|先|只)\s*(?=[把将请帮给替为麻删移清去完标新创添记加备提写改重查看列显展])/u
-    : /^(?:再|只|先)\s*(?=[把将请帮给替为麻删移清去完标新创添记加备提写改重查看列显展])/u;
+    ? /^(?:也|再|并|先|只)\s*(?=[把将请帮给替为麻删移清去完标新创添记加备提写改重])/u
+    : /^(?:再|只|先)\s*(?=[把将请帮给替为麻删移清去完标新创添记加备提写改重])/u;
   const politePattern =
     /^(?:请问|麻烦(?:\s*[你您])?(?=\s|[把将帮给替为再只先删移清去完标新创添记加备提写改重查看列显展])|请(?:\s*[你您])?(?=\s|[把将帮给替为麻再只先删移清去完标新创添记加备提写改重查看列显展])|帮我|给我|替我|为我)\s*/u;
   while (true) {
@@ -490,7 +490,7 @@ export function isPureListClause(clause: string): boolean {
   if (
     clauseNegationPattern.test(masked) ||
     isUnsupportedDueDateQuery(trimmed) ||
-    /(?:把|将|删掉|删除|移除|清掉|去掉|清除|删了|(?<![\p{Script=Han}])删(?![除掉了一节减改])|新增|新建|创建|添加|加入|加上|加(?:同名的?)?[一二两三四五六1-6]?[条项个]|记(?:一下|[一二两三四五六1-6]?[条项个]|下)|备忘|提醒我|改回|重新打开|恢复|退回|改名|重命名|更名|标(?:记)?(?:为|成)|设(?:置)?(?:为|成)|调(?:整)?(?:为|成|到)|(?<!已|已经|未|待|没|没有|还没|尚未|不)完成(?!(?:了)?的)|(?:做好|买好|办好|交好|搞定)了(?!的))/u.test(
+    /(?:把|将|删掉|删除|移除|清掉|去掉|清除|删了|(?<![\p{Script=Han}])删(?![除掉了一节减改])|新增|新建|创建|添加|加入|加上|加(?:同名的?)?[一二两三四五六1-6]?[条项个]|记(?:一下|[一二两三四五六1-6]?[条项个]|下)|备忘|提醒我|改回|重新打开|恢复|退回|改名|重命名|更名|标(?:记)?(?:为|成)|设(?:置)?(?:为|成)|调(?:整)?(?:为|成|到)|(?<!已|已经|未|待|没|没有|还没|尚未|不)完成(?!(?:\s*了)?\s*的)|(?:做好|买好|办好|交好|搞定)\s*了(?!\s*的))/u.test(
       masked,
     )
   ) {
@@ -498,7 +498,7 @@ export function isPureListClause(clause: string): boolean {
   }
   const text = stripLeadingActionPrefixes(masked).replace(/[吧呢]?[。！？.!?]?$/u, "");
   const prefix =
-    /^(?:再?\s*(?:看看|看一看|列出|(?:查看|显示|展示|看|列)(?:一下|下)?)|我?(?:现在|目前|手头)?都?(?:还)?有(?:哪些|什么))/u.exec(
+    /^(?:(?:先|再)\s*)?(?:(?:看看|看一看|列出|(?:查看|显示|展示|看|列)(?:一下|下)?)|我?(?:现在|目前|手头)?都?(?:还)?有(?:哪些|什么))/u.exec(
       text,
     );
   if (!prefix) return false;
@@ -551,7 +551,7 @@ export function expectedScopedListFilter(
   const masked = maskQuotedTitles(activeClauses[0]);
   const text = stripLeadingActionPrefixes(masked).replace(/[吧呢]?[。！？.!?]?$/u, "");
   const prefix =
-    /^(?:再?\s*(?:看看|看一看|列出|(?:查看|显示|展示|看|列)(?:一下|下)?)|我?(?:现在|目前|手头)?都?(?:还)?有(?:哪些|什么))/u.exec(
+    /^(?:(?:先|再)\s*)?(?:(?:看看|看一看|列出|(?:查看|显示|展示|看|列)(?:一下|下)?)|我?(?:现在|目前|手头)?都?(?:还)?有(?:哪些|什么))/u.exec(
       text,
     );
   if (!prefix) return undefined;
@@ -793,7 +793,7 @@ export function analyzeClauses(input: string): ClauseAnalysis {
     if (leadingCreateBody.test(stripped)) return false;
     if (/(?:删掉|删除|移除|清掉|去掉|清除|删了|删一)/u.test(stripped)) return true;
     if (/(?:把|将)[^，,。]+?删(?:吧)?$/u.test(stripped)) return true;
-    return /^删(?![除掉了一节减改])\s*[\p{Script=Han}「“"]/u.test(stripped);
+    return /^删(?![除掉了一节减改])\s*[\p{L}\p{N}「“"]/u.test(stripped);
   });
   const allowReopen =
     /(?:改回|恢复|退回|变回|重置(?:为|成)?|重新(?:打开|开启|标记|设为|变为)|取消(?:已)?完成|标(?:记)?(?:为|成)?(?:未|待)完成|设(?:置)?(?:为|成)?(?:未|待)完成|还没(?:做|买|寄|写|交|办|完成|搞定)|其实没|其实还没|未完成|待完成)/u.test(
