@@ -1633,3 +1633,85 @@ test("LIVE-SWEEP-1 regressions: compound create guard, bound delete force, plain
     assert.equal(await readFile(filename, "utf8"), before);
   }
 });
+
+test("LIVE-SWEEP-2 regressions: forced tool narrowing, same-domain semantic isolation, and repeated-op batch preservation", async (t) => {
+  // 1. Metadata update narrows round-1 tools to [list_tasks] and round-2 tools to [update_task]
+  {
+    const { tasks } = await setup(t);
+    const report = tasks.create("写报告", { priority: "medium", workload: "small" });
+    const mock = scripted(
+      proposal(call("l1", "list_tasks", {})),
+      proposal(
+        call("u1", "update_task", {
+          candidateIds: [report.id],
+          changes: { priority: "low", workload: "large" },
+        }),
+      ),
+    );
+    const turn = await createAgent(tasks, mock.provider).runTurn([
+      user("把写报告的优先级改成低，工作量改成大"),
+    ]);
+    assert.equal(turn.failure, undefined);
+    assert.deepEqual(
+      mock.requests[0]?.tools?.map((tool) => tool.type === "function" && tool.function.name),
+      ["list_tasks"],
+    );
+    assert.deepEqual(
+      mock.requests[1]?.tools?.map((tool) => tool.type === "function" && tool.function.name),
+      ["update_task"],
+    );
+    assert.equal(tasks.list()[0]?.priority, "low");
+    assert.equal(tasks.list()[0]?.workload, "large");
+  }
+
+  // 2. Same-domain distinct tasks never auto-delete via semantic concepts
+  for (const [prompt, storedTitle] of [
+    ["把交水电费删掉", "交房租"],
+    ["把取快递删掉", "寄快递"],
+    ["把预约牙医删掉", "去口腔诊所缴费"],
+    ["把预约牙医删掉", "联系口腔诊所补牙"],
+  ] as const) {
+    const { tasks, filename } = await setup(t);
+    const stored = tasks.create(storedTitle);
+    const before = await readFile(filename, "utf8");
+    const mock = scripted(
+      proposal(call("l1", "list_tasks", {})),
+      proposal(call("d1", "delete_task", { candidateIds: [stored.id] })),
+      proposal(
+        call("v1", "verify_task_reference", { decision: "match", candidateIds: [stored.id] }),
+      ),
+    );
+    const turn = await createAgent(tasks, mock.provider).runTurn([user(prompt)]);
+    assert.ok(
+      turn.failure === "reference_required" || turn.failure === "exact_title_not_found",
+      `${prompt} -> ${storedTitle}: got ${String(turn.failure)}`,
+    );
+    assert.deepEqual(turn.outcomes, [], `${prompt} -> ${storedTitle}`);
+    assert.equal(await readFile(filename, "utf8"), before, `${prompt} -> ${storedTitle}`);
+  }
+
+  // 3. Repeated-operation compound batch does not mis-rank calls when a tool matches >1 positive clause
+  {
+    const { tasks } = await setup(t);
+    const milk = tasks.create("买牛奶");
+    const rent = tasks.create("交房租");
+    const mock = scripted(
+      proposal(call("l1", "list_tasks", {})),
+      proposal(
+        call("c1", "create_task", { title: "预约牙医" }),
+        call("d2", "delete_task", { candidateIds: [rent.id] }),
+      ),
+      final("已处理。"),
+    );
+    const turn = await createAgent(tasks, mock.provider).runTurn([
+      user("把买牛奶删掉，再记一条预约牙医，另外把交房租删掉"),
+    ]);
+    assert.equal(turn.failure, undefined);
+    assert.deepEqual(
+      turn.outcomes.map((o) => o.operation),
+      ["create_task", "delete_task"],
+    );
+    assert.ok(tasks.list().some((item) => item.id === milk.id));
+    assert.ok(!tasks.list().some((item) => item.id === rent.id));
+  }
+});

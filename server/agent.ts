@@ -257,21 +257,28 @@ function referenceWords(title: string) {
 const cancelsTaskAction = /取消|撤销|停止|终止|放弃|退订|退掉/u;
 const preparatoryTaskPrefix = /^(?:准备|计划|打算|考虑|研究|先了解|确认是否)/u;
 const semanticConceptGroups: ReadonlyArray<readonly [string, readonly string[]]> = [
-  [
-    "dental",
-    ["牙医", "牙科", "口腔", "牙齿", "看牙", "洗牙", "补牙", "拔牙", "洁牙", "正畸", "种牙"],
-  ],
+  ["dental_clinic", ["牙医", "牙科", "口腔", "看牙"]],
+  ["dental_cleaning", ["洗牙", "洁牙"]],
+  ["dental_extraction", ["拔牙"]],
+  ["dental_filling", ["补牙"]],
+  ["dental_ortho", ["正畸", "矫正牙齿", "种牙", "种植牙"]],
   ["physical_exam", ["体检", "体格检查", "健康检查"]],
   ["orthopedics", ["骨科"]],
   ["ophthalmology", ["眼科"]],
   ["dermatology", ["皮肤科"]],
   ["vet_pet", ["宠物", "兽医"]],
   ["medication", ["开药", "取药", "买药", "配药"]],
+  ["payment", ["缴费", "付款", "结账", "付钱", "退款"]],
   ["tax", ["税务", "报税", "纳税", "个税"]],
   ["legal", ["法律", "律师", "法务"]],
-  ["property_utility", ["物业费", "水电费", "水费", "电费", "燃气费", "暖气费", "房租", "租金"]],
-  ["delivery", ["快递", "包裹", "取件", "寄件"]],
-  ["reimbursement", ["报销", "差旅费"]],
+  ["property_fee", ["物业费"]],
+  ["utility_bill", ["水电费", "水费", "电费"]],
+  ["gas_bill", ["燃气费"]],
+  ["heating_bill", ["暖气费"]],
+  ["rent", ["房租", "租金"]],
+  ["delivery_pickup", ["取快递", "取件", "拿快递"]],
+  ["delivery_send", ["寄快递", "寄件", "发快递"]],
+  ["reimbursement", ["报销", "报销单"]],
   ["access_card", ["门禁卡", "工牌", "胸卡"]],
 ];
 
@@ -287,13 +294,14 @@ function hasGroundedSemanticMatch(title: string, storedTitle: string): boolean {
   if (cancelsTaskAction.test(title) !== cancelsTaskAction.test(storedTitle)) return false;
   if (preparatoryTaskPrefix.test(title) !== preparatoryTaskPrefix.test(storedTitle)) return false;
   if (namesSemanticTarget(title, storedTitle)) return true;
-  const requestedObject = taskActionAndObject(title)?.object ?? title;
-  const requestedConcepts = semanticConcepts(requestedObject);
+  const requestedConcepts = semanticConcepts(title);
   if (!requestedConcepts.size) return false;
   const storedConcepts = semanticConcepts(storedTitle);
   if (!storedConcepts.size) return false;
   const hasOverlap = [...requestedConcepts].some((concept) => storedConcepts.has(concept));
-  const hasConflict = [...storedConcepts].some((concept) => !requestedConcepts.has(concept));
+  const hasConflict =
+    [...storedConcepts].some((concept) => !requestedConcepts.has(concept)) ||
+    [...requestedConcepts].some((concept) => !storedConcepts.has(concept));
   return hasOverlap && !hasConflict;
 }
 
@@ -2016,7 +2024,7 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
         const anchor = new Set(referenceTerms(title));
         const requested = taskActionAndObject(title);
         const requestedWords = referenceWords(requested?.object ?? title);
-        const requestedConcepts = semanticConcepts(requested?.object ?? title);
+        const requestedConcepts = semanticConcepts(title);
         const requestedAction = new Set(referenceTerms(requested?.action ?? ""));
         const selectedWords = new Set(referenceWords(selected.title));
         const selectedHasObject = requestedWords.some((word) => selectedWords.has(word));
@@ -2046,7 +2054,7 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
         const requested = taskActionAndObject(title);
         const proposed = taskActionAndObject(selected.title);
         const proposedObject = new Set(referenceWords(proposed?.object ?? ""));
-        const requestedConcepts = semanticConcepts(requested?.object ?? title);
+        const requestedConcepts = semanticConcepts(title);
         const storedConcepts = semanticConcepts(selected.title);
         const domainConflict =
           requestedConcepts.size > 0 &&
@@ -2168,6 +2176,14 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
           }
         }
         const requestToolChoice = forcedTool ?? hintTool;
+        const narrowedToolName =
+          forcedTool ??
+          (hintTool === "list_tasks" || (activeBoundReference && hintTool) ? hintTool : undefined);
+        const requestTools = narrowedToolName
+          ? activeTools.filter(
+              (tool) => tool.type === "function" && tool.function.name === narrowedToolName,
+            )
+          : activeTools;
         const semanticTool = semanticLookup?.candidates ? referenceVerificationTool : referenceTool;
         const request = () =>
           semanticLookup
@@ -2192,7 +2208,7 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
               )
             : buildModelRequest(
                 [{ role: "system", content: systemPrompt }, ...history.flat(), ...transcript],
-                activeTools,
+                requestTools,
                 requestToolChoice
                   ? { type: "function", function: { name: requestToolChoice } }
                   : "auto",
@@ -2505,16 +2521,20 @@ export function createAgent(tasks: TaskStore, provider: ModelProvider = requestM
           const clauseIntents = clauseAnalysis.positiveClauses.map((clause) =>
             analyzeClauses(clause),
           );
-          const rankForTool = (toolName: string): number =>
-            clauseIntents.findIndex((intent) => {
-              if (toolName === "create_task") return intent.hasPositiveCreateCommand;
-              if (toolName === "complete_task") return intent.hasCompleteVerb;
-              if (toolName === "delete_task") return intent.hasDeleteVerb;
-              if (toolName === "update_task") {
-                return intent.allowRename || intent.allowReopen || intent.hasMetadataMention;
-              }
-              return false;
-            });
+          const rankForTool = (toolName: string): number => {
+            const matchingIndices = clauseIntents
+              .map((intent, idx) => ({ intent, idx }))
+              .filter(({ intent }) => {
+                if (toolName === "create_task") return intent.hasPositiveCreateCommand;
+                if (toolName === "complete_task") return intent.hasCompleteVerb;
+                if (toolName === "delete_task") return intent.hasDeleteVerb;
+                if (toolName === "update_task") {
+                  return intent.allowRename || intent.allowReopen || intent.hasMetadataMention;
+                }
+                return false;
+              });
+            return matchingIndices.length === 1 ? matchingIndices[0].idx : -1;
+          };
           const ranked = calls.map((call, index) => ({
             call,
             index,
